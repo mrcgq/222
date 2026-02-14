@@ -1,6 +1,3 @@
-
-
-
 // =============================================================================
 // 文件: ebpf/xdp_phantom.c
 // 描述: XDP 加速程序 - 高性能数据包处理 (IPv4/IPv6 双栈支持)
@@ -66,11 +63,6 @@ struct {
 static __always_inline void update_stats_rx(struct stats_counter *s, __u32 bytes) {
     __sync_fetch_and_add(&s->packets_rx, 1);
     __sync_fetch_and_add(&s->bytes_rx, bytes);
-}
-
-static __always_inline void update_stats_tx(struct stats_counter *s, __u32 bytes) {
-    __sync_fetch_and_add(&s->packets_tx, 1);
-    __sync_fetch_and_add(&s->bytes_tx, bytes);
 }
 
 static __always_inline void update_stats_drop(struct stats_counter *s) {
@@ -141,15 +133,6 @@ static __always_inline int create_session_v6(
     return bpf_map_update_elem(&sessions, key, &val, BPF_ANY);
 }
 
-// 兼容旧代码的会话创建
-static __always_inline int create_session(
-    struct session_key *key,
-    __u32 peer_ip,
-    __u16 peer_port
-) {
-    return create_session_v4(key, peer_ip, peer_port);
-}
-
 static __always_inline void update_session(
     struct session_value *session,
     __u32 bytes,
@@ -190,55 +173,6 @@ static __always_inline int is_ipv6_enabled(void) {
     if (gcfg)
         return gcfg->enable_ipv6;
     return 1;  // 默认启用
-}
-
-// =============================================================================
-// 发送事件到用户态
-// =============================================================================
-
-static __always_inline void send_event_v4(
-    void *ctx,
-    __u32 src_ip, __u32 dst_ip,
-    __u16 src_port, __u16 dst_port,
-    __u16 len, __u8 protocol,
-    __u8 action, __u8 state
-) {
-    struct packet_event event = {};
-    event.timestamp = bpf_ktime_get_ns();
-    event.src_ip.v4 = src_ip;
-    event.dst_ip.v4 = dst_ip;
-    event.src_port = src_port;
-    event.dst_port = dst_port;
-    event.len = len;
-    event.protocol = protocol;
-    event.action = action;
-    event.state = state;
-    event.family = AF_INET_BPF;
-    
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
-}
-
-static __always_inline void send_event_v6(
-    void *ctx,
-    const struct ip_addr *src_ip,
-    const struct ip_addr *dst_ip,
-    __u16 src_port, __u16 dst_port,
-    __u16 len, __u8 protocol,
-    __u8 action, __u8 state
-) {
-    struct packet_event event = {};
-    event.timestamp = bpf_ktime_get_ns();
-    event.src_ip = *src_ip;
-    event.dst_ip = *dst_ip;
-    event.src_port = src_port;
-    event.dst_port = dst_port;
-    event.len = len;
-    event.protocol = protocol;
-    event.action = action;
-    event.state = state;
-    event.family = AF_INET6_BPF;
-    
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 }
 
 // =============================================================================
@@ -653,6 +587,3 @@ int xdp_phantom_filter(struct xdp_md *ctx) {
 
 char _license[] SEC("license") = "GPL";
 __u32 _version SEC("version") = 1;
-
-
-
