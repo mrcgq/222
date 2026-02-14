@@ -591,11 +591,13 @@ func (tm *TunnelManager) GetValidationTunnelURL() string {
 	if tm.validationRunner == nil {
 		return ""
 	}
-	// 使用 WaitForURL 的同步方式或者从状态中获取
-	tm.validationRunner.mu.RLock()
-	url := tm.validationRunner.tunnelURL
-	tm.validationRunner.mu.RUnlock()
-	return url
+	// 从 atomic.Value 中获取 URL
+	if urlVal := tm.validationRunner.url.Load(); urlVal != nil {
+		if urlStr, ok := urlVal.(string); ok {
+			return urlStr
+		}
+	}
+	return ""
 }
 
 // =============================================================================
@@ -656,10 +658,10 @@ func (tm *TunnelManager) getPublicIP() (string, error) {
 
 // updateDuckDNS 更新 DuckDNS
 func (tm *TunnelManager) updateDuckDNS() error {
-	url := fmt.Sprintf("https://www.duckdns.org/update?domains=%s&token=%s",
+	reqURL := fmt.Sprintf("https://www.duckdns.org/update?domains=%s&token=%s",
 		tm.config.DuckDNSDomain, tm.config.DuckDNSToken)
 
-	resp, err := fetchURL(url, 10*time.Second)
+	resp, err := fetchURL(reqURL, 10*time.Second)
 	if err != nil {
 		return err
 	}
@@ -687,31 +689,31 @@ func ipToDomain(ip string) string {
 }
 
 // extractDomainFromURL 从 URL 提取域名
-func extractDomainFromURL(url string) string {
+func extractDomainFromURL(urlStr string) string {
 	// 移除协议前缀
 	for _, prefix := range []string{"https://", "http://"} {
-		if len(url) > len(prefix) && url[:len(prefix)] == prefix {
-			url = url[len(prefix):]
+		if len(urlStr) > len(prefix) && urlStr[:len(prefix)] == prefix {
+			urlStr = urlStr[len(prefix):]
 			break
 		}
 	}
 
 	// 移除路径和端口
-	for i, c := range url {
+	for i, c := range urlStr {
 		if c == '/' || c == ':' {
-			return url[:i]
+			return urlStr[:i]
 		}
 	}
 
-	return url
+	return urlStr
 }
 
 // fetchURL 获取 URL 内容
-func fetchURL(url string, timeout time.Duration) (string, error) {
+func fetchURL(reqURL string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return "", err
 	}
