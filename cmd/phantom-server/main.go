@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"sync"
 	"syscall"
 	"time"
 
@@ -36,10 +35,17 @@ func main() {
 	genPSK := flag.Bool("gen-psk", false, "生成新的 PSK")
 	mode := flag.String("mode", "auto", "运行模式: auto/udp/faketcp/websocket/ebpf")
 
+	// 隧道相关参数
 	tunnelMode := flag.String("tunnel", "", "隧道模式: temp/fixed/direct/off")
 	tunnelDomain := flag.String("domain", "", "域名模式: auto/sslip/nip/duckdns/custom")
-	tunnelCert := flag.String("cert", "", "证书模式: auto/selfsigned/letsencrypt")
+	tunnelCert := flag.String("cert", "", "证书模式: auto/selfsigned/acme/letsencrypt")
 	quickTunnel := flag.Bool("quick", false, "快速启动临时隧道")
+
+	// ACME 相关参数
+	acmeEmail := flag.String("acme-email", "", "ACME 邮箱地址")
+	acmeDomains := flag.String("acme-domains", "", "ACME 域名 (逗号分隔)")
+	acmeProvider := flag.String("acme-provider", "letsencrypt", "ACME 提供商: letsencrypt/letsencrypt-staging/zerossl")
+	acmeUseTunnel := flag.Bool("acme-use-tunnel", true, "使用隧道进行 ACME 验证")
 
 	flag.Parse()
 
@@ -84,8 +90,28 @@ func main() {
 		cfg.Tunnel.DomainMode = *tunnelDomain
 	}
 	if *tunnelCert != "" {
-		_ = tunnelCert
+		// 处理证书模式别名
+		certMode := *tunnelCert
+		if certMode == "letsencrypt" {
+			certMode = "acme"
+			if cfg.Tunnel.ACMEProvider == "" {
+				cfg.Tunnel.ACMEProvider = "letsencrypt"
+			}
+		}
+		cfg.Tunnel.CertMode = certMode
 	}
+
+	// 覆盖 ACME 配置
+	if *acmeEmail != "" {
+		cfg.Tunnel.ACMEEmail = *acmeEmail
+	}
+	if *acmeDomains != "" {
+		cfg.Tunnel.ACMEDomains = splitDomains(*acmeDomains)
+	}
+	if *acmeProvider != "" {
+		cfg.Tunnel.ACMEProvider = *acmeProvider
+	}
+	cfg.Tunnel.ACMEUseTunnel = *acmeUseTunnel
 
 	// 创建加密器
 	cry, err := crypto.New(cfg.PSK, cfg.TimeWindow)
@@ -97,7 +123,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 创建 Metrics 服务器（提前创建以获取 registry）
+	// 创建 Metrics 服务器
 	var metricsServer *metrics.MetricsServer
 	var phantomMetrics *metrics.PhantomMetrics
 
@@ -109,14 +135,12 @@ func main() {
 			cfg.Metrics.EnablePprof,
 		)
 
-		// 创建实时埋点指标
 		phantomMetrics = metrics.NewPhantomMetrics(metricsServer.GetRegistry())
 	}
 
 	// 创建统一处理器
 	unifiedHandler := handler.NewUnifiedHandler(cry, cfg)
 
-	// 如果有 phantomMetrics，设置到 handler
 	if phantomMetrics != nil {
 		unifiedHandler.SetMetrics(phantomMetrics)
 	}
@@ -124,26 +148,22 @@ func main() {
 	// 创建智能链路切换器
 	sw := switcher.New(cfg, cry, unifiedHandler)
 
-	// 如果有 phantomMetrics，设置到 switcher
 	if phantomMetrics != nil {
 		sw.SetMetrics(phantomMetrics)
 	}
 
 	// 注册 Prometheus 收集器
 	if metricsServer != nil {
-		// 注册 Switcher 收集器
 		switcherCollector := metrics.NewSwitcherCollector(
 			&switcherStatsAdapter{sw: sw},
 		)
 		metricsServer.MustRegisterCollector(switcherCollector)
 
-		// 注册 Handler 收集器
 		handlerCollector := metrics.NewHandlerCollector(
 			&handlerStatsAdapter{h: unifiedHandler},
 		)
 		metricsServer.MustRegisterCollector(handlerCollector)
 
-		// 设置健康检查
 		metricsServer.SetHealthCheck(func() metrics.HealthStatus {
 			return createHealthStatus(sw, unifiedHandler)
 		})
@@ -160,9 +180,10 @@ func main() {
 	}
 
 	// 启动隧道
-	var tunnelMgr *TunnelManager
+	var tunnelMgr *tunnel.TunnelManager
 	if cfg.Tunnel.Enabled {
-		tunnelMgr = NewTunnelManager(&cfg.Tunnel, cfg.GetListenPort())
+		tunnelCfg := tunnel.FromConfigTunnelConfig(&cfg.Tunnel)
+		tunnelMgr = tunnel.NewTunnelManager(tunnelCfg)
 		if err := tunnelMgr.Start(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "隧道启动失败: %v (继续运行)\n", err)
 		}
@@ -187,270 +208,33 @@ func main() {
 	sw.Stop()
 }
 
-// =============================================================================
-// TunnelManager - Cloudflare 隧道管理器
-// =============================================================================
-
-// TunnelManager 隧道管理器
-type TunnelManager struct {
-	config    *config.TunnelConfig
-	localPort int
-
-	// 子组件
-	downloader  *tunnel.BinaryDownloader
-	privManager *tunnel.PrivilegeManager
-	runner      *tunnel.CloudflaredRunner
-
-	// 状态
-	running   bool
-	tunnelURL string
-	domain    string
-	startTime time.Time
-
-	// 同步
-	mu     sync.RWMutex
-	cancel context.CancelFunc
-}
-
-// NewTunnelManager 创建隧道管理器
-func NewTunnelManager(cfg *config.TunnelConfig, listenPort int) *TunnelManager {
-	// 使用配置的端口，如果未配置则使用主监听端口
-	localPort := cfg.LocalPort
-	if localPort == 0 {
-		localPort = listenPort
-	}
-
-	return &TunnelManager{
-		config:    cfg,
-		localPort: localPort,
-	}
-}
-
-// Start 启动隧道
-func (tm *TunnelManager) Start(ctx context.Context) error {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	if !tm.config.Enabled {
+// splitDomains 分割域名字符串
+func splitDomains(s string) []string {
+	if s == "" {
 		return nil
 	}
-
-	tm.startTime = time.Now()
-
-	// 创建可取消的上下文
-	runCtx, cancel := context.WithCancel(ctx)
-	tm.cancel = cancel
-
-	// 1. 初始化下载器
-	tm.downloader = tunnel.NewBinaryDownloader("",
-		tunnel.WithLogLevel(1),
-		tunnel.WithProgressCallback(func(downloaded, total int64) {
-			if total > 0 {
-				percent := float64(downloaded) / float64(total) * 100
-				fmt.Printf("\r下载 cloudflared: %.1f%%", percent)
+	var domains []string
+	current := ""
+	for _, c := range s {
+		if c == ',' || c == ' ' {
+			if current != "" {
+				domains = append(domains, current)
+				current = ""
 			}
-		}),
-	)
-
-	// 2. 确保 cloudflared 可用
-	binaryPath, err := tm.downloader.EnsureCloudflared()
-	if err != nil {
-		cancel()
-		return fmt.Errorf("获取 cloudflared 失败: %w", err)
-	}
-
-	fmt.Printf("\n") // 换行（下载进度后）
-
-	// 3. 初始化权限管理器
-	privCfg := tunnel.DefaultPrivilegeConfig()
-	tm.privManager, err = tunnel.NewPrivilegeManager(privCfg)
-	if err != nil {
-		// 权限管理器初始化失败不阻止启动
-		fmt.Printf("[WARN] 权限管理器初始化失败: %v\n", err)
-	}
-
-	// 4. 确定隧道模式
-	mode := tm.determineTunnelMode()
-
-	// 5. 创建运行器
-	runnerCfg := &tunnel.RunnerConfig{
-		BinaryPath:  binaryPath,
-		Mode:        mode,
-		LocalAddr:   tm.config.LocalAddr,
-		LocalPort:   tm.localPort,
-		Protocol:    tm.config.Protocol,
-		CFToken:     tm.config.CFToken,
-		CFTunnelID:  tm.config.CFTunnelID,
-		PrivManager: tm.privManager,
-		AutoRestart: true,
-		LogLevel:    1,
-
-		OnURLReady: func(url string) {
-			tm.mu.Lock()
-			tm.tunnelURL = url
-			tm.domain = extractDomainFromURL(url)
-			tm.mu.Unlock()
-			fmt.Printf("[INFO] 隧道 URL 就绪: %s\n", url)
-		},
-		OnError: func(err error) {
-			fmt.Printf("[ERROR] 隧道错误: %v\n", err)
-		},
-		OnStateChange: func(running bool) {
-			tm.mu.Lock()
-			tm.running = running
-			tm.mu.Unlock()
-		},
-	}
-
-	tm.runner, err = tunnel.NewCloudflaredRunner(runnerCfg)
-	if err != nil {
-		cancel()
-		return fmt.Errorf("创建 cloudflared 运行器失败: %w", err)
-	}
-
-	// 6. 启动运行器
-	if err := tm.runner.Start(runCtx); err != nil {
-		cancel()
-		return fmt.Errorf("启动 cloudflared 失败: %w", err)
-	}
-
-	tm.running = true
-
-	// 7. 对于临时隧道，等待 URL 就绪
-	if mode == tunnel.ModeTempTunnel {
-		go func() {
-			url, err := tm.runner.WaitForURL(30 * time.Second)
-			if err != nil {
-				fmt.Printf("[WARN] 等待隧道 URL 失败: %v\n", err)
-			} else {
-				fmt.Printf("[INFO] 临时隧道已建立: %s\n", url)
-			}
-		}()
-	}
-
-	return nil
-}
-
-// determineTunnelMode 确定隧道模式
-func (tm *TunnelManager) determineTunnelMode() tunnel.TunnelMode {
-	switch tm.config.Mode {
-	case "temp":
-		return tunnel.ModeTempTunnel
-	case "fixed":
-		return tunnel.ModeFixedTunnel
-	case "direct":
-		return tunnel.ModeDirectTCP
-	default:
-		// 如果有 token，使用固定模式；否则使用临时模式
-		if tm.config.CFToken != "" {
-			return tunnel.ModeFixedTunnel
-		}
-		return tunnel.ModeTempTunnel
-	}
-}
-
-// Stop 停止隧道
-func (tm *TunnelManager) Stop() {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	if tm.cancel != nil {
-		tm.cancel()
-	}
-
-	if tm.runner != nil {
-		if err := tm.runner.Stop(); err != nil {
-			fmt.Printf("[WARN] 停止 cloudflared 失败: %v\n", err)
+		} else {
+			current += string(c)
 		}
 	}
-
-	tm.running = false
-	tm.tunnelURL = ""
-	tm.domain = ""
-}
-
-// IsRunning 检查是否运行中
-func (tm *TunnelManager) IsRunning() bool {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.running
-}
-
-// GetTunnelURL 获取隧道 URL
-func (tm *TunnelManager) GetTunnelURL() string {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.tunnelURL
-}
-
-// GetDomain 获取域名
-func (tm *TunnelManager) GetDomain() string {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.domain
-}
-
-// GetStatus 获取状态
-func (tm *TunnelManager) GetStatus() map[string]interface{} {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-
-	status := map[string]interface{}{
-		"running": tm.running,
-		"mode":    tm.config.Mode,
+	if current != "" {
+		domains = append(domains, current)
 	}
-
-	if tm.running {
-		status["uptime"] = time.Since(tm.startTime).String()
-	}
-
-	if tm.tunnelURL != "" {
-		status["url"] = tm.tunnelURL
-		status["domain"] = tm.domain
-	}
-
-	if tm.runner != nil {
-		status["pid"] = tm.runner.GetPID()
-	}
-
-	return status
-}
-
-// extractDomainFromURL 从 URL 中提取域名
-func extractDomainFromURL(url string) string {
-	// 移除协议前缀
-	for _, prefix := range []string{"https://", "http://"} {
-		if len(url) > len(prefix) && url[:len(prefix)] == prefix {
-			url = url[len(prefix):]
-			break
-		}
-	}
-
-	// 移除路径和端口
-	for _, sep := range []string{"/", ":"} {
-		if idx := indexOf(url, sep); idx != -1 {
-			url = url[:idx]
-		}
-	}
-
-	return url
-}
-
-// indexOf 查找字符串位置
-func indexOf(s, substr string) int {
-	for i := 0; i < len(s); i++ {
-		if i+len(substr) <= len(s) && s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
+	return domains
 }
 
 // =============================================================================
 // 适配器：将 Switcher 和 Handler 适配到 Prometheus 收集器接口
 // =============================================================================
 
-// switcherStatsAdapter 适配 Switcher 到 SwitcherStats 接口
 type switcherStatsAdapter struct {
 	sw *switcher.Switcher
 }
@@ -511,7 +295,6 @@ func (a *switcherStatsAdapter) GetModeStats() map[string]metrics.ModeStatData {
 	return result
 }
 
-// handlerStatsAdapter 适配 Handler 到 HandlerStats 接口
 type handlerStatsAdapter struct {
 	h *handler.UnifiedHandler
 }
@@ -593,10 +376,9 @@ func (a *handlerStatsAdapter) GetReplayAttacks() uint64 {
 }
 
 // =============================================================================
-// 其他函数
+// 健康检查
 // =============================================================================
 
-// createHealthStatus 创建健康状态
 func createHealthStatus(sw *switcher.Switcher, h *handler.UnifiedHandler) metrics.HealthStatus {
 	status := metrics.HealthStatus{
 		Status:     "healthy",
@@ -608,7 +390,6 @@ func createHealthStatus(sw *switcher.Switcher, h *handler.UnifiedHandler) metric
 
 	stats := sw.GetStats()
 
-	// 传输层状态
 	if stats.CurrentState == switcher.StateRunning {
 		status.Components["transport"] = metrics.ComponentHealth{
 			Status:  "healthy",
@@ -622,14 +403,12 @@ func createHealthStatus(sw *switcher.Switcher, h *handler.UnifiedHandler) metric
 		}
 	}
 
-	// 连接状态
 	activeConns := h.GetActiveConns()
 	status.Components["connections"] = metrics.ComponentHealth{
 		Status:  "healthy",
 		Message: fmt.Sprintf("active: %d", activeConns),
 	}
 
-	// ARQ 状态
 	if stats.ARQEnabled {
 		status.Components["arq"] = metrics.ComponentHealth{
 			Status:  "healthy",
@@ -637,7 +416,6 @@ func createHealthStatus(sw *switcher.Switcher, h *handler.UnifiedHandler) metric
 		}
 	}
 
-	// 拥塞控制状态
 	if sw.HasHysteria2() {
 		status.Components["congestion"] = metrics.ComponentHealth{
 			Status:  "healthy",
@@ -647,6 +425,10 @@ func createHealthStatus(sw *switcher.Switcher, h *handler.UnifiedHandler) metric
 
 	return status
 }
+
+// =============================================================================
+// 版本和横幅
+// =============================================================================
 
 func printVersion() {
 	fmt.Printf("Phantom Server v%s (Ultimate Edition)\n", Version)
@@ -667,12 +449,21 @@ func printVersion() {
 	fmt.Println("  - fixed     : Cloudflare 固定隧道 (需要 token)")
 	fmt.Println("  - direct    : 直接 TCP 隧道")
 	fmt.Println()
+	fmt.Println("证书模式:")
+	fmt.Println("  - auto        : Cloudflare 自动 TLS")
+	fmt.Println("  - selfsigned  : 自签名证书")
+	fmt.Println("  - acme        : ACME 自动证书 (Let's Encrypt)")
+	fmt.Println("  - letsencrypt : Let's Encrypt (acme 别名)")
+	fmt.Println()
+	fmt.Println("ACME 示例:")
+	fmt.Println("  --cert acme --acme-email you@example.com --acme-domains example.com")
+	fmt.Println()
 	fmt.Println("监控:")
 	fmt.Println("  - /metrics  : Prometheus 格式指标")
 	fmt.Println("  - /health   : JSON 健康状态")
 }
 
-func printBanner(cfg *config.Config, sw *switcher.Switcher, tm *TunnelManager, ms *metrics.MetricsServer) {
+func printBanner(cfg *config.Config, sw *switcher.Switcher, tm *tunnel.TunnelManager, ms *metrics.MetricsServer) {
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║         Phantom Server v4.0 - Ultimate Edition                   ║")
@@ -695,6 +486,17 @@ func printBanner(cfg *config.Config, sw *switcher.Switcher, tm *TunnelManager, m
 			fmt.Printf("║    域名: %-57s ║\n", truncateString(domain, 57))
 		}
 		fmt.Printf("║    模式: %-57s ║\n", cfg.Tunnel.Mode)
+
+		// 显示证书信息
+		if certMgr := tm.GetCertManager(); certMgr != nil {
+			certInfo := certMgr.GetCertInfo()
+			if certMode, ok := certInfo["mode"].(string); ok {
+				fmt.Printf("║    证书: %-57s ║\n", certMode)
+			}
+			if expiresIn, ok := certInfo["expires_in"].(string); ok {
+				fmt.Printf("║    过期: %-57s ║\n", expiresIn)
+			}
+		}
 	}
 
 	if ms != nil {
@@ -722,6 +524,9 @@ func printBanner(cfg *config.Config, sw *switcher.Switcher, tm *TunnelManager, m
 	}
 	if tm != nil && tm.IsRunning() {
 		fmt.Println("║    ✓ Cloudflare 隧道 (全球加速)                                  ║")
+		if tm.GetCertManager() != nil {
+			fmt.Println("║    ✓ ACME 自动证书管理                                           ║")
+		}
 	}
 	fmt.Println("║    ✓ TSKD 0-RTT 认证                                             ║")
 	fmt.Println("║    ✓ ChaCha20-Poly1305 加密                                      ║")
