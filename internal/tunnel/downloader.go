@@ -1,6 +1,3 @@
-
-
-
 // =============================================================================
 // 文件: internal/tunnel/downloader.go
 // 描述: 外部依赖下载器 - 仅 cloudflared（已移除 acme.sh）
@@ -10,6 +7,7 @@ package tunnel
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,7 +39,7 @@ var CloudflaredVersions = map[string]BinaryInfo{
 		Name:       "cloudflared",
 		Version:    "2024.1.5",
 		URL:        "https://github.com/cloudflare/cloudflared/releases/download/2024.1.5/cloudflared-linux-amd64",
-		SHA256:     "a]6b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3", // 示例哈希，部署时替换
+		SHA256:     "a6b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3", // 示例哈希，部署时替换
 		InstallDir: "/usr/local/bin",
 	},
 	"linux-arm64": {
@@ -430,10 +428,3 @@ func GetLatestCloudflaredVersion() (string, error) {
 
 	return release.TagName, nil
 }
-
-// 需要导入 encoding/json
-import "encoding/json"
-
-
-
-
