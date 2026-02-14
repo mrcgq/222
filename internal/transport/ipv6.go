@@ -1,6 +1,3 @@
-
-
-
 // =============================================================================
 // 文件: internal/transport/ipv6.go
 // 描述: IPv6 支持工具函数和统一会话键
@@ -42,21 +39,7 @@ func ParseIPVersion(addr *net.UDPAddr) IPVersion {
 	return IPv6Only
 }
 
-// IPToUint32 将 IPv4 转换为 uint32
-func IPToUint32(ip net.IP) uint32 {
-	ip = ip.To4()
-	if ip == nil {
-		return 0
-	}
-	return binary.BigEndian.Uint32(ip)
-}
-
-// Uint32ToIP 将 uint32 转换为 IPv4
-func Uint32ToIP(n uint32) net.IP {
-	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, n)
-	return ip
-}
+// 注意: IPToUint32, Uint32ToIP, Htons, Ntohs 已在 ebpf_types.go 中定义，此处不再重复
 
 // IPToUint128 将 IPv6 转换为两个 uint64
 func IPToUint128(ip net.IP) (high, low uint64) {
@@ -75,16 +58,6 @@ func Uint128ToIP(high, low uint64) net.IP {
 	binary.BigEndian.PutUint64(ip[:8], high)
 	binary.BigEndian.PutUint64(ip[8:], low)
 	return ip
-}
-
-// Htons 主机字节序转网络字节序 (16位)
-func Htons(v uint16) uint16 {
-	return (v >> 8) | (v << 8)
-}
-
-// Ntohs 网络字节序转主机字节序 (16位)
-func Ntohs(v uint16) uint16 {
-	return Htons(v)
 }
 
 // UnifiedSessionKey 统一会话键 (支持 IPv4/IPv6)
@@ -134,9 +107,3 @@ func (k *UnifiedSessionKey) ToAddrs() (src, dst *net.UDPAddr) {
 	return &net.UDPAddr{IP: srcIP, Port: int(Ntohs(k.SrcPort))},
 		&net.UDPAddr{IP: dstIP, Port: int(Ntohs(k.DstPort))}
 }
-
-
-
-
-
-
