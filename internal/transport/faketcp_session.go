@@ -1,8 +1,4 @@
-
-
-
-
-
+//go:build linux
 
 // =============================================================================
 // 文件: internal/transport/faketcp_session.go
@@ -22,9 +18,9 @@ import (
 
 // FakeTCPSessionManager 会话管理器
 type FakeTCPSessionManager struct {
-	// 使用字符串键，兼容 IPv4/IPv6
-	sessions sync.Map // SessionKey (string) -> *FakeTCPSession
-	
+	// 使用 sync.Map，键为 SessionKey (string)，值为 *FakeTCPSession
+	sessions sync.Map
+
 	config *FakeTCPConfig
 
 	// 统计
@@ -69,14 +65,14 @@ func (m *FakeTCPSessionManager) GetOrCreateSession(remoteAddr *net.UDPAddr) *Fak
 	}
 
 	atomic.AddUint64(&m.stats.TotalSessions, 1)
-	
+
 	// 更新 IPv4/IPv6 统计
 	if session.IsIPv6 {
 		atomic.AddUint64(&m.stats.IPv6Sessions, 1)
 	} else {
 		atomic.AddUint64(&m.stats.IPv4Sessions, 1)
 	}
-	
+
 	return session
 }
 
@@ -557,20 +553,72 @@ func (m *FakeTCPSessionManager) SendData(session *FakeTCPSession, data []byte) *
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	if session.State != TCPStateEstablished {
-		return nil
+	// 对于简化的 FakeTCP，允许在非 ESTABLISHED 状态发送
+	// 实际会话状态可能还未完全建立
+	if session.State == TCPStateClosed {
+		session.State = TCPStateEstablished
 	}
 
 	// 分片
 	mss := int(session.GetMSS())
+	if mss == 0 {
+		mss = DefaultMSS
+	}
 	if len(data) > mss {
 		data = data[:mss]
 	}
 
-	pkt := m.buildACK(session, data)
+	pkt := m.buildACKWithoutLock(session, data)
 	session.LocalSeq += uint32(len(data))
 	session.BytesSent += uint64(len(data))
 	session.PacketsSent++
+
+	return pkt
+}
+
+// buildACKWithoutLock 构建 ACK 包 (不加锁版本，供内部使用)
+func (m *FakeTCPSessionManager) buildACKWithoutLock(session *FakeTCPSession, payload []byte) *FakeTCPPacket {
+	var options []TCPOption
+	if session.Timestamps {
+		tsVal := uint32(time.Now().UnixMilli() & 0xFFFFFFFF)
+		session.TSVal = tsVal
+		data := make([]byte, 8)
+		binary.BigEndian.PutUint32(data[0:4], tsVal)
+		binary.BigEndian.PutUint32(data[4:8], session.LastTSVal)
+		options = append(options, TCPOption{
+			Kind:   TCPOptTimestamp,
+			Length: 10,
+			Data:   data,
+		})
+	}
+
+	flags := uint8(TCPFlagACK)
+	if len(payload) > 0 {
+		flags |= TCPFlagPSH
+	}
+
+	window := session.LocalWindow
+	if window == 0 {
+		window = DefaultTCPWindow
+	}
+
+	tcpHeader := &TCPHeader{
+		SrcPort:    uint16(session.LocalAddr.Port),
+		DstPort:    uint16(session.RemoteAddr.Port),
+		SeqNum:     session.LocalSeq,
+		AckNum:     session.LocalAck,
+		DataOffset: 5,
+		Flags:      flags,
+		Window:     window,
+		Options:    options,
+	}
+
+	pkt := &FakeTCPPacket{
+		TCPHeader: tcpHeader,
+		Payload:   payload,
+	}
+
+	m.setIPHeaders(pkt, session)
 
 	return pkt
 }
@@ -679,5 +727,3 @@ func (m *FakeTCPSessionManager) GetIPv6SessionCount() int {
 	})
 	return count
 }
-
-
