@@ -1,7 +1,3 @@
-
-
-
-
 // =============================================================================
 // 文件: internal/metrics/gauges.go
 // 描述: 实时埋点指标（Counter/Gauge/Histogram）
@@ -34,10 +30,10 @@ type PhantomMetrics struct {
 	ModeSwitches *prometheus.CounterVec
 
 	// ARQ 相关
-	ARQRetransmits  prometheus.Counter
-	ARQAckLatency   prometheus.Histogram
-	ARQWindowSize   prometheus.Gauge
-	ARQPacketLoss   prometheus.Gauge
+	ARQRetransmits prometheus.Counter
+	ARQAckLatency  prometheus.Histogram
+	ARQWindowSize  prometheus.Gauge
+	ARQPacketLoss  prometheus.Gauge
 
 	// 拥塞控制
 	CongestionWindow prometheus.Gauge
@@ -206,7 +202,12 @@ func (m *PhantomMetrics) RecordError(errorType string) {
 }
 
 // RecordModeSwitch 记录模式切换
-func (m *PhantomMetrics) RecordModeSwitch(from, to, reason string) {
+func (m *PhantomMetrics) RecordModeSwitch(from, to string) {
+	m.ModeSwitches.WithLabelValues(from, to, "auto").Inc()
+}
+
+// RecordModeSwitchWithReason 记录模式切换（带原因）
+func (m *PhantomMetrics) RecordModeSwitchWithReason(from, to, reason string) {
 	m.ModeSwitches.WithLabelValues(from, to, reason).Inc()
 }
 
@@ -232,8 +233,44 @@ func (m *PhantomMetrics) UpdateCongestionStats(cwnd uint64, sendRate float64) {
 	m.SendRate.Set(sendRate)
 }
 
+// =============================================================================
+// 便捷方法（供 handler 和 switcher 调用）
+// =============================================================================
 
+// IncConnections 增加活跃连接数
+func (m *PhantomMetrics) IncConnections() {
+	m.ActiveConnections.Inc()
+}
 
+// DecConnections 减少活跃连接数
+func (m *PhantomMetrics) DecConnections() {
+	m.ActiveConnections.Dec()
+}
 
+// AddBytesSent 增加发送字节数（使用默认模式）
+func (m *PhantomMetrics) AddBytesSent(n int64) {
+	if n > 0 {
+		m.BytesSent.WithLabelValues("default").Add(float64(n))
+	}
+}
 
+// AddBytesReceived 增加接收字节数（使用默认模式）
+func (m *PhantomMetrics) AddBytesReceived(n int64) {
+	if n > 0 {
+		m.BytesReceived.WithLabelValues("default").Add(float64(n))
+	}
+}
 
+// AddBytesSentWithMode 增加发送字节数（指定模式）
+func (m *PhantomMetrics) AddBytesSentWithMode(mode string, n int64) {
+	if n > 0 {
+		m.BytesSent.WithLabelValues(mode).Add(float64(n))
+	}
+}
+
+// AddBytesReceivedWithMode 增加接收字节数（指定模式）
+func (m *PhantomMetrics) AddBytesReceivedWithMode(mode string, n int64) {
+	if n > 0 {
+		m.BytesReceived.WithLabelValues(mode).Add(float64(n))
+	}
+}
