@@ -1,7 +1,19 @@
-
 // =============================================================================
 // internal/transport/faketcp_client.go         增强版 FakeTCP 客户端
 // =============================================================================
+
+package transport
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
 
 // FakeTCPClient FakeTCP 客户端 (NAT 穿透增强版)
 type FakeTCPClient struct {
@@ -35,9 +47,9 @@ type FakeTCPClient struct {
 	running   int32
 
 	// 重试配置
-	maxRetries     int
-	retryInterval  time.Duration
-	synRetries     int32
+	maxRetries    int
+	retryInterval time.Duration
+	synRetries    int32
 }
 
 // FakeTCPConfig 配置结构
@@ -52,9 +64,9 @@ type FakeTCPConfig struct {
 	LogLevel string
 
 	// 其他配置...
-	MSS            uint16
-	WindowSize     uint16
-	EnableSACK     bool
+	MSS             uint16
+	WindowSize      uint16
+	EnableSACK      bool
 	EnableTimestamp bool
 }
 
@@ -165,7 +177,7 @@ func (c *FakeTCPClient) Connect(ctx context.Context) error {
 		c.Close()
 		return fmt.Errorf("连接超时 (SYN 重试 %d 次)", atomic.LoadInt32(&c.synRetries))
 	case <-c.waitConnected():
-		c.log(1, "FakeTCP 连接已建立: %s (重试 %d 次)", 
+		c.log(1, "FakeTCP 连接已建立: %s (重试 %d 次)",
 			c.serverAddr, atomic.LoadInt32(&c.synRetries))
 		return nil
 	}
@@ -530,9 +542,6 @@ func (c *FakeTCPClient) log(level int, format string, args ...interface{}) {
 		return
 	}
 	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
-	fmt.Printf("%s %s [FakeTCP-Client] %s\n", 
+	fmt.Printf("%s %s [FakeTCP-Client] %s\n",
 		prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
-
-
-
