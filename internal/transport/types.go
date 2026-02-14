@@ -1,7 +1,3 @@
-
-
-
-
 // =============================================================================
 // 文件: internal/transport/types.go
 // 描述: 传输层统一类型定义 - 消除重复定义
@@ -17,17 +13,5 @@ type PacketHandler interface {
 	HandlePacket(data []byte, from *net.UDPAddr) []byte
 }
 
-// ARQHandler ARQ 事件处理接口
-type ARQHandler interface {
-	OnData(data []byte, from *net.UDPAddr)
-	OnConnected(addr *net.UDPAddr)
-	OnDisconnected(addr *net.UDPAddr, reason error)
-}
-
-// TCPConnectionHandler TCP 连接处理接口
-type TCPConnectionHandler interface {
-	HandleConnection(ctx context.Context, conn net.Conn)
-}
-
-
-
+// 注意: ARQHandler 已在 arq_types.go 中定义，此处不再重复
+// 注意: TCPConnectionHandler 已在 tcp.go 中定义，此处不再重复
