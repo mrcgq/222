@@ -1,58 +1,73 @@
-# .github/workflows/release.yml
-#
-# GitHub Actions 工作流：用于发布新版本的 Phantom Server
-#
-# 何时触发:
-# - 当一个以 "v" 开头的标签被推送到仓库时 (例如: v4.0.1)
-#
-# 主要任务:
-# - 自动创建 GitHub Release
-# - 交叉编译适用于多个平台 (Linux, Windows, macOS) 的二进制文件
-# - 编译 eBPF 内核程序
-# - 将二进制文件、eBPF 程序、配置文件示例和安装脚本打包成 .tar.gz 或 .zip
-# - 将所有打包好的资产上传到 GitHub Release
-#
-name: Release
+name: Release Version
 
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - "v*" # 只有推送 v1.0.0, v4.0.1 这样的标签时才触发
 
 permissions:
-  contents: write # 需要此权限来创建和上传 Release
+  contents: write # 需要写权限来创建 Release
 
 jobs:
   release:
-    name: Create Release
+    name: Build and Release
     runs-on: ubuntu-latest
+    
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # 获取所有历史记录，以便生成 changelog
 
       - name: 设置 Go 环境
         uses: actions/setup-go@v5
         with:
           go-version: '1.22.x'
 
+      # 使用 v2 key 缓存
       - name: 缓存 Go 模块
         uses: actions/cache@v4
         with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-1.22-v2-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-1.22-v2-
 
-      - name: 安装 eBPF 和交叉编译依赖
+      - name: 安装依赖 (含 bpftool 修复)
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev bpftool gcc-multilib zip tar
+          sudo apt-get install -y clang llvm libbpf-dev gcc-multilib libelf-dev
+          
+          # 下载并配置静态版 bpftool
+          curl -L https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz | sudo tar -xz -C /usr/local/bin
+          sudo chmod +x /usr/local/bin/bpftool
+          sudo rm -f /usr/bin/bpftool
+          sudo ln -sf /usr/local/bin/bpftool /usr/bin/bpftool
 
-      - name: 运行 GoReleaser (自动完成所有发布工作)
-        uses: goreleaser/goreleaser-action@v5
+      - name: 整理依赖
+        run: go mod tidy
+
+      # 1. 编译 eBPF 内核程序
+      - name: 构建 eBPF 内核程序
+        run: |
+          # 忽略警告参数
+          sed -i 's/CFLAGS :=/CFLAGS := -Wno-address-of-packed-member -Wno-unused-function /' ebpf/Makefile
+          make ebpf
+
+      # 2. 编译全平台主程序
+      - name: 构建全平台二进制文件
+        run: make release
+
+      # 3. 【核心步骤】自动创建 GitHub Release 并上传文件
+      - name: 发布到 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          # 使用 'goreleaser release' 命令
-          args: release --clean
-        env:
-          # GitHub Token 用于创建 Release 和上传文件
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 将 dist 目录下的所有文件，以及 ebpf 的 .o 文件都作为单独的附件上传
+          files: |
+            dist/*
+            ebpf/*.o
+          # 自动生成更新日志
+          generate_release_notes: true
+          # 如果是预发布版本（包含 -beta, -rc），标记为 Pre-release
+          prerelease: ${{ contains(github.ref, '-') }}
