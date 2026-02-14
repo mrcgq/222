@@ -34,18 +34,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib libelf-dev
-          
-          # 1. 下载静态版 bpftool
           curl -L https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz | sudo tar -xz -C /usr/local/bin
-          
-          # 2. 【关键修复】赋予执行权限
           sudo chmod +x /usr/local/bin/bpftool
-          
-          # 3. 强制覆盖系统自带的冲突占位符
           sudo rm -f /usr/bin/bpftool
           sudo ln -sf /usr/local/bin/bpftool /usr/bin/bpftool
-          
-          # 4. 验证安装
           bpftool version
           clang --version
 
@@ -60,5 +52,18 @@ jobs:
 
       - name: 验证构建产物
         run: |
-          ls -l phantom-server || true
-          ls -l ebpf/*.o || true
+          ls -l phantom-server
+          ls -l ebpf/*.o
+
+      # ==========================================================
+      # 新增步骤：上传构建产物
+      # ==========================================================
+      - name: 上传构建产物 (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          # 打包后的文件名
+          name: phantom-server-binaries-ubuntu
+          # 要打包的文件路径
+          path: |
+            ./phantom-server
+            ./ebpf/*.o
