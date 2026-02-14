@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/transport/tcp.go
 // 描述: TCP 传输层 (保留原有功能，增加与新架构的兼容)
@@ -26,6 +24,11 @@ const (
 	WriteTimeout = 30 * time.Second
 )
 
+// TCPConnectionHandler TCP 连接处理接口 (唯一定义位置)
+type TCPConnectionHandler interface {
+	HandleConnection(ctx context.Context, conn net.Conn)
+}
+
 // TCPServer TCP 服务器
 type TCPServer struct {
 	addr     string
@@ -37,11 +40,6 @@ type TCPServer struct {
 	conns  sync.Map // net.Conn -> struct{}
 	stopCh chan struct{}
 	wg     sync.WaitGroup
-}
-
-// TCPConnectionHandler TCP 连接处理接口
-type TCPConnectionHandler interface {
-	HandleConnection(ctx context.Context, conn net.Conn)
 }
 
 // NewTCPServer 创建 TCP 服务器
@@ -249,6 +247,3 @@ func (w *FrameWriter) WriteFrame(data []byte) error {
 	_, err := w.conn.Write(w.buf[:total])
 	return err
 }
-
-
-
