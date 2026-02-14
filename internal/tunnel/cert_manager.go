@@ -667,7 +667,7 @@ func (m *CertManager) prefetchCertificates() {
 	for _, domain := range cfg.Domains {
 		m.log(1, "获取证书: %s", domain)
 
-		fetchCtx, cancel := context.WithTimeout(m.ctx, 5*time.Minute)
+		certCtx, cancel := context.WithTimeout(m.ctx, 5*time.Minute)
 
 		cert, err := m.autocertManager.GetCertificate(&tls.ClientHelloInfo{
 			ServerName: domain,
@@ -697,7 +697,10 @@ func (m *CertManager) prefetchCertificates() {
 		select {
 		case <-m.ctx.Done():
 			return
+		case <-certCtx.Done():
+			// certCtx 超时但主 ctx 未取消，继续下一个
 		default:
+			// 正常继续
 		}
 	}
 
