@@ -192,8 +192,8 @@ func (e *EBPFAccelerator) checkEBPFSupport() bool {
 		return false
 	}
 
-	// 转换 Release 字段 - 使用跨平台方式
-	release := utsReleaseToString(uname.Release)
+	// 使用 unsafe 转换 Release 字段，兼容不同架构
+	release := utsReleaseToString(&uname)
 	var major, minor int
 	fmt.Sscanf(release, "%d.%d", &major, &minor)
 
@@ -226,22 +226,22 @@ func (e *EBPFAccelerator) checkEBPFSupport() bool {
 }
 
 // utsReleaseToString 将 utsname.Release 转换为字符串
-// 使用 unsafe 处理不同架构上 int8/uint8 的差异
-func utsReleaseToString(release [65]byte) string {
-	// 直接将数组作为字节处理
-	var buf []byte
-	for _, v := range release {
-		if v == 0 {
+// 使用 unsafe.Pointer 处理不同架构上 int8/uint8 的差异
+func utsReleaseToString(uname *syscall.Utsname) string {
+	// 获取 Release 字段的指针，转换为 byte 指针
+	ptr := unsafe.Pointer(&uname.Release[0])
+	length := len(uname.Release)
+
+	// 创建 byte slice
+	bytes := make([]byte, 0, length)
+	for i := 0; i < length; i++ {
+		b := *(*byte)(unsafe.Pointer(uintptr(ptr) + uintptr(i)))
+		if b == 0 {
 			break
 		}
-		buf = append(buf, v)
+		bytes = append(bytes, b)
 	}
-	return string(buf)
-}
-
-// int8ArrayToBytes 将 int8 数组转换为 byte 数组（跨平台兼容）
-func int8ArrayToBytes(arr *[65]int8) []byte {
-	return (*[65]byte)(unsafe.Pointer(arr))[:]
+	return string(bytes)
 }
 
 // configureListenPort 配置监听端口
