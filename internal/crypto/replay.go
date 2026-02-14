@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/crypto/replay.go
 // =============================================================================
@@ -7,7 +5,6 @@
 package crypto
 
 import (
-	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,12 +27,12 @@ const (
 
 // ReplayGuard 高性能防重放保护
 type ReplayGuard struct {
-	slices      [maxSlices]*timeSlice
-	currentIdx  int64
-	exactCache  *lruCache // 处理布隆过滤器误报
-	
-	mu          sync.RWMutex
-	stats       ReplayStats
+	slices     [maxSlices]*timeSlice
+	currentIdx int64
+	exactCache *lruCache // 处理布隆过滤器误报
+
+	mu    sync.RWMutex
+	stats ReplayStats
 }
 
 // ReplayStats 统计信息
@@ -130,7 +127,7 @@ func (rg *ReplayGuard) CheckAndMark(nonce []byte) bool {
 			// 布隆过滤器命中，可能是真正的重放或误报
 			// 添加到精确缓存以便后续快速判断
 			atomic.AddUint64(&rg.stats.BloomHits, 1)
-			
+
 			// 这里我们保守处理：认为是重放
 			// 如果需要更精确，可以维护一个最近的 nonce 列表
 			atomic.AddUint64(&rg.stats.ReplayBlocked, 1)
@@ -295,6 +292,3 @@ func (c *lruCache) contains(key uint64) bool {
 	_, exists := c.items[key]
 	return exists
 }
-
-
-
