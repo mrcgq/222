@@ -656,6 +656,7 @@ func (m *CertManager) startTLSALPN01Challenge() error {
 	return nil
 }
 
+
 // prefetchCertificates 预获取证书
 func (m *CertManager) prefetchCertificates() {
 	// 等待服务启动
@@ -698,6 +699,7 @@ func (m *CertManager) prefetchCertificates() {
 		case <-m.ctx.Done():
 			return
 		default:
+			// 正常继续
 		}
 	}
 
@@ -711,6 +713,7 @@ func (m *CertManager) prefetchCertificates() {
 		m.signalCertReady()
 	}
 }
+
 
 // =============================================================================
 // 手动 ACME 流程（用于更多控制）
