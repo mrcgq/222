@@ -20,7 +20,6 @@ import (
 
 	"github.com/mrcgq/211/internal/config"
 	"github.com/mrcgq/211/internal/crypto"
-	"github.com/mrcgq/211/internal/metrics"
 	"github.com/mrcgq/211/internal/protocol"
 	"github.com/mrcgq/211/internal/transport"
 )
@@ -63,9 +62,8 @@ type Sender func(data []byte, addr *net.UDPAddr) error
 // UnifiedHandler 统一处理器 - 用户态核心处理中心
 type UnifiedHandler struct {
 	// 依赖注入
-	crypto  *crypto.Crypto  // 加密器
-	cfg     *config.Config  // 配置
-	metrics *metrics.PhantomMetrics // 指标收集器
+	crypto *crypto.Crypto // 加密器
+	cfg    *config.Config // 配置
 
 	// 日志配置
 	logLevel int
@@ -152,11 +150,6 @@ func parseLogLevel(level string) int {
 // =============================================================================
 // 公共接口
 // =============================================================================
-
-// SetMetrics 设置指标收集器
-func (h *UnifiedHandler) SetMetrics(m *metrics.PhantomMetrics) {
-	h.metrics = m
-}
 
 // SetSender 设置数据发送回调（由传输层调用）
 func (h *UnifiedHandler) SetSender(fn Sender) {
@@ -270,11 +263,6 @@ func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAd
 	atomic.AddUint64(&h.stats.totalConns, 1)
 	atomic.AddInt64(&h.stats.activeConns, 1)
 
-	// 更新指标
-	if h.metrics != nil {
-		h.metrics.IncConnections()
-	}
-
 	// 发送初始数据（如果有）
 	if len(req.Data) > 0 {
 		if err := h.writeToTarget(conn, req.Data); err != nil {
@@ -353,11 +341,6 @@ func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 		atomic.AddUint64(&conn.BytesRecv, uint64(n))
 		atomic.AddUint64(&h.stats.totalBytes, uint64(n))
 
-		// 更新指标
-		if h.metrics != nil {
-			h.metrics.AddBytesReceived(int64(n))
-		}
-
 		// 发送响应到客户端
 		h.sendUDPResponse(conn.ID, protocol.TypeData, buf[:n], clientAddr)
 	}
@@ -383,8 +366,6 @@ func (h *UnifiedHandler) sendUDPResponse(reqID uint32, status byte, data []byte,
 	// 通过传输层发送
 	if err := h.sender(encrypted, to); err != nil {
 		h.log(LogLevelDebug, "发送响应失败: %v", err)
-	} else if h.metrics != nil {
-		h.metrics.AddBytesSent(int64(len(encrypted)))
 	}
 }
 
@@ -396,12 +377,6 @@ func (h *UnifiedHandler) sendUDPResponse(reqID uint32, status byte, data []byte,
 func (h *UnifiedHandler) HandleConnection(ctx context.Context, clientConn net.Conn) {
 	atomic.AddInt64(&h.stats.activeConns, 1)
 	defer atomic.AddInt64(&h.stats.activeConns, -1)
-
-	// 更新指标
-	if h.metrics != nil {
-		h.metrics.IncConnections()
-		defer h.metrics.DecConnections()
-	}
 
 	clientAddr := clientConn.RemoteAddr().String()
 	h.log(LogLevelDebug, "TCP 新连接: %s", clientAddr)
@@ -598,11 +573,9 @@ func (h *UnifiedHandler) tcpClientToTarget(
 		case protocol.TypeData:
 			if len(req.Data) > 0 {
 				_ = targetConn.SetWriteDeadline(time.Now().Add(writeTimeout))
-				if n, err := targetConn.Write(req.Data); err != nil {
+				if _, err := targetConn.Write(req.Data); err != nil {
 					h.log(LogLevelDebug, "写入目标失败: ID:%d - %v", reqID, err)
 					return
-				} else if h.metrics != nil {
-					h.metrics.AddBytesSent(int64(n))
 				}
 			}
 
@@ -643,11 +616,6 @@ func (h *UnifiedHandler) tcpTargetToClient(
 			return
 		}
 
-		// 更新指标
-		if h.metrics != nil {
-			h.metrics.AddBytesReceived(int64(n))
-		}
-
 		// 发送到客户端
 		if err := h.sendTCPResponse(writer, reqID, protocol.TypeData, buf[:n]); err != nil {
 			h.log(LogLevelDebug, "发送到客户端失败: ID:%d - %v", reqID, err)
@@ -668,16 +636,7 @@ func (h *UnifiedHandler) sendTCPResponse(writer *transport.FrameWriter, reqID ui
 	}
 
 	// 发送帧
-	if err := writer.WriteFrame(encrypted); err != nil {
-		return err
-	}
-
-	// 更新指标
-	if h.metrics != nil {
-		h.metrics.AddBytesSent(int64(len(encrypted)))
-	}
-
-	return nil
+	return writer.WriteFrame(encrypted)
 }
 
 // =============================================================================
@@ -714,11 +673,6 @@ func (h *UnifiedHandler) closeConnection(reqID uint32) {
 	// 更新统计
 	atomic.AddInt64(&h.stats.activeConns, -1)
 
-	// 更新指标
-	if h.metrics != nil {
-		h.metrics.DecConnections()
-	}
-
 	h.log(LogLevelInfo, "连接关闭: ID:%d %s (sent:%d recv:%d duration:%s)",
 		reqID, conn.TargetAddr, conn.BytesSent, conn.BytesRecv,
 		time.Since(conn.CreatedAt).Round(time.Second))
@@ -735,11 +689,6 @@ func (h *UnifiedHandler) writeToTarget(conn *ProxyConnection, data []byte) error
 
 	atomic.AddUint64(&conn.BytesSent, uint64(n))
 	atomic.AddUint64(&h.stats.totalBytes, uint64(n))
-
-	// 更新指标
-	if h.metrics != nil {
-		h.metrics.AddBytesSent(int64(n))
-	}
 
 	return nil
 }
