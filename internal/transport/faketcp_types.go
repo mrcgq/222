@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/transport/faketcp_types.go
 // 描述: FakeTCP 伪装 - 类型定义 (支持 IPv4/IPv6 双栈)
@@ -25,8 +23,8 @@ const (
 	IPv6PseudoHdrSize = 40
 
 	// 伪头部大小
-	PseudoHeaderSize     = 12 // IPv4
-	PseudoHeaderV6Size   = 40 // IPv6
+	PseudoHeaderSize   = 12 // IPv4
+	PseudoHeaderV6Size = 40 // IPv6
 
 	// TCP 标志位
 	TCPFlagFIN = 0x01
@@ -48,6 +46,7 @@ const (
 	TCPOptTimestamp = 8
 
 	// 默认值
+	DefaultMSS        = 1460 // 默认 MSS (兼容旧代码)
 	DefaultTCPMSS     = 1460
 	DefaultTCPMSSv6   = 1440 // IPv6 头部更大，MSS 稍小
 	DefaultTCPWindow  = 65535
@@ -163,24 +162,24 @@ type UnifiedIPHeader interface {
 }
 
 // 实现 UnifiedIPHeader 接口
-func (h *IPHeader) GetVersion() uint8        { return 4 }
-func (h *IPHeader) GetSrcIP() net.IP         { return h.SrcIP }
-func (h *IPHeader) GetDstIP() net.IP         { return h.DstIP }
-func (h *IPHeader) GetProtocol() uint8       { return h.Protocol }
-func (h *IPHeader) GetPayloadLength() int    { return int(h.TotalLen) - int(h.IHL)*4 }
+func (h *IPHeader) GetVersion() uint8     { return 4 }
+func (h *IPHeader) GetSrcIP() net.IP      { return h.SrcIP }
+func (h *IPHeader) GetDstIP() net.IP      { return h.DstIP }
+func (h *IPHeader) GetProtocol() uint8    { return h.Protocol }
+func (h *IPHeader) GetPayloadLength() int { return int(h.TotalLen) - int(h.IHL)*4 }
 
-func (h *IPv6Header) GetVersion() uint8      { return 6 }
-func (h *IPv6Header) GetSrcIP() net.IP       { return h.SrcIP }
-func (h *IPv6Header) GetDstIP() net.IP       { return h.DstIP }
-func (h *IPv6Header) GetProtocol() uint8     { return h.NextHeader }
-func (h *IPv6Header) GetPayloadLength() int  { return int(h.PayloadLen) }
+func (h *IPv6Header) GetVersion() uint8     { return 6 }
+func (h *IPv6Header) GetSrcIP() net.IP      { return h.SrcIP }
+func (h *IPv6Header) GetDstIP() net.IP      { return h.DstIP }
+func (h *IPv6Header) GetProtocol() uint8    { return h.NextHeader }
+func (h *IPv6Header) GetPayloadLength() int { return int(h.PayloadLen) }
 
 // FakeTCPPacket 完整的 FakeTCP 数据包 (支持双栈)
 type FakeTCPPacket struct {
 	// IP 层 (二选一)
 	IPHeader   *IPHeader   // IPv4
 	IPv6Header *IPv6Header // IPv6
-	
+
 	// TCP 层
 	TCPHeader *TCPHeader
 	Payload   []byte
@@ -280,11 +279,11 @@ func NewBinarySessionKey(local, remote *net.UDPAddr) BinarySessionKey {
 		LocalPort:  uint16(local.Port),
 		RemotePort: uint16(remote.Port),
 	}
-	
+
 	// 检测 IP 版本
 	localIP4 := local.IP.To4()
 	remoteIP4 := remote.IP.To4()
-	
+
 	if localIP4 != nil && remoteIP4 != nil {
 		// IPv4
 		copy(key.LocalIP[:4], localIP4)
@@ -296,7 +295,7 @@ func NewBinarySessionKey(local, remote *net.UDPAddr) BinarySessionKey {
 		copy(key.RemoteIP[:], remote.IP.To16())
 		key.IsIPv6 = true
 	}
-	
+
 	return key
 }
 
@@ -429,9 +428,9 @@ type FakeTCPConfig struct {
 	RandomizeISN bool
 
 	// IPv6 特定
-	EnableIPv6  bool
-	PreferIPv6  bool
-	FlowLabel   uint32
+	EnableIPv6 bool
+	PreferIPv6 bool
+	FlowLabel  uint32
 
 	// 日志
 	LogLevel string
@@ -491,8 +490,8 @@ type FakeTCPStats struct {
 	FailedHandshakes  uint64
 
 	// IPv6 统计
-	IPv6Sessions    uint64
-	IPv4Sessions    uint64
+	IPv6Sessions uint64
+	IPv4Sessions uint64
 
 	// 数据统计
 	BytesSent       uint64
@@ -538,6 +537,3 @@ func NormalizeIP(ip net.IP) net.IP {
 	}
 	return ip.To16()
 }
-
-
-
