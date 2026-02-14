@@ -1,6 +1,3 @@
-
-
-
 // =============================================================================
 // 文件: internal/switcher/switcher.go
 // 描述: 智能链路切换 - 核心切换器 (修复锁竞争、ARQ 逻辑、质量异步更新)
@@ -19,6 +16,7 @@ import (
 	"github.com/mrcgq/211/internal/congestion"
 	"github.com/mrcgq/211/internal/crypto"
 	"github.com/mrcgq/211/internal/handler"
+	"github.com/mrcgq/211/internal/metrics"
 	"github.com/mrcgq/211/internal/transport"
 )
 
@@ -28,6 +26,7 @@ type Switcher struct {
 	switchCfg *SwitcherConfig
 	crypto    *crypto.Crypto
 	handler   *handler.UnifiedHandler
+	metrics   *metrics.PhantomMetrics // 指标收集器
 
 	transports map[TransportMode]TransportHandler
 	udpServer  *transport.UDPServer
@@ -157,6 +156,11 @@ func New(cfg *config.Config, cry *crypto.Crypto, h *handler.UnifiedHandler) *Swi
 	return s
 }
 
+// SetMetrics 设置指标收集器
+func (s *Switcher) SetMetrics(m *metrics.PhantomMetrics) {
+	s.metrics = m
+}
+
 // Start 启动切换器
 func (s *Switcher) Start(ctx context.Context) error {
 	s.log(1, "启动智能链路切换器...")
@@ -228,11 +232,11 @@ func (s *Switcher) startTransports(ctx context.Context) error {
 	// 启用 ARQ 增强层
 	if s.cfg.ARQ.Enabled {
 		arqConfig := &transport.ARQConnConfig{
-			MaxWindowSize:  s.cfg.ARQ.WindowSize,
-			RTOMin:         time.Duration(s.cfg.ARQ.RTOMinMs) * time.Millisecond,
-			RTOMax:         time.Duration(s.cfg.ARQ.RTOMaxMs) * time.Millisecond,
-			MaxRetries:     s.cfg.ARQ.MaxRetries,
-			EnableSACK:     s.cfg.ARQ.EnableSACK,
+			MaxWindowSize:   s.cfg.ARQ.WindowSize,
+			RTOMin:          time.Duration(s.cfg.ARQ.RTOMinMs) * time.Millisecond,
+			RTOMax:          time.Duration(s.cfg.ARQ.RTOMaxMs) * time.Millisecond,
+			MaxRetries:      s.cfg.ARQ.MaxRetries,
+			EnableSACK:      s.cfg.ARQ.EnableSACK,
 			EnableTimestamp: s.cfg.ARQ.EnableTimestamp,
 		}
 		arqHandler := &arqHandlerWrapper{handler: s.handler}
@@ -421,6 +425,11 @@ func (s *Switcher) doSwitch(fromMode, toMode TransportMode, reason SwitchReason)
 	atomic.AddUint64(&s.totalSwitches, 1)
 	atomic.AddUint64(&s.successSwitches, 1)
 
+	// 更新指标
+	if s.metrics != nil {
+		s.metrics.RecordModeSwitch(string(oldMode), string(toMode))
+	}
+
 	s.log(1, "链路切换: %s -> %s (原因: %s, 耗时: %v)",
 		oldMode, toMode, reason, event.Duration)
 }
@@ -502,6 +511,11 @@ func (s *Switcher) SendTo(data []byte, addr *net.UDPAddr) error {
 		// 队列满，丢弃更新
 	}
 
+	// 更新指标
+	if s.metrics != nil && err == nil {
+		s.metrics.AddBytesSent(int64(len(data)))
+	}
+
 	return err
 }
 
@@ -564,7 +578,6 @@ func (s *Switcher) SwitchMode(mode TransportMode) error {
 	s.doSwitch(currentMode, mode, ReasonManual)
 	return nil
 }
-
 
 // GetStats 获取统计信息
 func (s *Switcher) GetStats() *SwitcherStats {
@@ -646,6 +659,3 @@ func (s *Switcher) log(level int, format string, args ...interface{}) {
 	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
 	fmt.Printf("%s %s [Switcher] %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
-
-
-
