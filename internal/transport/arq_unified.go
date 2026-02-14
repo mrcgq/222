@@ -1,8 +1,3 @@
-
-
-
-
-
 // =============================================================================
 // 文件: internal/transport/arq_unified.go
 // 描述: ARQ 统一接口适配器 - 解决版本冲突
@@ -10,7 +5,6 @@
 package transport
 
 import (
-	"net"
 	"time"
 
 	"github.com/mrcgq/211/internal/congestion"
@@ -57,7 +51,3 @@ func (a *ARQCongestionAdapter) CanSend(size int) bool {
 	}
 	return true
 }
-
-
-
-
