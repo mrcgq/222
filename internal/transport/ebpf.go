@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // EBPFAccelerator eBPF 加速器
@@ -191,8 +192,8 @@ func (e *EBPFAccelerator) checkEBPFSupport() bool {
 		return false
 	}
 
-	// 转换 Release 字段
-	release := parseUtsRelease(uname.Release)
+	// 转换 Release 字段 - 使用跨平台方式
+	release := utsReleaseToString(uname.Release)
 	var major, minor int
 	fmt.Sscanf(release, "%d.%d", &major, &minor)
 
@@ -224,17 +225,23 @@ func (e *EBPFAccelerator) checkEBPFSupport() bool {
 	return true
 }
 
-// parseUtsRelease 解析 utsname.Release 字段
-// 在不同 Linux 架构上，Release 可能是 [65]int8 或 [65]uint8
-func parseUtsRelease(release [65]int8) string {
+// utsReleaseToString 将 utsname.Release 转换为字符串
+// 使用 unsafe 处理不同架构上 int8/uint8 的差异
+func utsReleaseToString(release [65]byte) string {
+	// 直接将数组作为字节处理
 	var buf []byte
 	for _, v := range release {
 		if v == 0 {
 			break
 		}
-		buf = append(buf, byte(v))
+		buf = append(buf, v)
 	}
 	return string(buf)
+}
+
+// int8ArrayToBytes 将 int8 数组转换为 byte 数组（跨平台兼容）
+func int8ArrayToBytes(arr *[65]int8) []byte {
+	return (*[65]byte)(unsafe.Pointer(arr))[:]
 }
 
 // configureListenPort 配置监听端口
