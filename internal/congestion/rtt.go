@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/congestion/rtt.go
 // 描述: RTT 测量与估算 (RFC 6298)
@@ -34,9 +32,9 @@ type RTTEstimator struct {
 	minRTTWindow    time.Duration
 
 	// 采样历史
-	samples      []rttSample
-	sampleIdx    int
-	sampleCount  int
+	samples     []rttSampleEntry
+	sampleIdx   int
+	sampleCount int
 
 	// 统计
 	totalSamples uint64
@@ -48,7 +46,8 @@ type RTTEstimator struct {
 	mu sync.RWMutex
 }
 
-type rttSample struct {
+// rttSampleEntry RTT 采样条目（重命名避免与函数参数冲突）
+type rttSampleEntry struct {
 	rtt       time.Duration
 	timestamp time.Time
 }
@@ -60,14 +59,14 @@ func NewRTTEstimator() *RTTEstimator {
 		rttVariance:  defaultInitRTT / 2,
 		minRTT:       0,
 		minRTTWindow: minRTTWindow,
-		samples:      make([]rttSample, rttSampleSize),
+		samples:      make([]rttSampleEntry, rttSampleSize),
 		initialized:  false,
 	}
 }
 
 // Update 更新 RTT (RFC 6298 算法)
-func (r *RTTEstimator) Update(rttSample time.Duration, ackDelay time.Duration) {
-	if rttSample <= 0 {
+func (r *RTTEstimator) Update(rttMeasurement time.Duration, ackDelay time.Duration) {
+	if rttMeasurement <= 0 {
 		return
 	}
 
@@ -77,9 +76,9 @@ func (r *RTTEstimator) Update(rttSample time.Duration, ackDelay time.Duration) {
 	now := time.Now()
 
 	// 调整 ACK 延迟
-	adjustedRTT := rttSample
-	if ackDelay > 0 && rttSample > ackDelay {
-		adjustedRTT = rttSample - ackDelay
+	adjustedRTT := rttMeasurement
+	if ackDelay > 0 && rttMeasurement > ackDelay {
+		adjustedRTT = rttMeasurement - ackDelay
 	}
 
 	r.latestRTT = adjustedRTT
@@ -87,7 +86,7 @@ func (r *RTTEstimator) Update(rttSample time.Duration, ackDelay time.Duration) {
 	r.sumRTT += adjustedRTT
 
 	// 记录采样
-	r.samples[r.sampleIdx] = rttSample{
+	r.samples[r.sampleIdx] = rttSampleEntry{
 		rtt:       adjustedRTT,
 		timestamp: now,
 	}
@@ -258,14 +257,13 @@ func (r *RTTEstimator) GetStats() map[string]interface{} {
 	defer r.mu.RUnlock()
 
 	return map[string]interface{}{
-		"srtt_ms":        r.smoothedRTT.Milliseconds(),
-		"min_rtt_ms":     r.minRTT.Milliseconds(),
-		"latest_rtt_ms":  r.latestRTT.Milliseconds(),
-		"max_rtt_ms":     r.maxRTT.Milliseconds(),
-		"rtt_var_ms":     r.rttVariance.Milliseconds(),
-		"rto_ms":         r.GetRTO().Milliseconds(),
-		"total_samples":  r.totalSamples,
-		"initialized":    r.initialized,
+		"srtt_ms":       r.smoothedRTT.Milliseconds(),
+		"min_rtt_ms":    r.minRTT.Milliseconds(),
+		"latest_rtt_ms": r.latestRTT.Milliseconds(),
+		"max_rtt_ms":    r.maxRTT.Milliseconds(),
+		"rtt_var_ms":    r.rttVariance.Milliseconds(),
+		"rto_ms":        r.GetRTO().Milliseconds(),
+		"total_samples": r.totalSamples,
+		"initialized":   r.initialized,
 	}
 }
-
