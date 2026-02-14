@@ -1,8 +1,3 @@
-
-
-
-
-
 // =============================================================================
 // 文件: internal/handler/unified_handler.go
 // 描述: 统一处理器 - 用户态核心处理中心，负责解析数据包并驱动代理逻辑
@@ -38,6 +33,12 @@ const (
 	LogLevelError = iota
 	LogLevelInfo
 	LogLevelDebug
+)
+
+// 响应状态码 (本地定义，避免依赖 protocol 包的常量)
+const (
+	StatusOK    byte = 0x00 // 成功
+	StatusError byte = 0x01 // 错误
 )
 
 // 超时配置
@@ -239,7 +240,7 @@ func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAd
 	targetConn, err := net.DialTimeout(network, target, connectTimeout)
 	if err != nil {
 		h.log(LogLevelDebug, "连接目标失败: %s - %v", target, err)
-		h.sendUDPResponse(req.ReqID, protocol.StatusError, nil, from)
+		h.sendUDPResponse(req.ReqID, StatusError, nil, from)
 		return
 	}
 
@@ -271,7 +272,7 @@ func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAd
 	}
 
 	// 发送成功响应
-	h.sendUDPResponse(req.ReqID, protocol.StatusOK, nil, from)
+	h.sendUDPResponse(req.ReqID, StatusOK, nil, from)
 
 	// 启动异步读取循环
 	go h.udpReadLoop(conn)
@@ -467,7 +468,7 @@ func (h *UnifiedHandler) handleTCPConnect(
 	targetConn, err := net.DialTimeout(network, target, connectTimeout)
 	if err != nil {
 		h.log(LogLevelDebug, "连接目标失败: %s - %v", target, err)
-		_ = h.sendTCPResponse(writer, req.ReqID, protocol.StatusError, nil)
+		_ = h.sendTCPResponse(writer, req.ReqID, StatusError, nil)
 		return
 	}
 	defer targetConn.Close()
@@ -480,13 +481,13 @@ func (h *UnifiedHandler) handleTCPConnect(
 		_ = targetConn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if _, err := targetConn.Write(req.Data); err != nil {
 			h.log(LogLevelDebug, "发送初始数据失败: %v", err)
-			_ = h.sendTCPResponse(writer, req.ReqID, protocol.StatusError, nil)
+			_ = h.sendTCPResponse(writer, req.ReqID, StatusError, nil)
 			return
 		}
 	}
 
 	// 发送成功响应
-	if err := h.sendTCPResponse(writer, req.ReqID, protocol.StatusOK, nil); err != nil {
+	if err := h.sendTCPResponse(writer, req.ReqID, StatusOK, nil); err != nil {
 		h.log(LogLevelDebug, "发送响应失败: %v", err)
 		return
 	}
@@ -813,6 +814,3 @@ func (h *UnifiedHandler) log(level int, format string, args ...interface{}) {
 		time.Now().Format("15:04:05"),
 		fmt.Sprintf(format, args...))
 }
-
-
-
