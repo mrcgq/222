@@ -1,3 +1,5 @@
+
+//go:build linux
 // =============================================================================
 // 文件: internal/transport/ebpf_loader.go
 // 描述: eBPF 加速 - 程序加载器 (支持 Map Pinning 和平滑重启)
