@@ -1,6 +1,3 @@
-
-
-
 // =============================================================================
 // 文件: internal/transport/ebpf_loader.go
 // 描述: eBPF 加速 - 程序加载器 (支持 Map Pinning 和平滑重启)
@@ -8,6 +5,7 @@
 package transport
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,17 +25,17 @@ import (
 const (
 	// BPF 文件系统路径
 	DefaultBPFFS = "/sys/fs/bpf"
-	
+
 	// Pin 路径前缀
 	PinPathPrefix = "phantom"
-	
+
 	// Map 名称常量
 	MapNameSessions    = "sessions"
 	MapNameListenPorts = "listen_ports"
 	MapNameConfig      = "config"
 	MapNameStats       = "stats"
 	MapNameEvents      = "events"
-	
+
 	// Link 名称
 	LinkNameXDP = "xdp_link"
 )
@@ -63,19 +61,19 @@ const (
 // EBPFLoaderConfig 加载器配置
 type EBPFLoaderConfig struct {
 	*EBPFConfig
-	
+
 	// Pinning 配置
-	EnablePinning   bool    // 启用 Map Pinning
-	PinMode         PinMode // Pinning 模式
-	PinPath         string  // Pin 路径 (默认: /sys/fs/bpf/phantom)
-	
+	EnablePinning bool    // 启用 Map Pinning
+	PinMode       PinMode // Pinning 模式
+	PinPath       string  // Pin 路径 (默认: /sys/fs/bpf/phantom)
+
 	// 平滑重启配置
 	GracefulRestart bool          // 支持平滑重启
 	StateTimeout    time.Duration // 状态保留超时
-	
+
 	// 清理配置
-	CleanupOnExit   bool // 退出时清理 pinned 资源
-	CleanupOrphans  bool // 清理孤立的 pinned 资源
+	CleanupOnExit  bool // 退出时清理 pinned 资源
+	CleanupOrphans bool // 清理孤立的 pinned 资源
 }
 
 // DefaultEBPFLoaderConfig 默认配置
@@ -493,7 +491,7 @@ func (l *EBPFLoader) savePinMetadata() error {
 	}
 
 	metaPath := filepath.Join(l.config.PinPath, "metadata.json")
-	
+
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return err
@@ -505,7 +503,7 @@ func (l *EBPFLoader) savePinMetadata() error {
 // loadPinMetadata 加载元数据
 func (l *EBPFLoader) loadPinMetadata() (*PinMetadata, error) {
 	metaPath := filepath.Join(l.config.PinPath, "metadata.json")
-	
+
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		return nil, err
@@ -610,7 +608,7 @@ func (l *EBPFLoader) Attach() error {
 // tryReusePinnedLink 尝试复用已 pin 的 link
 func (l *EBPFLoader) tryReusePinnedLink() error {
 	linkPath := l.getLinkPinPath(LinkNameXDP)
-	
+
 	pinnedLink, err := link.LoadPinnedLink(linkPath, nil)
 	if err != nil {
 		return err
@@ -1171,7 +1169,3 @@ func getInterfaceByName(name string) (*netInterface, error) {
 		Index: int(index),
 	}, nil
 }
-
-
-
-
