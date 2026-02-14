@@ -1,6 +1,3 @@
-
-
-
 // =============================================================================
 // 文件: internal/config/config.go
 // 描述: 配置管理 - 修复配置隐性关联、端口冲突检测、ARQ 优先级验证
@@ -144,6 +141,11 @@ type TunnelConfig struct {
 	NoTLSVerify bool   `yaml:"no_tls_verify"`
 	Metrics     string `yaml:"metrics"`
 	LogLevel    string `yaml:"log_level"`
+
+	// 高级配置
+	AutoRestart    bool `yaml:"auto_restart"`
+	MaxRestarts    int  `yaml:"max_restarts"`
+	RestartDelaySec int `yaml:"restart_delay_sec"`
 }
 
 // DuckDNSConfig DuckDNS 配置
@@ -255,22 +257,28 @@ func DefaultConfig() *Config {
 		},
 
 		Tunnel: TunnelConfig{
-			Enabled:    false,
-			Mode:       "temp",
-			DomainMode: "auto",
-			CertMode:   "auto",
-			LocalAddr:  "127.0.0.1",
-			Protocol:   "http",
-			LogLevel:   "info",
+			Enabled:         false,
+			Mode:            "temp",
+			DomainMode:      "auto",
+			CertMode:        "auto",
+			LocalAddr:       "127.0.0.1",
+			Protocol:        "http",
+			LogLevel:        "info",
+			AutoRestart:     true,
+			MaxRestarts:     5,
+			RestartDelaySec: 5,
 		},
 	}
 }
 
 // Validate 验证配置
 func (c *Config) Validate() error {
+	// 验证 PSK
 	if c.PSK == "" {
 		return fmt.Errorf("psk 不能为空")
 	}
+
+	// 验证时间窗口
 	if c.TimeWindow < 1 || c.TimeWindow > 300 {
 		return fmt.Errorf("time_window 需在 1-300 之间")
 	}
@@ -332,6 +340,12 @@ func (c *Config) Validate() error {
 		if c.ARQ.MaxRetries < 1 || c.ARQ.MaxRetries > 50 {
 			return fmt.Errorf("arq.max_retries 需在 1-50 之间")
 		}
+		if c.ARQ.RTOMinMs < 10 || c.ARQ.RTOMinMs > 5000 {
+			return fmt.Errorf("arq.rto_min_ms 需在 10-5000 之间")
+		}
+		if c.ARQ.RTOMaxMs < c.ARQ.RTOMinMs || c.ARQ.RTOMaxMs > 60000 {
+			return fmt.Errorf("arq.rto_max_ms 需大于 rto_min_ms 且不超过 60000")
+		}
 	}
 
 	// 验证切换器优先级不包含 ARQ
@@ -341,6 +355,199 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// 验证隧道配置
+	if c.Tunnel.Enabled {
+		if err := c.validateTunnelConfig(); err != nil {
+			return fmt.Errorf("隧道配置错误: %w", err)
+		}
+	}
+
+	// 验证 Hysteria2 配置
+	if c.Hysteria2.Enabled {
+		if err := c.validateHysteria2Config(); err != nil {
+			return fmt.Errorf("hysteria2 配置错误: %w", err)
+		}
+	}
+
+	// 验证 EBPF 配置
+	if c.EBPF.Enabled {
+		if err := c.validateEBPFConfig(); err != nil {
+			return fmt.Errorf("ebpf 配置错误: %w", err)
+		}
+	}
+
+	// 验证 WebSocket 配置
+	if c.WebSocket.Enabled {
+		if err := c.validateWebSocketConfig(); err != nil {
+			return fmt.Errorf("websocket 配置错误: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// validateTunnelConfig 验证隧道配置
+func (c *Config) validateTunnelConfig() error {
+	// 验证模式
+	switch c.Tunnel.Mode {
+	case "temp", "fixed", "direct":
+		// 有效模式
+	case "":
+		// 默认为 temp
+		c.Tunnel.Mode = "temp"
+	default:
+		return fmt.Errorf("无效的隧道模式: %s (支持: temp, fixed, direct)", c.Tunnel.Mode)
+	}
+
+	// 固定隧道需要 token
+	if c.Tunnel.Mode == "fixed" {
+		if c.Tunnel.CFToken == "" {
+			return fmt.Errorf("固定隧道模式需要配置 cf_token")
+		}
+	}
+
+	// 验证协议
+	switch c.Tunnel.Protocol {
+	case "", "http", "https", "tcp":
+		// 有效协议
+		if c.Tunnel.Protocol == "" {
+			c.Tunnel.Protocol = "http"
+		}
+	default:
+		return fmt.Errorf("无效的隧道协议: %s (支持: http, https, tcp)", c.Tunnel.Protocol)
+	}
+
+	// 验证域名模式
+	switch c.Tunnel.DomainMode {
+	case "", "auto", "sslip", "nip", "duckdns", "freedns", "custom":
+		// 有效模式
+	default:
+		return fmt.Errorf("无效的域名模式: %s", c.Tunnel.DomainMode)
+	}
+
+	// 验证证书模式
+	switch c.Tunnel.CertMode {
+	case "", "auto", "selfsigned", "letsencrypt", "zerossl", "cforigin", "custom":
+		// 有效模式
+	default:
+		return fmt.Errorf("无效的证书模式: %s", c.Tunnel.CertMode)
+	}
+
+	// 如果是自定义域名模式，需要指定域名
+	if c.Tunnel.DomainMode == "custom" && c.Tunnel.Domain == "" {
+		return fmt.Errorf("自定义域名模式需要配置 domain")
+	}
+
+	// 如果是自定义证书模式，需要指定证书文件
+	if c.Tunnel.CertMode == "custom" {
+		if c.Tunnel.CertFile == "" || c.Tunnel.KeyFile == "" {
+			return fmt.Errorf("自定义证书模式需要配置 cert_file 和 key_file")
+		}
+	}
+
+	// 验证 DuckDNS 配置
+	if c.Tunnel.DomainMode == "duckdns" {
+		if c.Tunnel.DuckDNS.Token == "" {
+			return fmt.Errorf("DuckDNS 模式需要配置 duckdns.token")
+		}
+		if c.Tunnel.DuckDNS.Domains == "" {
+			return fmt.Errorf("DuckDNS 模式需要配置 duckdns.domains")
+		}
+	}
+
+	// 验证 FreeDNS 配置
+	if c.Tunnel.DomainMode == "freedns" {
+		if c.Tunnel.FreeDNS.Token == "" {
+			return fmt.Errorf("FreeDNS 模式需要配置 freedns.token")
+		}
+	}
+
+	// 验证 Let's Encrypt 配置
+	if c.Tunnel.CertMode == "letsencrypt" {
+		if c.Tunnel.LetsEncrypt.Email == "" {
+			return fmt.Errorf("Let's Encrypt 模式需要配置 letsencrypt.email")
+		}
+	}
+
+	// 验证本地地址
+	if c.Tunnel.LocalAddr != "" {
+		if net.ParseIP(c.Tunnel.LocalAddr) == nil && c.Tunnel.LocalAddr != "localhost" {
+			return fmt.Errorf("无效的本地地址: %s", c.Tunnel.LocalAddr)
+		}
+	}
+
+	// 验证端口范围
+	if c.Tunnel.LocalPort != 0 {
+		if c.Tunnel.LocalPort < 1 || c.Tunnel.LocalPort > 65535 {
+			return fmt.Errorf("无效的本地端口: %d", c.Tunnel.LocalPort)
+		}
+	}
+
+	// 验证重启配置
+	if c.Tunnel.MaxRestarts < 0 {
+		return fmt.Errorf("max_restarts 不能为负数")
+	}
+	if c.Tunnel.RestartDelaySec < 0 {
+		return fmt.Errorf("restart_delay_sec 不能为负数")
+	}
+
+	return nil
+}
+
+// validateHysteria2Config 验证 Hysteria2 配置
+func (c *Config) validateHysteria2Config() error {
+	if c.Hysteria2.UpMbps < 1 || c.Hysteria2.UpMbps > 10000 {
+		return fmt.Errorf("up_mbps 需在 1-10000 之间")
+	}
+	if c.Hysteria2.DownMbps < 1 || c.Hysteria2.DownMbps > 10000 {
+		return fmt.Errorf("down_mbps 需在 1-10000 之间")
+	}
+	if c.Hysteria2.InitialWindow < 1 || c.Hysteria2.InitialWindow > 1024 {
+		return fmt.Errorf("initial_window 需在 1-1024 之间")
+	}
+	if c.Hysteria2.MaxWindow < c.Hysteria2.InitialWindow || c.Hysteria2.MaxWindow > 4096 {
+		return fmt.Errorf("max_window 需大于 initial_window 且不超过 4096")
+	}
+	if c.Hysteria2.LossThreshold < 0 || c.Hysteria2.LossThreshold > 1 {
+		return fmt.Errorf("loss_threshold 需在 0-1 之间")
+	}
+	return nil
+}
+
+// validateEBPFConfig 验证 EBPF 配置
+func (c *Config) validateEBPFConfig() error {
+	switch c.EBPF.XDPMode {
+	case "generic", "native", "offload":
+		// 有效模式
+	case "":
+		c.EBPF.XDPMode = "generic"
+	default:
+		return fmt.Errorf("无效的 XDP 模式: %s (支持: generic, native, offload)", c.EBPF.XDPMode)
+	}
+	
+	if c.EBPF.MapSize < 1024 || c.EBPF.MapSize > 1048576 {
+		return fmt.Errorf("map_size 需在 1024-1048576 之间")
+	}
+	
+	return nil
+}
+
+// validateWebSocketConfig 验证 WebSocket 配置
+func (c *Config) validateWebSocketConfig() error {
+	if c.WebSocket.Path == "" {
+		c.WebSocket.Path = "/ws"
+	}
+	
+	if !strings.HasPrefix(c.WebSocket.Path, "/") {
+		return fmt.Errorf("websocket.path 必须以 / 开头")
+	}
+	
+	if c.WebSocket.TLS {
+		if c.WebSocket.CertFile == "" || c.WebSocket.KeyFile == "" {
+			return fmt.Errorf("websocket TLS 模式需要配置 cert_file 和 key_file")
+		}
+	}
+	
 	return nil
 }
 
@@ -366,6 +573,14 @@ func (c *Config) syncRelatedConfig() {
 	if c.EBPF.Interface != "" && c.FakeTCP.Interface == "" {
 		c.FakeTCP.Interface = c.EBPF.Interface
 	}
+
+	// 同步默认值
+	if c.Tunnel.MaxRestarts == 0 {
+		c.Tunnel.MaxRestarts = 5
+	}
+	if c.Tunnel.RestartDelaySec == 0 {
+		c.Tunnel.RestartDelaySec = 5
+	}
 }
 
 // parsePort 解析端口号
@@ -386,10 +601,181 @@ func (c *Config) GetListenPort() int {
 	return port
 }
 
+// GetListenHost 获取监听地址
+func (c *Config) GetListenHost() string {
+	host, _, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
 // ToTunnelConfig 转换为 tunnel 包的配置类型
 func (c *TunnelConfig) ToTunnelConfig() interface{} {
 	return c
 }
 
+// IsTempTunnel 是否为临时隧道模式
+func (c *TunnelConfig) IsTempTunnel() bool {
+	return c.Mode == "temp" || c.Mode == ""
+}
 
+// IsFixedTunnel 是否为固定隧道模式
+func (c *TunnelConfig) IsFixedTunnel() bool {
+	return c.Mode == "fixed"
+}
 
+// IsDirectTunnel 是否为直接 TCP 隧道模式
+func (c *TunnelConfig) IsDirectTunnel() bool {
+	return c.Mode == "direct"
+}
+
+// GetLocalURL 获取本地服务 URL
+func (c *TunnelConfig) GetLocalURL() string {
+	addr := c.LocalAddr
+	if addr == "" {
+		addr = "127.0.0.1"
+	}
+	
+	protocol := c.Protocol
+	if protocol == "" {
+		protocol = "http"
+	}
+	
+	return fmt.Sprintf("%s://%s:%d", protocol, addr, c.LocalPort)
+}
+
+// =============================================================================
+// 配置文件示例生成
+// =============================================================================
+
+// GenerateExampleConfig 生成示例配置
+func GenerateExampleConfig() string {
+	return `# Phantom Server 配置文件示例
+# =============================================================================
+
+# 基础配置
+listen: ":54321"                    # 监听地址
+psk: "your-secret-psk-here"         # 预共享密钥 (使用 --gen-psk 生成)
+time_window: 30                     # 时间窗口 (秒)
+log_level: "info"                   # 日志级别: debug, info, warn, error
+mode: "auto"                        # 运行模式: auto, udp, faketcp, websocket, ebpf
+
+# ARQ 可靠传输层 (UDP 增强，非独立模式)
+arq:
+  enabled: true
+  window_size: 256                  # 滑动窗口大小
+  max_retries: 10                   # 最大重传次数
+  rto_min_ms: 100                   # 最小重传超时 (毫秒)
+  rto_max_ms: 10000                 # 最大重传超时 (毫秒)
+  enable_sack: true                 # 启用选择性确认
+  enable_timestamp: true            # 启用时间戳
+
+# Hysteria2 拥塞控制
+hysteria2:
+  enabled: true
+  up_mbps: 100                      # 上行带宽 (Mbps)
+  down_mbps: 100                    # 下行带宽 (Mbps)
+  initial_window: 32                # 初始拥塞窗口
+  max_window: 512                   # 最大拥塞窗口
+  loss_threshold: 0.1               # 丢包阈值
+
+# FakeTCP 伪装
+faketcp:
+  enabled: false
+  listen: ":54322"                  # FakeTCP 监听端口
+  interface: ""                     # 网卡接口 (留空自动检测)
+  use_ebpf: false                   # 使用 eBPF 加速
+
+# WebSocket 传输
+websocket:
+  enabled: false
+  listen: ":54323"                  # WebSocket 监听端口
+  path: "/ws"                       # WebSocket 路径
+  tls: false                        # 启用 TLS
+  cert_file: ""                     # TLS 证书文件
+  key_file: ""                      # TLS 密钥文件
+  cdn: false                        # CDN 模式
+
+# eBPF 加速
+ebpf:
+  enabled: false
+  interface: ""                     # 网卡接口
+  xdp_mode: "generic"               # XDP 模式: generic, native, offload
+  map_size: 65536                   # eBPF Map 大小
+  enable_tc: false                  # 启用 TC
+  tc_faketcp: false                 # TC FakeTCP 模式
+
+# 链路切换器
+switcher:
+  enabled: true
+  check_interval_ms: 1000           # 检查间隔 (毫秒)
+  fail_threshold: 3                 # 失败阈值
+  recover_threshold: 5              # 恢复阈值
+  rtt_threshold_ms: 300             # RTT 阈值 (毫秒)
+  loss_threshold: 0.3               # 丢包率阈值
+  priority:                         # 模式优先级 (不包含 arq)
+    - ebpf
+    - faketcp
+    - udp
+    - websocket
+
+# Prometheus 监控
+metrics:
+  enabled: true
+  listen: ":9100"                   # 监控端口
+  path: "/metrics"                  # Prometheus 指标路径
+  health_path: "/health"            # 健康检查路径
+  enable_pprof: false               # 启用 pprof
+
+# Cloudflare 隧道
+tunnel:
+  enabled: false
+  mode: "temp"                      # 隧道模式: temp (临时), fixed (固定), direct (直接 TCP)
+  
+  # 临时隧道 (mode: temp) - 无需额外配置
+  # 自动获取 xxx.trycloudflare.com 域名
+  
+  # 固定隧道 (mode: fixed) - 需要以下配置
+  cf_token: ""                      # Cloudflare Tunnel Token
+  cf_tunnel_id: ""                  # Tunnel ID (可选)
+  
+  # 本地服务配置
+  local_addr: "127.0.0.1"           # 本地地址
+  local_port: 0                     # 本地端口 (0 = 自动使用主监听端口)
+  protocol: "http"                  # 协议: http, https, tcp
+  
+  # 域名配置 (可选)
+  domain_mode: "auto"               # 域名模式: auto, sslip, nip, duckdns, freedns, custom
+  domain: ""                        # 自定义域名
+  subdomain: ""                     # 子域名
+  
+  # 证书配置 (可选)
+  cert_mode: "auto"                 # 证书模式: auto, selfsigned, letsencrypt, custom
+  cert_file: ""                     # 自定义证书文件
+  key_file: ""                      # 自定义密钥文件
+  
+  # DuckDNS 配置 (domain_mode: duckdns)
+  duckdns:
+    token: ""
+    domains: ""
+  
+  # Let's Encrypt 配置 (cert_mode: letsencrypt)
+  letsencrypt:
+    email: ""
+    staging: false
+    dns_provider: ""
+    dns_token: ""
+  
+  # 高级配置
+  auto_restart: true                # 自动重启
+  max_restarts: 5                   # 最大重启次数
+  restart_delay_sec: 5              # 重启延迟 (秒)
+  log_level: "info"                 # 隧道日志级别
+`
+}
+
+// WriteExampleConfig 写入示例配置文件
+func WriteExampleConfig(path string) error {
+	return os.WriteFile(path, []byte(GenerateExampleConfig()), 0644)
+}
