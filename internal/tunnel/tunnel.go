@@ -15,17 +15,8 @@ import (
 )
 
 // =============================================================================
-// 隧道模式常量
+// 域名模式常量 (TunnelMode 已在 runner.go 中定义)
 // =============================================================================
-
-// TunnelMode 隧道模式
-type TunnelMode string
-
-const (
-	ModeTempTunnel  TunnelMode = "temp"   // 临时隧道
-	ModeFixedTunnel TunnelMode = "fixed"  // 固定隧道
-	ModeDirect      TunnelMode = "direct" // 直接 TCP
-)
 
 // DomainMode 域名模式
 type DomainMode string
@@ -232,7 +223,7 @@ func (tm *TunnelManager) Start(ctx context.Context) error {
 		return tm.startTempTunnel()
 	case ModeFixedTunnel:
 		return tm.startFixedTunnel()
-	case ModeDirect:
+	case ModeDirectTCP:
 		return tm.startDirectMode()
 	default:
 		return fmt.Errorf("未知的隧道模式: %s", tm.config.Mode)
@@ -600,7 +591,11 @@ func (tm *TunnelManager) GetValidationTunnelURL() string {
 	if tm.validationRunner == nil {
 		return ""
 	}
-	return tm.validationRunner.GetURL()
+	// 使用 WaitForURL 的同步方式或者从状态中获取
+	tm.validationRunner.mu.RLock()
+	url := tm.validationRunner.tunnelURL
+	tm.validationRunner.mu.RUnlock()
+	return url
 }
 
 // =============================================================================
