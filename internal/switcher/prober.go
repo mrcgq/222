@@ -1,6 +1,3 @@
-
-
-
 // =============================================================================
 // 文件: internal/switcher/prober.go
 // 描述: 智能链路切换 - 链路探测器
@@ -38,18 +35,18 @@ type Prober struct {
 
 // ProbeResult 探测结果
 type ProbeResult struct {
-	Mode        TransportMode
-	Available   bool
-	RTT         time.Duration
-	MinRTT      time.Duration
-	MaxRTT      time.Duration
-	AvgRTT      time.Duration
-	LossRate    float64
-	Jitter      time.Duration
-	ProbeCount  int
+	Mode         TransportMode
+	Available    bool
+	RTT          time.Duration
+	MinRTT       time.Duration
+	MaxRTT       time.Duration
+	AvgRTT       time.Duration
+	LossRate     float64
+	Jitter       time.Duration
+	ProbeCount   int
 	SuccessCount int
-	LastProbe   time.Time
-	Error       error
+	LastProbe    time.Time
+	Error        error
 }
 
 // NewProber 创建探测器
@@ -168,9 +165,33 @@ func (p *Prober) probeMode(ctx context.Context, mode TransportMode, transport Tr
 
 	for i := 0; i < p.config.ProbeCount; i++ {
 		for _, addr := range addrs {
-			probeCtx, cancel := context.WithTimeout(ctx, p.config.ProbeTimeout)
-			rtt, err := transport.Probe(addr)
-			cancel()
+			// 检查上下文是否已取消
+			select {
+			case <-ctx.Done():
+				result.Error = ctx.Err()
+				return result
+			default:
+			}
+
+			// 使用带超时的探测
+			probeDone := make(chan struct{})
+			var rtt time.Duration
+			var err error
+
+			go func() {
+				rtt, err = transport.Probe(addr)
+				close(probeDone)
+			}()
+
+			select {
+			case <-probeDone:
+				// 探测完成
+			case <-time.After(p.config.ProbeTimeout):
+				err = fmt.Errorf("probe timeout")
+			case <-ctx.Done():
+				result.Error = ctx.Err()
+				return result
+			}
 
 			result.ProbeCount++
 
@@ -259,7 +280,3 @@ func (p *Prober) Stop() {
 	p.cancel()
 	p.wg.Wait()
 }
-
-
-
-
