@@ -1,6 +1,3 @@
-
-
-
 // =============================================================================
 // 文件: internal/transport/ebpf.go
 // 描述: eBPF 加速 - 主加速器 (修复 SendTo 实现)
@@ -80,11 +77,23 @@ func NewEBPFAccelerator(
 		LogLevel:        logLevel,
 	}
 
+	// 创建 EBPFLoaderConfig
+	loaderConfig := &EBPFLoaderConfig{
+		EBPFConfig:      config,
+		EnablePinning:   true,
+		PinMode:         PinModeReuse,
+		PinPath:         DefaultBPFFS + "/" + PinPathPrefix,
+		GracefulRestart: true,
+		StateTimeout:    5 * time.Minute,
+		CleanupOnExit:   false,
+		CleanupOrphans:  true,
+	}
+
 	return &EBPFAccelerator{
 		config:    config,
 		handler:   handler,
 		logLevel:  level,
-		loader:    NewEBPFLoader(config),
+		loader:    NewEBPFLoader(loaderConfig),
 		eventChan: make(chan *EBPFPacketEvent, 1024),
 	}
 }
@@ -538,12 +547,3 @@ func (e *EBPFAccelerator) log(level int, format string, args ...interface{}) {
 	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
 	fmt.Printf("%s %s [eBPF] %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
-
-
-
-
-
-
-
-
-
