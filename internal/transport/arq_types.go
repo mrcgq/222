@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/transport/arq_types.go
 // 描述: ARQ 可靠传输 - 统一类型定义 (唯一定义位置)
@@ -185,6 +183,9 @@ type ARQStats struct {
 	State        string
 	LastActivity time.Time
 	Uptime       time.Duration
+
+	// 队列统计 (新增)
+	RecvQueueDrops uint64
 }
 
 // ARQHandler 数据处理接口 (唯一定义)
@@ -198,5 +199,3 @@ type ARQHandler interface {
 	// OnDisconnected 连接断开时调用
 	OnDisconnected(addr *net.UDPAddr, reason error)
 }
-
-
