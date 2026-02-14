@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/transport/ebpf_restart_manager.go
 // 描述: eBPF 平滑重启管理器
@@ -69,7 +67,7 @@ func (m *GracefulRestartManager) PrepareRestart(listenPorts []uint16) error {
 	stats, _ := m.loader.GetStats()
 	sessionCount := int64(0)
 	if stats != nil {
-		sessionCount = int64(stats.ActiveSessions)
+		sessionCount = int64(stats.SessionsCreated)
 	}
 
 	state := RestartState{
@@ -194,5 +192,3 @@ func (m *GracefulRestartManager) Cleanup() {
 
 	os.Remove(m.statePath)
 }
-
-
