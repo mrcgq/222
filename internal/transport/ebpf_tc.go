@@ -1,6 +1,6 @@
 
 
-
+//go:build linux
 // =============================================================================
 // 文件: internal/transport/ebpf_tc.go
 // 描述: eBPF TC 集成 - FakeTCP 加速 (集成 tc_faketcp.c)
