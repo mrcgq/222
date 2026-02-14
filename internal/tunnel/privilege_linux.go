@@ -15,6 +15,95 @@ import (
 )
 
 // =============================================================================
+// 平台特定函数实现（被 privilege.go 调用）
+// =============================================================================
+
+// configureCommandPlatform Linux 平台的命令权限配置
+func configureCommandPlatform(pm *PrivilegeManager, cmd *exec.Cmd) error {
+	if !pm.enabled || !pm.initialized {
+		return nil
+	}
+
+	// 设置进程凭据
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{
+			Uid:    pm.uid,
+			Gid:    pm.gid,
+			Groups: []uint32{pm.gid},
+		},
+		// 创建新的进程组
+		Setpgid: true,
+		Pgid:    0,
+		// 父进程退出时发送信号
+		Pdeathsig: syscall.SIGTERM,
+	}
+
+	return nil
+}
+
+// configureCapsPlatform Linux 平台的 capabilities 配置
+func configureCapsPlatform(pm *PrivilegeManager, cmd *exec.Cmd, caps []string) error {
+	// Linux 支持 capabilities，使用 capsh 包装命令
+	if len(caps) > 0 && pm.enabled {
+		wrapWithCapsh(pm, cmd, caps)
+	}
+	return nil
+}
+
+// applySandboxPlatform Linux 平台的沙箱配置
+func applySandboxPlatform(cmd *exec.Cmd, cfg *SandboxConfig) error {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+
+	// 设置基本隔离
+	cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWUTS // UTS 命名空间
+	cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWIPC // IPC 命名空间
+
+	// 如果不需要网络，隔离网络命名空间
+	if !cfg.AllowNetwork {
+		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWNET
+	}
+
+	return nil
+}
+
+// wrapWithCapsh 使用 capsh 包装命令以设置 capabilities
+func wrapWithCapsh(pm *PrivilegeManager, cmd *exec.Cmd, caps []string) {
+	// 检查 capsh 是否可用
+	capshPath, err := exec.LookPath("capsh")
+	if err != nil {
+		return // capsh 不可用，跳过 capabilities 设置
+	}
+
+	// 构建 capabilities 字符串
+	capStr := ""
+	for i, cap := range caps {
+		if i > 0 {
+			capStr += ","
+		}
+		capStr += "cap_" + cap
+	}
+
+	// 重构命令
+	originalArgs := cmd.Args
+	originalPath := cmd.Path
+
+	newArgs := []string{
+		capshPath,
+		"--user=" + pm.targetUser,
+		"--caps=" + capStr + "+eip",
+		"--",
+		"-c",
+		originalPath,
+	}
+	newArgs = append(newArgs, originalArgs[1:]...)
+
+	cmd.Path = capshPath
+	cmd.Args = newArgs
+}
+
+// =============================================================================
 // Linux Capabilities 支持
 // =============================================================================
 
@@ -147,7 +236,6 @@ type SeccompRule struct {
 func ApplySeccompFilter(cfg *SeccompConfig) error {
 	// 注意：完整的 seccomp 实现需要使用 BPF 程序
 	// 这里提供一个简化的实现示意
-
 	// 实际使用中建议使用 libseccomp 或生成 BPF 字节码
 	return nil
 }
@@ -323,7 +411,6 @@ func ApplyResourceLimitsToCommand(cmd *exec.Cmd, limits *ResourceLimits) error {
 
 	// 使用 prlimit 系统调用为子进程设置限制
 	// 这需要在进程启动后立即执行
-
 	return nil
 }
 
