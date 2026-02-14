@@ -1,10 +1,5 @@
 //go:build darwin
-// +build darwin
 
-// =============================================================================
-// 文件: internal/tunnel/privilege_darwin.go
-// 描述: 进程权限管理 - macOS 特定实现
-// =============================================================================
 package tunnel
 
 import (
@@ -34,13 +29,48 @@ func configureCommandPlatform(pm *PrivilegeManager, cmd *exec.Cmd) error {
 // configureCapsPlatform macOS 平台的 capabilities 配置
 func configureCapsPlatform(pm *PrivilegeManager, cmd *exec.Cmd, caps []string) error {
 	// macOS 不支持 Linux capabilities
-	// 忽略 caps 参数
 	return nil
 }
 
 // applySandboxPlatform macOS 平台的沙箱配置
 func applySandboxPlatform(cmd *exec.Cmd, cfg *SandboxConfig) error {
 	// macOS 使用 sandbox-exec，但配置复杂
-	// 这里不实现，返回 nil
 	return nil
 }
+
+// =============================================================================
+// 存根类型和函数（macOS 不支持这些 Linux 特性）
+// =============================================================================
+
+type Capability uint
+
+const (
+	CAP_NET_BIND_SERVICE Capability = 10
+	CAP_NET_RAW          Capability = 13
+	CAP_NET_ADMIN        Capability = 12
+	CAP_SYS_ADMIN        Capability = 21
+)
+
+func DropCapabilities(keep []Capability) error                              { return nil }
+func SetAmbientCapabilities(caps []Capability) error                        { return nil }
+func ClearAmbientCapabilities() error                                       { return nil }
+
+type NamespaceConfig struct{}
+
+func ConfigureNamespaces(cmd *exec.Cmd, cfg *NamespaceConfig) error { return nil }
+
+type SeccompConfig struct{}
+
+func ApplySeccompFilter(cfg *SeccompConfig) error { return nil }
+
+type ResourceLimits struct {
+	MaxOpenFiles uint64
+	MaxProcesses uint64
+	MaxMemory    uint64
+	MaxCPUTime   uint64
+	MaxFileSize  uint64
+}
+
+func DefaultResourceLimits() *ResourceLimits                                { return &ResourceLimits{} }
+func ApplyResourceLimits(limits *ResourceLimits) error                      { return nil }
+func ApplyResourceLimitsToCommand(cmd *exec.Cmd, limits *ResourceLimits) error { return nil }
