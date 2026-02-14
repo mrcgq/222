@@ -1,19 +1,14 @@
-
-
-
 // =============================================================================
 // 文件:internal/transport/faketcp_nat.go
-// 描述: FakeTCP 伪装 - 客户端实现 (NAT 穿透增强版)
+// 描述: FakeTCP 伪装 - NAT 穿透辅助器
 // =============================================================================
 package transport
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -22,6 +17,7 @@ import (
 // NAT 穿透策略
 // =============================================================================
 
+// NATTraversalMode NAT 穿透模式类型
 type NATTraversalMode int
 
 const (
@@ -186,7 +182,7 @@ func (h *NATHelper) PunchHole(ctx context.Context) error {
 
 	// 发送多个探测包以确保 NAT 映射建立
 	probeData := []byte("FAKETCP_PROBE")
-	
+
 	for i := 0; i < 3; i++ {
 		select {
 		case <-ctx.Done():
@@ -331,30 +327,6 @@ func (h *NATHelper) setupConntrack(localPort int) error {
 	// 需要使用 netlink 库操作 conntrack 表
 	// 这里提供伪代码框架
 
-	/*
-	// 使用 netlink 创建 conntrack 条目
-	ct := netlink.ConntrackFlow{
-		FamilyType: unix.AF_INET,
-		Forward: netlink.IPTuple{
-			SrcIP:   h.localAddr.IP,
-			DstIP:   h.serverAddr.IP,
-			SrcPort: uint16(localPort),
-			DstPort: uint16(h.serverAddr.Port),
-			Proto:   unix.IPPROTO_TCP,
-		},
-		Reverse: netlink.IPTuple{
-			SrcIP:   h.serverAddr.IP,
-			DstIP:   h.localAddr.IP,
-			SrcPort: uint16(h.serverAddr.Port),
-			DstPort: uint16(localPort),
-			Proto:   unix.IPPROTO_TCP,
-		},
-		Mark: 0,
-	}
-
-	err := netlink.ConntrackCreate(netlink.ConntrackTable, unix.AF_INET, &ct)
-	*/
-
 	h.localAddr = &net.UDPAddr{
 		IP:   net.IPv4zero,
 		Port: localPort,
@@ -397,7 +369,3 @@ func (h *NATHelper) Close() error {
 
 	return nil
 }
-
-
-
-
