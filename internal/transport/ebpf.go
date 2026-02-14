@@ -1,5 +1,5 @@
-
 //go:build linux
+
 // =============================================================================
 // 文件: internal/transport/ebpf.go
 // 描述: eBPF 加速 - 主加速器 (修复 SendTo 实现)
@@ -191,7 +191,7 @@ func (e *EBPFAccelerator) checkEBPFSupport() bool {
 		return false
 	}
 
-	release := int8ToString(uname.Release[:])
+	release := int8SliceToString(uname.Release[:])
 	var major, minor int
 	fmt.Sscanf(release, "%d.%d", &major, &minor)
 
@@ -223,7 +223,8 @@ func (e *EBPFAccelerator) checkEBPFSupport() bool {
 	return true
 }
 
-func int8ToString(arr []int8) string {
+// int8SliceToString 将 int8 切片转换为字符串 (Linux 专用)
+func int8SliceToString(arr []int8) string {
 	var buf []byte
 	for _, v := range arr {
 		if v == 0 {
