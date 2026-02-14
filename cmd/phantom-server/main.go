@@ -1,6 +1,6 @@
 // =============================================================================
 // 文件: cmd/phantom-server/main.go
-// 描述: 主程序入口 - 集成 Prometheus 指标
+// 描述: 主程序入口 - 集成 Prometheus 指标和 Cloudflare 隧道
 // =============================================================================
 package main
 
@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/mrcgq/211/internal/handler"
 	"github.com/mrcgq/211/internal/metrics"
 	"github.com/mrcgq/211/internal/switcher"
+	"github.com/mrcgq/211/internal/tunnel"
 )
 
 var (
@@ -160,7 +162,7 @@ func main() {
 	// 启动隧道
 	var tunnelMgr *TunnelManager
 	if cfg.Tunnel.Enabled {
-		tunnelMgr = NewTunnelManager(&cfg.Tunnel)
+		tunnelMgr = NewTunnelManager(&cfg.Tunnel, cfg.GetListenPort())
 		if err := tunnelMgr.Start(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "隧道启动失败: %v (继续运行)\n", err)
 		}
@@ -186,65 +188,262 @@ func main() {
 }
 
 // =============================================================================
-// TunnelManager - 简化的隧道管理器（内置实现）
+// TunnelManager - Cloudflare 隧道管理器
 // =============================================================================
 
 // TunnelManager 隧道管理器
 type TunnelManager struct {
 	config    *config.TunnelConfig
+	localPort int
+
+	// 子组件
+	downloader  *tunnel.BinaryDownloader
+	privManager *tunnel.PrivilegeManager
+	runner      *tunnel.CloudflaredRunner
+
+	// 状态
 	running   bool
 	tunnelURL string
 	domain    string
-	cancel    context.CancelFunc
+	startTime time.Time
+
+	// 同步
+	mu     sync.RWMutex
+	cancel context.CancelFunc
 }
 
 // NewTunnelManager 创建隧道管理器
-func NewTunnelManager(cfg *config.TunnelConfig) *TunnelManager {
+func NewTunnelManager(cfg *config.TunnelConfig, listenPort int) *TunnelManager {
+	// 使用配置的端口，如果未配置则使用主监听端口
+	localPort := cfg.LocalPort
+	if localPort == 0 {
+		localPort = listenPort
+	}
+
 	return &TunnelManager{
-		config: cfg,
+		config:    cfg,
+		localPort: localPort,
 	}
 }
 
 // Start 启动隧道
 func (tm *TunnelManager) Start(ctx context.Context) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
 	if !tm.config.Enabled {
 		return nil
 	}
 
-	ctx, tm.cancel = context.WithCancel(ctx)
+	tm.startTime = time.Now()
+
+	// 创建可取消的上下文
+	runCtx, cancel := context.WithCancel(ctx)
+	tm.cancel = cancel
+
+	// 1. 初始化下载器
+	tm.downloader = tunnel.NewBinaryDownloader("",
+		tunnel.WithLogLevel(1),
+		tunnel.WithProgressCallback(func(downloaded, total int64) {
+			if total > 0 {
+				percent := float64(downloaded) / float64(total) * 100
+				fmt.Printf("\r下载 cloudflared: %.1f%%", percent)
+			}
+		}),
+	)
+
+	// 2. 确保 cloudflared 可用
+	binaryPath, err := tm.downloader.EnsureCloudflared()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("获取 cloudflared 失败: %w", err)
+	}
+
+	fmt.Printf("\n") // 换行（下载进度后）
+
+	// 3. 初始化权限管理器
+	privCfg := tunnel.DefaultPrivilegeConfig()
+	tm.privManager, err = tunnel.NewPrivilegeManager(privCfg)
+	if err != nil {
+		// 权限管理器初始化失败不阻止启动
+		fmt.Printf("[WARN] 权限管理器初始化失败: %v\n", err)
+	}
+
+	// 4. 确定隧道模式
+	mode := tm.determineTunnelMode()
+
+	// 5. 创建运行器
+	runnerCfg := &tunnel.RunnerConfig{
+		BinaryPath:  binaryPath,
+		Mode:        mode,
+		LocalAddr:   tm.config.LocalAddr,
+		LocalPort:   tm.localPort,
+		Protocol:    tm.config.Protocol,
+		CFToken:     tm.config.CFToken,
+		CFTunnelID:  tm.config.CFTunnelID,
+		PrivManager: tm.privManager,
+		AutoRestart: true,
+		LogLevel:    1,
+
+		OnURLReady: func(url string) {
+			tm.mu.Lock()
+			tm.tunnelURL = url
+			tm.domain = extractDomainFromURL(url)
+			tm.mu.Unlock()
+			fmt.Printf("[INFO] 隧道 URL 就绪: %s\n", url)
+		},
+		OnError: func(err error) {
+			fmt.Printf("[ERROR] 隧道错误: %v\n", err)
+		},
+		OnStateChange: func(running bool) {
+			tm.mu.Lock()
+			tm.running = running
+			tm.mu.Unlock()
+		},
+	}
+
+	tm.runner, err = tunnel.NewCloudflaredRunner(runnerCfg)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("创建 cloudflared 运行器失败: %w", err)
+	}
+
+	// 6. 启动运行器
+	if err := tm.runner.Start(runCtx); err != nil {
+		cancel()
+		return fmt.Errorf("启动 cloudflared 失败: %w", err)
+	}
+
 	tm.running = true
 
-	// TODO: 实现实际的 Cloudflare 隧道逻辑
-	// 这里是占位实现
-	go func() {
-		<-ctx.Done()
-		tm.running = false
-	}()
+	// 7. 对于临时隧道，等待 URL 就绪
+	if mode == tunnel.ModeTempTunnel {
+		go func() {
+			url, err := tm.runner.WaitForURL(30 * time.Second)
+			if err != nil {
+				fmt.Printf("[WARN] 等待隧道 URL 失败: %v\n", err)
+			} else {
+				fmt.Printf("[INFO] 临时隧道已建立: %s\n", url)
+			}
+		}()
+	}
 
 	return nil
 }
 
+// determineTunnelMode 确定隧道模式
+func (tm *TunnelManager) determineTunnelMode() tunnel.TunnelMode {
+	switch tm.config.Mode {
+	case "temp":
+		return tunnel.ModeTempTunnel
+	case "fixed":
+		return tunnel.ModeFixedTunnel
+	case "direct":
+		return tunnel.ModeDirectTCP
+	default:
+		// 如果有 token，使用固定模式；否则使用临时模式
+		if tm.config.CFToken != "" {
+			return tunnel.ModeFixedTunnel
+		}
+		return tunnel.ModeTempTunnel
+	}
+}
+
 // Stop 停止隧道
 func (tm *TunnelManager) Stop() {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
 	if tm.cancel != nil {
 		tm.cancel()
 	}
+
+	if tm.runner != nil {
+		if err := tm.runner.Stop(); err != nil {
+			fmt.Printf("[WARN] 停止 cloudflared 失败: %v\n", err)
+		}
+	}
+
 	tm.running = false
+	tm.tunnelURL = ""
+	tm.domain = ""
 }
 
 // IsRunning 检查是否运行中
 func (tm *TunnelManager) IsRunning() bool {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 	return tm.running
 }
 
 // GetTunnelURL 获取隧道 URL
 func (tm *TunnelManager) GetTunnelURL() string {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 	return tm.tunnelURL
 }
 
 // GetDomain 获取域名
 func (tm *TunnelManager) GetDomain() string {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 	return tm.domain
+}
+
+// GetStatus 获取状态
+func (tm *TunnelManager) GetStatus() map[string]interface{} {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	status := map[string]interface{}{
+		"running": tm.running,
+		"mode":    tm.config.Mode,
+	}
+
+	if tm.running {
+		status["uptime"] = time.Since(tm.startTime).String()
+	}
+
+	if tm.tunnelURL != "" {
+		status["url"] = tm.tunnelURL
+		status["domain"] = tm.domain
+	}
+
+	if tm.runner != nil {
+		status["pid"] = tm.runner.GetPID()
+	}
+
+	return status
+}
+
+// extractDomainFromURL 从 URL 中提取域名
+func extractDomainFromURL(url string) string {
+	// 移除协议前缀
+	for _, prefix := range []string{"https://", "http://"} {
+		if len(url) > len(prefix) && url[:len(prefix)] == prefix {
+			url = url[len(prefix):]
+			break
+		}
+	}
+
+	// 移除路径和端口
+	for _, sep := range []string{"/", ":"} {
+		if idx := indexOf(url, sep); idx != -1 {
+			url = url[:idx]
+		}
+	}
+
+	return url
+}
+
+// indexOf 查找字符串位置
+func indexOf(s, substr string) int {
+	for i := 0; i < len(s); i++ {
+		if i+len(substr) <= len(s) && s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
 }
 
 // =============================================================================
@@ -463,6 +662,11 @@ func printVersion() {
 	fmt.Println("  - websocket : WebSocket/CDN (高隐蔽)")
 	fmt.Println("  - ebpf      : eBPF 内核加速 (极致性能)")
 	fmt.Println()
+	fmt.Println("隧道模式:")
+	fmt.Println("  - temp      : Cloudflare 临时隧道 (无需配置)")
+	fmt.Println("  - fixed     : Cloudflare 固定隧道 (需要 token)")
+	fmt.Println("  - direct    : 直接 TCP 隧道")
+	fmt.Println()
 	fmt.Println("监控:")
 	fmt.Println("  - /metrics  : Prometheus 格式指标")
 	fmt.Println("  - /health   : JSON 健康状态")
@@ -485,11 +689,12 @@ func printBanner(cfg *config.Config, sw *switcher.Switcher, tm *TunnelManager, m
 		if url == "" {
 			url = "(正在建立...)"
 		}
-		fmt.Printf("║    URL: %-58s ║\n", url)
+		fmt.Printf("║    URL: %-58s ║\n", truncateString(url, 58))
 		domain := tm.GetDomain()
 		if domain != "" {
-			fmt.Printf("║    域名: %-57s ║\n", domain)
+			fmt.Printf("║    域名: %-57s ║\n", truncateString(domain, 57))
 		}
+		fmt.Printf("║    模式: %-57s ║\n", cfg.Tunnel.Mode)
 	}
 
 	if ms != nil {
@@ -535,4 +740,11 @@ func formatListenPorts(cfg *config.Config) string {
 		ports += fmt.Sprintf(", %s (WS)", cfg.WebSocket.Listen)
 	}
 	return ports
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
