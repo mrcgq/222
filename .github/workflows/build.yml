@@ -35,15 +35,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib libelf-dev
           
-          # 下载静态版 bpftool
+          # 1. 下载静态版 bpftool
           curl -L https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz | sudo tar -xz -C /usr/local/bin
           
-          # 强制覆盖系统自带的冲突占位符
+          # 2. 【关键修复】赋予执行权限
+          sudo chmod +x /usr/local/bin/bpftool
+          
+          # 3. 强制覆盖系统自带的冲突占位符
           sudo rm -f /usr/bin/bpftool
           sudo ln -sf /usr/local/bin/bpftool /usr/bin/bpftool
           
-          # 验证安装
-          /usr/local/bin/bpftool version
+          # 4. 验证安装
+          bpftool version
           clang --version
 
       - name: 整理依赖
