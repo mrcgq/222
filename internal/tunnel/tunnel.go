@@ -159,7 +159,8 @@ type TunnelManager struct {
 	certManager *CertManager
 
 	// 验证隧道（用于 ACME）
-	validationRunner *CloudflaredRunner
+	validationRunner    *CloudflaredRunner
+	validationTunnelURL string // 缓存验证隧道 URL
 
 	// 状态
 	running   bool
@@ -261,6 +262,7 @@ func (tm *TunnelManager) Stop() {
 	tm.running = false
 	tm.tunnelURL = ""
 	tm.domain = ""
+	tm.validationTunnelURL = ""
 }
 
 // =============================================================================
@@ -550,6 +552,9 @@ func (tm *TunnelManager) StartValidationTunnel(ctx context.Context, localPort in
 		LogLevel:    tm.logLevel,
 
 		OnURLReady: func(tunnelURL string) {
+			tm.mu.Lock()
+			tm.validationTunnelURL = tunnelURL
+			tm.mu.Unlock()
 			tm.log(1, "验证隧道 URL: %s", tunnelURL)
 		},
 		OnError: func(err error) {
@@ -578,6 +583,11 @@ func (tm *TunnelManager) StopValidationTunnel() error {
 	tm.log(1, "停止 ACME 验证隧道")
 	err := tm.validationRunner.Stop()
 	tm.validationRunner = nil
+
+	tm.mu.Lock()
+	tm.validationTunnelURL = ""
+	tm.mu.Unlock()
+
 	return err
 }
 
@@ -588,10 +598,9 @@ func (tm *TunnelManager) IsValidationTunnelRunning() bool {
 
 // GetValidationTunnelURL 获取验证隧道 URL
 func (tm *TunnelManager) GetValidationTunnelURL() string {
-	if tm.validationRunner == nil {
-		return ""
-	}
-	return tm.validationRunner.GetTunnelURL()
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.validationTunnelURL
 }
 
 // =============================================================================
