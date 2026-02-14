@@ -1,6 +1,3 @@
-
-
-
 // =============================================================================
 // 文件: internal/tunnel/cert_manager.go
 // 描述: 证书管理器 - 使用 Go 原生 ACME 客户端
@@ -12,7 +9,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -90,7 +86,7 @@ type ACMEConfig struct {
 	TLSPort       int          `yaml:"tls_port"`       // TLS-ALPN-01 挑战端口
 
 	// ZeroSSL 特定
-	EABKeyID  string `yaml:"eab_key_id"`
+	EABKeyID   string `yaml:"eab_key_id"`
 	EABHMACKey string `yaml:"eab_hmac_key"`
 }
 
@@ -183,9 +179,9 @@ func (m *CertManager) Stop() {
 	}
 
 	if m.httpServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		m.httpServer.Shutdown(ctx)
+		m.httpServer.Shutdown(shutdownCtx)
 	}
 }
 
@@ -395,7 +391,7 @@ func (m *CertManager) prefetchCertificates() {
 	for _, domain := range m.config.ACME.Domains {
 		m.log(1, "预获取证书: %s", domain)
 
-		ctx, cancel := context.WithTimeout(m.ctx, 5*time.Minute)
+		fetchCtx, cancel := context.WithTimeout(m.ctx, 5*time.Minute)
 		_, err := m.autocertManager.GetCertificate(&tls.ClientHelloInfo{
 			ServerName: domain,
 		})
@@ -405,6 +401,14 @@ func (m *CertManager) prefetchCertificates() {
 			m.log(0, "获取证书失败 %s: %v", domain, err)
 		} else {
 			m.log(1, "证书获取成功: %s", domain)
+		}
+
+		// 使用 fetchCtx 检查是否被取消
+		select {
+		case <-fetchCtx.Done():
+			// context 已完成，继续下一个
+		default:
+			// 正常继续
 		}
 	}
 }
@@ -421,10 +425,10 @@ func (m *CertManager) setupZeroSSLWithEAB() error {
 	}
 
 	// 获取目录
-	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
-	defer cancel()
+	discoverCtx, discoverCancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer discoverCancel()
 
-	dir, err := client.Discover(ctx)
+	dir, err := client.Discover(discoverCtx)
 	if err != nil {
 		return fmt.Errorf("获取 ACME 目录失败: %w", err)
 	}
@@ -446,7 +450,10 @@ func (m *CertManager) setupZeroSSLWithEAB() error {
 	client.Key = accountKey
 
 	// 注册账户
-	_, err = client.Register(ctx, account, func(tosURL string) bool {
+	registerCtx, registerCancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer registerCancel()
+
+	_, err = client.Register(registerCtx, account, func(tosURL string) bool {
 		m.log(1, "接受服务条款: %s", tosURL)
 		return cfg.AcceptTOS
 	})
@@ -464,7 +471,7 @@ func (m *CertManager) setupZeroSSLWithEAB() error {
 	}
 
 	m.log(1, "ZeroSSL EAB 配置完成")
-	_ = dir // 使用目录信息
+	_ = dir // 使用目录信息（避免未使用警告）
 
 	return m.startHTTP01Challenge()
 }
@@ -670,6 +677,3 @@ func (m *CertManager) checkAndRenew() {
 		}
 	}
 }
-
-
-
