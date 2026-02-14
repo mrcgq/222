@@ -7,6 +7,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -99,8 +100,8 @@ func FromConfigTunnelConfig(cfg *config.TunnelConfig) *TunnelConfig {
 		Protocol:      cfg.Protocol,
 		CFToken:       cfg.CFToken,
 		CFTunnelID:    cfg.CFTunnelID,
-		DuckDNSToken:  cfg.DuckDNSToken,
-		DuckDNSDomain: cfg.DuckDNSDomain,
+		DuckDNSToken:  cfg.GetDuckDNSToken(),
+		DuckDNSDomain: cfg.GetDuckDNSDomain(),
 		LogLevel:      cfg.LogLevel,
 	}
 
@@ -651,7 +652,7 @@ func (tm *TunnelManager) getPublicIP() (string, error) {
 	for _, svc := range services {
 		ip, err := fetchURL(svc, 5*time.Second)
 		if err == nil && ip != "" {
-			return ip, nil
+			return trimSpace(ip), nil
 		}
 	}
 
@@ -668,6 +669,7 @@ func (tm *TunnelManager) updateDuckDNS() error {
 		return err
 	}
 
+	resp = trimSpace(resp)
 	if resp != "OK" {
 		return fmt.Errorf("DuckDNS 更新失败: %s", resp)
 	}
@@ -728,6 +730,22 @@ func fetchURL(url string, timeout time.Duration) (string, error) {
 	body := make([]byte, 1024)
 	n, _ := resp.Body.Read(body)
 	return string(body[:n]), nil
+}
+
+// trimSpace 去除字符串首尾空白字符
+func trimSpace(s string) string {
+	start := 0
+	end := len(s)
+
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
+		start++
+	}
+
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+
+	return s[start:end]
 }
 
 // =============================================================================
@@ -810,6 +828,3 @@ func (tm *TunnelManager) log(level int, format string, args ...interface{}) {
 	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
 	fmt.Printf("%s %s [Tunnel] %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
-
-// 需要导入的包
-import "net/http"
