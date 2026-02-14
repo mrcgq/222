@@ -1,7 +1,3 @@
-
-
-
-
 // =============================================================================
 // 文件: internal/switcher/wrappers.go
 // 描述: 智能链路切换 - 传输层包装器 (完整修复版)
@@ -118,6 +114,9 @@ type tcpTransportWrapper struct {
 	pendingData     map[string][][]byte
 	pendingDataLock sync.Mutex
 
+	// 数据处理回调
+	dataHandler func(data []byte, addr *net.UDPAddr)
+
 	// 配置
 	dialTimeout    time.Duration
 	maxPendingSize int
@@ -147,10 +146,12 @@ func NewTCPTransportWrapperWithConfig(server *transport.TCPServer, cfg TCPWrappe
 		maxPendingSize: cfg.MaxPendingSize,
 	}
 
-	// 注册连接回调
-	server.SetConnectionCallback(w.onNewConnection)
-
 	return w
+}
+
+// SetDataHandler 设置数据处理回调
+func (w *tcpTransportWrapper) SetDataHandler(handler func(data []byte, addr *net.UDPAddr)) {
+	w.dataHandler = handler
 }
 
 func (w *tcpTransportWrapper) Start() error {
@@ -334,8 +335,10 @@ func (w *tcpTransportWrapper) receiveLoop(conn net.Conn, addr *net.UDPAddr) {
 			return
 		}
 
-		// 将数据转发给 TCPServer 的处理回调
-		w.server.HandleData(data, addr)
+		// 将数据转发给处理回调
+		if w.dataHandler != nil {
+			w.dataHandler(data, addr)
+		}
 	}
 }
 
@@ -365,8 +368,8 @@ func (w *tcpTransportWrapper) removeConnection(addrKey string, conn net.Conn) {
 	w.reverseMapLock.Unlock()
 }
 
-// onNewConnection 处理新的入站连接
-func (w *tcpTransportWrapper) onNewConnection(conn net.Conn) {
+// HandleIncomingConnection 处理新的入站连接
+func (w *tcpTransportWrapper) HandleIncomingConnection(conn net.Conn) {
 	// 对于入站连接，我们需要等待第一个数据包来确定客户端身份
 	// 或者通过 TCP 连接的远程地址建立映射
 	remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
@@ -440,9 +443,9 @@ func (w *tcpTransportWrapper) estimateRTT() time.Duration {
 
 func (w *tcpTransportWrapper) GetStats() map[string]interface{} {
 	return map[string]interface{}{
-		"mode":            "tcp",
-		"active_conns":    w.GetActiveConnections(),
-		"pending_dials":   w.getPendingCount(),
+		"mode":          "tcp",
+		"active_conns":  w.GetActiveConnections(),
+		"pending_dials": w.getPendingCount(),
 	}
 }
 
@@ -652,6 +655,3 @@ func (w *ebpfTransportWrapper) GetStats() map[string]interface{} {
 func (w *ebpfTransportWrapper) Probe(addr *net.UDPAddr) (time.Duration, error) {
 	return 5 * time.Millisecond, nil
 }
-
-
-
