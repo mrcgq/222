@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/congestion/adapter.go
 // 描述: 拥塞控制适配器 - 统一接口 (修复版：支持 ARQ 序列号映射)
@@ -11,13 +9,13 @@ import (
 	"time"
 )
 
-// PacketInfo 数据包信息（用于映射和 RTT 计算）
-type PacketInfo struct {
-	PktNum       uint64        // 拥塞控制器的包编号
-	Size         int           // 数据包大小
-	SentTime     time.Time     // 首次发送时间（用于 RTT 计算）
-	Retransmit   bool          // 是否为重传包
-	RetransCount int           // 重传次数
+// AdapterPacketInfo 适配器内部使用的数据包信息（与 types.go 中的 PacketInfo 区分）
+type AdapterPacketInfo struct {
+	PktNum       uint64    // 拥塞控制器的包编号
+	Size         int       // 数据包大小
+	SentTime     time.Time // 首次发送时间（用于 RTT 计算）
+	Retransmit   bool      // 是否为重传包
+	RetransCount int       // 重传次数
 }
 
 // CongestionAdapter 拥塞控制适配器
@@ -26,8 +24,8 @@ type CongestionAdapter struct {
 	cc *Hysteria2Controller
 
 	// ARQ 序列号 -> 拥塞控制包信息的映射
-	seqToPktInfo map[uint32]*PacketInfo
-	
+	seqToPktInfo map[uint32]*AdapterPacketInfo
+
 	// 拥塞控制 pktNum -> ARQ 序列号的反向映射（用于丢包通知）
 	pktNumToSeq map[uint64]uint32
 
@@ -39,7 +37,7 @@ type CongestionAdapter struct {
 func NewCongestionAdapter(cc *Hysteria2Controller) *CongestionAdapter {
 	return &CongestionAdapter{
 		cc:           cc,
-		seqToPktInfo: make(map[uint32]*PacketInfo),
+		seqToPktInfo: make(map[uint32]*AdapterPacketInfo),
 		pktNumToSeq:  make(map[uint64]uint32),
 		nextPktNum:   1,
 	}
@@ -79,7 +77,7 @@ func (a *CongestionAdapter) OnARQPacketSent(seq uint32, size int, isRetransmit b
 	a.nextPktNum++
 
 	// 建立双向映射
-	a.seqToPktInfo[seq] = &PacketInfo{
+	a.seqToPktInfo[seq] = &AdapterPacketInfo{
 		PktNum:       pktNum,
 		Size:         size,
 		SentTime:     now,
@@ -165,13 +163,13 @@ func (a *CongestionAdapter) OnARQPacketSACKed(ranges [][2]uint32) (ackedBytes in
 
 	for _, r := range ranges {
 		startSeq, endSeq := r[0], r[1]
-		
+
 		for seq, info := range a.seqToPktInfo {
 			// 检查序列号是否在 SACK 区间内
 			if seqInRange(seq, startSeq, endSeq) {
 				// SACK 确认的包，只计算字节数，不用于 RTT 计算
 				totalAckedBytes += info.Size
-				
+
 				// 计算 RTT（仅非重传包）
 				var rtt time.Duration
 				if !info.Retransmit {
@@ -180,7 +178,7 @@ func (a *CongestionAdapter) OnARQPacketSACKed(ranges [][2]uint32) (ackedBytes in
 						rtt = 0
 					}
 				}
-				
+
 				a.cc.OnPacketAcked(info.PktNum, info.Size, rtt)
 
 				// 标记为已确认（稍后删除）
@@ -222,8 +220,8 @@ func (a *CongestionAdapter) OnARQPacketRetransmit(seq uint32) {
 	}
 }
 
-// GetPktInfo 获取包信息（用于调试）
-func (a *CongestionAdapter) GetPktInfo(seq uint32) *PacketInfo {
+// GetAdapterPktInfo 获取包信息（用于调试）
+func (a *CongestionAdapter) GetAdapterPktInfo(seq uint32) *AdapterPacketInfo {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -246,7 +244,7 @@ func (a *CongestionAdapter) cleanupOldEntries(currentSeq uint32) {
 
 	// 找出最旧的序列号并删除
 	threshold := currentSeq - uint32(maxEntries/2)
-	
+
 	var toDelete []uint32
 	for seq := range a.seqToPktInfo {
 		if seqLessThan(seq, threshold) {
@@ -398,5 +396,3 @@ func (a *CongestionAdapter) GetMappingStats() (seqCount, pktNumCount int) {
 	defer a.mu.Unlock()
 	return len(a.seqToPktInfo), len(a.pktNumToSeq)
 }
-
-
