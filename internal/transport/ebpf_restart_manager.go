@@ -1,3 +1,4 @@
+//go:build linux
 // =============================================================================
 // 文件: internal/transport/ebpf_restart_manager.go
 // 描述: eBPF 平滑重启管理器
