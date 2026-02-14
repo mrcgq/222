@@ -1,3 +1,5 @@
+//go:build linux
+
 // =============================================================================
 // internal/transport/faketcp_client.go         增强版 FakeTCP 客户端
 // =============================================================================
@@ -415,7 +417,7 @@ func (c *FakeTCPClient) Send(data []byte) error {
 		mss = int(c.config.MSS)
 	}
 	if mss == 0 {
-		mss = 1460
+		mss = DefaultMSS
 	}
 
 	for len(data) > 0 {
