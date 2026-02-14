@@ -1,7 +1,8 @@
+//go:build linux
 
 // =============================================================================
 // 文件: internal/transport/ebpf_types.go
-// 描述: eBPF 加速 - 类型定义
+// 描述: eBPF 加速 - 类型定义 (仅 Linux)
 // =============================================================================
 package transport
 
@@ -24,17 +25,17 @@ const (
 	EBPFStateClosed      = 4
 
 	// XDP 动作
-	XDPAborted = 0
-	XDPDrop    = 1
-	XDPPass    = 2
-	XDPTX      = 3
+	XDPAborted  = 0
+	XDPDrop     = 1
+	XDPPass     = 2
+	XDPTX       = 3
 	XDPRedirect = 4
 
 	// XDP 模式
-	XDPModeNative   = "native"
-	XDPModeGeneric  = "generic"
-	XDPModeOffload  = "offload"
-	XDPModeAuto     = "auto"
+	XDPModeNative  = "native"
+	XDPModeGeneric = "generic"
+	XDPModeOffload = "offload"
+	XDPModeAuto    = "auto"
 )
 
 // EBPFSessionKey 会话键 (与 C 结构对应)
@@ -47,47 +48,48 @@ type EBPFSessionKey struct {
 
 // EBPFSessionValue 会话值 (与 C 结构对应)
 type EBPFSessionValue struct {
-	PeerIP      uint32
-	PeerPort    uint16
-	State       uint8
-	Flags       uint8
-	CreatedNS   uint64
-	LastSeenNS  uint64
-	BytesIn     uint64
-	BytesOut    uint64
-	PacketsIn   uint64
-	PacketsOut  uint64
-	SeqLocal    uint32
-	SeqRemote   uint32
+	PeerIP     uint32
+	PeerPort   uint16
+	State      uint8
+	Flags      uint8
+	CreatedNS  uint64
+	LastSeenNS uint64
+	BytesIn    uint64
+	BytesOut   uint64
+	PacketsIn  uint64
+	PacketsOut uint64
+	SeqLocal   uint32
+	SeqRemote  uint32
 }
 
 // EBPFGlobalConfig 全局配置 (与 C 结构对应)
 type EBPFGlobalConfig struct {
-	Magic          uint32
-	ListenPort     uint16
-	Mode           uint8
-	LogLevel       uint8
-	SessionTimeout uint32
-	MaxSessions    uint32
-	EnableStats    uint8
+	Magic           uint32
+	ListenPort      uint16
+	Mode            uint8
+	LogLevel        uint8
+	SessionTimeout  uint32
+	MaxSessions     uint32
+	EnableStats     uint8
 	EnableConntrack uint8
-	Reserved       [2]uint8
+	Reserved        [2]uint8
 }
 
 // EBPFStats 统计计数器 (与 C 结构对应)
 type EBPFStats struct {
-	PacketsRX        uint64
-	PacketsTX        uint64
-	BytesRX          uint64
-	BytesTX          uint64
-	PacketsDropped   uint64
-	PacketsPassed    uint64
+	PacketsRX         uint64
+	PacketsTX         uint64
+	BytesRX           uint64
+	BytesTX           uint64
+	PacketsDropped    uint64
+	PacketsPassed     uint64
 	PacketsRedirected uint64
-	SessionsCreated  uint64
-	SessionsExpired  uint64
-	Errors           uint64
-	ChecksumErrors   uint64
-	InvalidPackets   uint64
+	SessionsCreated   uint64
+	SessionsExpired   uint64
+	SessionsDeleted   uint64
+	Errors            uint64
+	ChecksumErrors    uint64
+	InvalidPackets    uint64
 }
 
 // EBPFPacketEvent 数据包事件 (与 C 结构对应)
@@ -148,25 +150,25 @@ func DefaultEBPFConfig() *EBPFConfig {
 
 // EBPFSession Go 侧会话表示
 type EBPFSession struct {
-	Key         EBPFSessionKey
-	Value       EBPFSessionValue
-	LocalAddr   *net.UDPAddr
-	RemoteAddr  *net.UDPAddr
-	State       int
-	CreatedAt   time.Time
-	LastSeen    time.Time
-	BytesIn     uint64
-	BytesOut    uint64
-	PacketsIn   uint64
-	PacketsOut  uint64
+	Key        EBPFSessionKey
+	Value      EBPFSessionValue
+	LocalAddr  *net.UDPAddr
+	RemoteAddr *net.UDPAddr
+	State      int
+	CreatedAt  time.Time
+	LastSeen   time.Time
+	BytesIn    uint64
+	BytesOut   uint64
+	PacketsIn  uint64
+	PacketsOut uint64
 }
 
 // EBPFAcceleratorStats 加速器统计
 type EBPFAcceleratorStats struct {
 	// 状态
-	Active      bool
-	XDPMode     string
-	Interface   string
+	Active        bool
+	XDPMode       string
+	Interface     string
 	ProgramLoaded bool
 
 	// eBPF 统计
@@ -213,4 +215,3 @@ func Htonl(n uint32) uint32 {
 func Ntohl(n uint32) uint32 {
 	return Htonl(n)
 }
-
