@@ -1,17 +1,38 @@
-
-
-
 // =============================================================================
 // 文件: internal/tunnel/privilege_other.go
 // 描述: 非 Linux 系统的权限管理存根
 // =============================================================================
-//go:build !linux
+//go:build !linux && !darwin && !freebsd && !openbsd && !netbsd && !dragonfly && !windows
 
 package tunnel
 
 import (
 	"os/exec"
 )
+
+// =============================================================================
+// 平台特定函数实现（被 privilege.go 调用）
+// =============================================================================
+
+// configureCommandPlatform 其他平台的命令权限配置
+func configureCommandPlatform(pm *PrivilegeManager, cmd *exec.Cmd) error {
+	// 不支持的平台，跳过权限配置
+	return nil
+}
+
+// configureCapsPlatform 其他平台的 capabilities 配置
+func configureCapsPlatform(pm *PrivilegeManager, cmd *exec.Cmd, caps []string) error {
+	return nil
+}
+
+// applySandboxPlatform 其他平台的沙箱配置
+func applySandboxPlatform(cmd *exec.Cmd, cfg *SandboxConfig) error {
+	return nil
+}
+
+// =============================================================================
+// 存根类型和函数
+// =============================================================================
 
 // Capability 存根
 type Capability uint
@@ -77,6 +98,3 @@ func ApplyResourceLimits(limits *ResourceLimits) error {
 func ApplyResourceLimitsToCommand(cmd *exec.Cmd, limits *ResourceLimits) error {
 	return nil
 }
-
-
-
