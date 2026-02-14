@@ -1,5 +1,5 @@
-
 //go:build linux
+
 // =============================================================================
 // 文件: internal/transport/ebpf_loader.go
 // 描述: eBPF 加速 - 程序加载器 (支持 Map Pinning 和平滑重启)
@@ -40,6 +40,9 @@ const (
 
 	// Link 名称
 	LinkNameXDP = "xdp_link"
+
+	// BPF 文件系统魔数
+	BPFFSMagic uint32 = 0xcafe4a11
 )
 
 // PinMode Map Pinning 模式
@@ -1103,8 +1106,8 @@ func checkBPFFS() error {
 		return err
 	}
 
-	// BPF_FS_MAGIC = 0xcafe4a11
-	if stat.Type != 0xcafe4a11 {
+	// 使用 uint32 比较避免在某些架构上的溢出
+	if uint32(stat.Type) != BPFFSMagic {
 		return fmt.Errorf("不是 BPFFS: type=%x", stat.Type)
 	}
 
