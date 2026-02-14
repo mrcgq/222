@@ -191,8 +191,8 @@ func (e *EBPFAccelerator) checkEBPFSupport() bool {
 		return false
 	}
 
-	// 转换 Release 字段 (Linux 上是 []int8)
-	release := int8ArrayToString(uname.Release)
+	// 转换 Release 字段
+	release := parseUtsRelease(uname.Release)
 	var major, minor int
 	fmt.Sscanf(release, "%d.%d", &major, &minor)
 
@@ -224,10 +224,11 @@ func (e *EBPFAccelerator) checkEBPFSupport() bool {
 	return true
 }
 
-// int8ArrayToString 将 int8 数组转换为字符串 (Linux 专用，处理 syscall.Utsname)
-func int8ArrayToString(arr [65]int8) string {
+// parseUtsRelease 解析 utsname.Release 字段
+// 在不同 Linux 架构上，Release 可能是 [65]int8 或 [65]uint8
+func parseUtsRelease(release [65]int8) string {
 	var buf []byte
-	for _, v := range arr {
+	for _, v := range release {
 		if v == 0 {
 			break
 		}
