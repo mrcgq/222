@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/tunnel/privilege_linux.go
 // 描述: Linux 特有的权限管理实现
@@ -52,6 +50,9 @@ const (
 	PR_CAP_AMBIENT_CLEAR_ALL   = 4
 )
 
+// RLIMIT_NPROC 常量定义（某些环境下 syscall 包中没有）
+const RLIMIT_NPROC = 6
+
 // DropCapabilities 删除不需要的 capabilities
 func DropCapabilities(keep []Capability) error {
 	// 构建保留的 capability 集合
@@ -59,7 +60,7 @@ func DropCapabilities(keep []Capability) error {
 	for _, cap := range keep {
 		keepSet[cap] = true
 	}
-	
+
 	// 删除不需要的 capabilities
 	for cap := Capability(0); cap < 40; cap++ {
 		if !keepSet[cap] {
@@ -74,7 +75,7 @@ func DropCapabilities(keep []Capability) error {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -119,7 +120,7 @@ const (
 type SeccompConfig struct {
 	// 默认动作
 	DefaultAction SeccompAction
-	
+
 	// 系统调用规则
 	Rules []SeccompRule
 }
@@ -146,7 +147,7 @@ type SeccompRule struct {
 func ApplySeccompFilter(cfg *SeccompConfig) error {
 	// 注意：完整的 seccomp 实现需要使用 BPF 程序
 	// 这里提供一个简化的实现示意
-	
+
 	// 实际使用中建议使用 libseccomp 或生成 BPF 字节码
 	return nil
 }
@@ -159,22 +160,22 @@ func ApplySeccompFilter(cfg *SeccompConfig) error {
 type NamespaceConfig struct {
 	// 新建 PID 命名空间
 	NewPIDNS bool
-	
+
 	// 新建网络命名空间
 	NewNetNS bool
-	
+
 	// 新建挂载命名空间
 	NewMountNS bool
-	
+
 	// 新建 UTS 命名空间
 	NewUTSNS bool
-	
+
 	// 新建 IPC 命名空间
 	NewIPCNS bool
-	
+
 	// 新建用户命名空间
 	NewUserNS bool
-	
+
 	// 用户命名空间映射
 	UIDMappings []syscall.SysProcIDMap
 	GIDMappings []syscall.SysProcIDMap
@@ -185,13 +186,13 @@ func ConfigureNamespaces(cmd *exec.Cmd, cfg *NamespaceConfig) error {
 	if cfg == nil {
 		return nil
 	}
-	
+
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	
+
 	var cloneFlags uintptr
-	
+
 	if cfg.NewPIDNS {
 		cloneFlags |= syscall.CLONE_NEWPID
 	}
@@ -212,9 +213,9 @@ func ConfigureNamespaces(cmd *exec.Cmd, cfg *NamespaceConfig) error {
 		cmd.SysProcAttr.UidMappings = cfg.UIDMappings
 		cmd.SysProcAttr.GidMappings = cfg.GIDMappings
 	}
-	
+
 	cmd.SysProcAttr.Cloneflags = cloneFlags
-	
+
 	return nil
 }
 
@@ -226,16 +227,16 @@ func ConfigureNamespaces(cmd *exec.Cmd, cfg *NamespaceConfig) error {
 type ResourceLimits struct {
 	// 最大文件描述符数
 	MaxOpenFiles uint64
-	
+
 	// 最大进程数
 	MaxProcesses uint64
-	
+
 	// 最大内存 (字节)
 	MaxMemory uint64
-	
+
 	// 最大 CPU 时间 (秒)
 	MaxCPUTime uint64
-	
+
 	// 最大文件大小 (字节)
 	MaxFileSize uint64
 }
@@ -246,8 +247,8 @@ func DefaultResourceLimits() *ResourceLimits {
 		MaxOpenFiles: 1024,
 		MaxProcesses: 64,
 		MaxMemory:    512 * 1024 * 1024, // 512 MB
-		MaxCPUTime:   0,                  // 无限制
-		MaxFileSize:  100 * 1024 * 1024,  // 100 MB
+		MaxCPUTime:   0,                 // 无限制
+		MaxFileSize:  100 * 1024 * 1024, // 100 MB
 	}
 }
 
@@ -256,7 +257,7 @@ func ApplyResourceLimits(limits *ResourceLimits) error {
 	if limits == nil {
 		return nil
 	}
-	
+
 	// 文件描述符限制
 	if limits.MaxOpenFiles > 0 {
 		var rLimit syscall.Rlimit
@@ -266,17 +267,17 @@ func ApplyResourceLimits(limits *ResourceLimits) error {
 			return fmt.Errorf("设置文件描述符限制失败: %w", err)
 		}
 	}
-	
+
 	// 进程数限制
 	if limits.MaxProcesses > 0 {
 		var rLimit syscall.Rlimit
 		rLimit.Cur = limits.MaxProcesses
 		rLimit.Max = limits.MaxProcesses
-		if err := syscall.Setrlimit(syscall.RLIMIT_NPROC, &rLimit); err != nil {
+		if err := syscall.Setrlimit(RLIMIT_NPROC, &rLimit); err != nil {
 			return fmt.Errorf("设置进程数限制失败: %w", err)
 		}
 	}
-	
+
 	// 内存限制
 	if limits.MaxMemory > 0 {
 		var rLimit syscall.Rlimit
@@ -286,7 +287,7 @@ func ApplyResourceLimits(limits *ResourceLimits) error {
 			return fmt.Errorf("设置内存限制失败: %w", err)
 		}
 	}
-	
+
 	// CPU 时间限制
 	if limits.MaxCPUTime > 0 {
 		var rLimit syscall.Rlimit
@@ -296,7 +297,7 @@ func ApplyResourceLimits(limits *ResourceLimits) error {
 			return fmt.Errorf("设置 CPU 时间限制失败: %w", err)
 		}
 	}
-	
+
 	// 文件大小限制
 	if limits.MaxFileSize > 0 {
 		var rLimit syscall.Rlimit
@@ -306,7 +307,7 @@ func ApplyResourceLimits(limits *ResourceLimits) error {
 			return fmt.Errorf("设置文件大小限制失败: %w", err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -315,14 +316,14 @@ func ApplyResourceLimitsToCommand(cmd *exec.Cmd, limits *ResourceLimits) error {
 	if limits == nil {
 		return nil
 	}
-	
+
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	
+
 	// 使用 prlimit 系统调用为子进程设置限制
 	// 这需要在进程启动后立即执行
-	
+
 	return nil
 }
 
@@ -351,7 +352,7 @@ func NewAuditLogger(logPath string) (*AuditLogger, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &AuditLogger{
 		file: f,
 	}, nil
@@ -362,7 +363,7 @@ func (al *AuditLogger) LogEvent(event AuditEvent) error {
 	if al.file == nil {
 		return nil
 	}
-	
+
 	// 格式化并写入日志
 	line := fmt.Sprintf("[%d] %s pid=%d name=%s\n",
 		event.Timestamp,
@@ -370,7 +371,7 @@ func (al *AuditLogger) LogEvent(event AuditEvent) error {
 		event.ProcessID,
 		event.ProcessName,
 	)
-	
+
 	_, err := al.file.WriteString(line)
 	return err
 }
@@ -403,14 +404,14 @@ func NewProcessMonitor(pid int) *ProcessMonitor {
 // GetProcessInfo 获取进程信息
 func (pm *ProcessMonitor) GetProcessInfo() (map[string]interface{}, error) {
 	info := make(map[string]interface{})
-	
+
 	// 读取 /proc/[pid]/status
 	statusPath := fmt.Sprintf("/proc/%d/status", pm.pid)
 	data, err := os.ReadFile(statusPath)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// 解析状态信息
 	lines := string(data)
 	for _, line := range splitLines(lines) {
@@ -419,7 +420,7 @@ func (pm *ProcessMonitor) GetProcessInfo() (map[string]interface{}, error) {
 			info[parts[0]] = parts[1]
 		}
 	}
-	
+
 	return info, nil
 }
 
@@ -430,7 +431,7 @@ func (pm *ProcessMonitor) GetOpenFiles() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var files []string
 	for _, entry := range entries {
 		link, err := os.Readlink(fmt.Sprintf("%s/%s", fdPath, entry.Name()))
@@ -438,7 +439,7 @@ func (pm *ProcessMonitor) GetOpenFiles() ([]string, error) {
 			files = append(files, link)
 		}
 	}
-	
+
 	return files, nil
 }
 
@@ -469,6 +470,3 @@ func splitByColon(s string) []string {
 
 // Dummy usage of unsafe to satisfy import
 var _ = unsafe.Sizeof(0)
-
-
-
