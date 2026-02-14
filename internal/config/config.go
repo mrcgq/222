@@ -1,6 +1,7 @@
 // =============================================================================
 // 文件: internal/config/config.go
 // 描述: 配置管理 - 修复配置隐性关联、端口冲突检测、ARQ 优先级验证
+//       增加 ACME 自动证书配置支持
 // =============================================================================
 package config
 
@@ -119,19 +120,34 @@ type TunnelConfig struct {
 	Subdomain  string `yaml:"subdomain"`
 
 	// 证书配置
-	CertMode string `yaml:"cert_mode"` // auto, selfsigned, letsencrypt, zerossl, cforigin, custom
+	CertMode string `yaml:"cert_mode"` // auto, selfsigned, acme, letsencrypt, zerossl, cforigin, custom
 	CertFile string `yaml:"cert_file"`
 	KeyFile  string `yaml:"key_file"`
+	CertDir  string `yaml:"cert_dir"` // 证书存储目录
+
+	// ACME 配置 (Let's Encrypt / ZeroSSL)
+	ACMEProvider      string   `yaml:"acme_provider"`       // letsencrypt, letsencrypt-staging, zerossl
+	ACMEEmail         string   `yaml:"acme_email"`          // ACME 账户邮箱 (必填)
+	ACMEDomains       []string `yaml:"acme_domains"`        // 要申请证书的域名列表
+	ACMEChallengeType string   `yaml:"acme_challenge_type"` // http-01, tls-alpn-01
+	ACMEHTTPPort      int      `yaml:"acme_http_port"`      // HTTP-01 挑战端口，默认 80
+	ACMEUseTunnel     bool     `yaml:"acme_use_tunnel"`     // 使用 Cloudflare 隧道进行 ACME 验证
+
+	// ZeroSSL EAB 配置 (External Account Binding)
+	ACMEEABKeyID   string `yaml:"acme_eab_key_id"`
+	ACMEEABHMACKey string `yaml:"acme_eab_hmac_key"`
 
 	// Cloudflare 配置
 	CFToken    string `yaml:"cf_token"`
 	CFTunnelID string `yaml:"cf_tunnel_id"`
 
 	// 免费域名 API 配置
-	DuckDNS DuckDNSConfig `yaml:"duckdns"`
-	FreeDNS FreeDNSConfig `yaml:"freedns"`
+	DuckDNS       DuckDNSConfig `yaml:"duckdns"`
+	FreeDNS       FreeDNSConfig `yaml:"freedns"`
+	DuckDNSToken  string        `yaml:"duckdns_token"`  // 简化配置
+	DuckDNSDomain string        `yaml:"duckdns_domain"` // 简化配置
 
-	// Let's Encrypt 配置
+	// Let's Encrypt 配置 (旧版兼容)
 	LetsEncrypt LetsEncryptConfig `yaml:"letsencrypt"`
 
 	// 本地服务配置
@@ -143,9 +159,9 @@ type TunnelConfig struct {
 	LogLevel    string `yaml:"log_level"`
 
 	// 高级配置
-	AutoRestart    bool `yaml:"auto_restart"`
-	MaxRestarts    int  `yaml:"max_restarts"`
-	RestartDelaySec int `yaml:"restart_delay_sec"`
+	AutoRestart     bool `yaml:"auto_restart"`
+	MaxRestarts     int  `yaml:"max_restarts"`
+	RestartDelaySec int  `yaml:"restart_delay_sec"`
 }
 
 // DuckDNSConfig DuckDNS 配置
@@ -160,7 +176,7 @@ type FreeDNSConfig struct {
 	Domain string `yaml:"domain"`
 }
 
-// LetsEncryptConfig Let's Encrypt 配置
+// LetsEncryptConfig Let's Encrypt 配置 (旧版兼容，推荐使用 ACME* 字段)
 type LetsEncryptConfig struct {
 	Email       string `yaml:"email"`
 	Staging     bool   `yaml:"staging"`
@@ -231,11 +247,11 @@ func DefaultConfig() *Config {
 		},
 
 		EBPF: EBPFConfig{
-			Enabled:     false,
-			XDPMode:     "generic",
-			MapSize:     65536,
-			EnableTC:    false,
-			TCFakeTCP:   false,
+			Enabled:   false,
+			XDPMode:   "generic",
+			MapSize:   65536,
+			EnableTC:  false,
+			TCFakeTCP: false,
 		},
 
 		Switcher: SwitcherConfig{
@@ -257,16 +273,20 @@ func DefaultConfig() *Config {
 		},
 
 		Tunnel: TunnelConfig{
-			Enabled:         false,
-			Mode:            "temp",
-			DomainMode:      "auto",
-			CertMode:        "auto",
-			LocalAddr:       "127.0.0.1",
-			Protocol:        "http",
-			LogLevel:        "info",
-			AutoRestart:     true,
-			MaxRestarts:     5,
-			RestartDelaySec: 5,
+			Enabled:           false,
+			Mode:              "temp",
+			DomainMode:        "auto",
+			CertMode:          "auto",
+			LocalAddr:         "127.0.0.1",
+			Protocol:          "http",
+			LogLevel:          "info",
+			AutoRestart:       true,
+			MaxRestarts:       5,
+			RestartDelaySec:   5,
+			ACMEProvider:      "letsencrypt",
+			ACMEChallengeType: "http-01",
+			ACMEHTTPPort:      80,
+			ACMEUseTunnel:     true,
 		},
 	}
 }
@@ -427,8 +447,21 @@ func (c *Config) validateTunnelConfig() error {
 
 	// 验证证书模式
 	switch c.Tunnel.CertMode {
-	case "", "auto", "selfsigned", "letsencrypt", "zerossl", "cforigin", "custom":
+	case "", "auto", "selfsigned", "acme", "letsencrypt", "zerossl", "cforigin", "custom":
 		// 有效模式
+		// 处理别名
+		if c.Tunnel.CertMode == "letsencrypt" {
+			c.Tunnel.CertMode = "acme"
+			if c.Tunnel.ACMEProvider == "" {
+				c.Tunnel.ACMEProvider = "letsencrypt"
+			}
+		}
+		if c.Tunnel.CertMode == "zerossl" {
+			c.Tunnel.CertMode = "acme"
+			if c.Tunnel.ACMEProvider == "" {
+				c.Tunnel.ACMEProvider = "zerossl"
+			}
+		}
 	default:
 		return fmt.Errorf("无效的证书模式: %s", c.Tunnel.CertMode)
 	}
@@ -445,13 +478,30 @@ func (c *Config) validateTunnelConfig() error {
 		}
 	}
 
+	// 验证 ACME 配置
+	if c.Tunnel.CertMode == "acme" {
+		if err := c.validateACMEConfig(); err != nil {
+			return fmt.Errorf("ACME 配置错误: %w", err)
+		}
+	}
+
 	// 验证 DuckDNS 配置
 	if c.Tunnel.DomainMode == "duckdns" {
-		if c.Tunnel.DuckDNS.Token == "" {
-			return fmt.Errorf("DuckDNS 模式需要配置 duckdns.token")
+		// 支持两种配置方式
+		token := c.Tunnel.DuckDNSToken
+		if token == "" {
+			token = c.Tunnel.DuckDNS.Token
 		}
-		if c.Tunnel.DuckDNS.Domains == "" {
-			return fmt.Errorf("DuckDNS 模式需要配置 duckdns.domains")
+		domains := c.Tunnel.DuckDNSDomain
+		if domains == "" {
+			domains = c.Tunnel.DuckDNS.Domains
+		}
+
+		if token == "" {
+			return fmt.Errorf("DuckDNS 模式需要配置 duckdns_token 或 duckdns.token")
+		}
+		if domains == "" {
+			return fmt.Errorf("DuckDNS 模式需要配置 duckdns_domain 或 duckdns.domains")
 		}
 	}
 
@@ -462,10 +512,14 @@ func (c *Config) validateTunnelConfig() error {
 		}
 	}
 
-	// 验证 Let's Encrypt 配置
-	if c.Tunnel.CertMode == "letsencrypt" {
-		if c.Tunnel.LetsEncrypt.Email == "" {
-			return fmt.Errorf("Let's Encrypt 模式需要配置 letsencrypt.email")
+	// 验证 Let's Encrypt 配置 (旧版兼容)
+	if c.Tunnel.CertMode == "acme" && c.Tunnel.ACMEEmail == "" {
+		// 尝试从旧版配置中获取
+		if c.Tunnel.LetsEncrypt.Email != "" {
+			c.Tunnel.ACMEEmail = c.Tunnel.LetsEncrypt.Email
+			if c.Tunnel.LetsEncrypt.Staging {
+				c.Tunnel.ACMEProvider = "letsencrypt-staging"
+			}
 		}
 	}
 
@@ -489,6 +543,64 @@ func (c *Config) validateTunnelConfig() error {
 	}
 	if c.Tunnel.RestartDelaySec < 0 {
 		return fmt.Errorf("restart_delay_sec 不能为负数")
+	}
+
+	return nil
+}
+
+// validateACMEConfig 验证 ACME 配置
+func (c *Config) validateACMEConfig() error {
+	// 验证邮箱 (ACME 必需)
+	if c.Tunnel.ACMEEmail == "" {
+		return fmt.Errorf("ACME 模式需要配置 acme_email")
+	}
+
+	// 简单的邮箱格式验证
+	if !strings.Contains(c.Tunnel.ACMEEmail, "@") {
+		return fmt.Errorf("无效的邮箱地址: %s", c.Tunnel.ACMEEmail)
+	}
+
+	// 验证 ACME 提供商
+	switch c.Tunnel.ACMEProvider {
+	case "", "letsencrypt", "letsencrypt-staging", "zerossl":
+		// 有效提供商
+		if c.Tunnel.ACMEProvider == "" {
+			c.Tunnel.ACMEProvider = "letsencrypt"
+		}
+	default:
+		return fmt.Errorf("无效的 ACME 提供商: %s (支持: letsencrypt, letsencrypt-staging, zerossl)",
+			c.Tunnel.ACMEProvider)
+	}
+
+	// 验证挑战类型
+	switch c.Tunnel.ACMEChallengeType {
+	case "", "http-01", "tls-alpn-01":
+		// 有效挑战类型
+		if c.Tunnel.ACMEChallengeType == "" {
+			c.Tunnel.ACMEChallengeType = "http-01"
+		}
+	default:
+		return fmt.Errorf("无效的 ACME 挑战类型: %s (支持: http-01, tls-alpn-01)",
+			c.Tunnel.ACMEChallengeType)
+	}
+
+	// 验证 HTTP 端口
+	if c.Tunnel.ACMEHTTPPort != 0 {
+		if c.Tunnel.ACMEHTTPPort < 1 || c.Tunnel.ACMEHTTPPort > 65535 {
+			return fmt.Errorf("无效的 ACME HTTP 端口: %d", c.Tunnel.ACMEHTTPPort)
+		}
+	}
+
+	// ZeroSSL 需要 EAB 凭据
+	if c.Tunnel.ACMEProvider == "zerossl" {
+		if c.Tunnel.ACMEEABKeyID == "" || c.Tunnel.ACMEEABHMACKey == "" {
+			return fmt.Errorf("ZeroSSL 需要配置 acme_eab_key_id 和 acme_eab_hmac_key")
+		}
+	}
+
+	// 如果没有指定域名，尝试从 Domain 字段获取
+	if len(c.Tunnel.ACMEDomains) == 0 && c.Tunnel.Domain != "" {
+		c.Tunnel.ACMEDomains = []string{c.Tunnel.Domain}
 	}
 
 	return nil
@@ -524,11 +636,11 @@ func (c *Config) validateEBPFConfig() error {
 	default:
 		return fmt.Errorf("无效的 XDP 模式: %s (支持: generic, native, offload)", c.EBPF.XDPMode)
 	}
-	
+
 	if c.EBPF.MapSize < 1024 || c.EBPF.MapSize > 1048576 {
 		return fmt.Errorf("map_size 需在 1024-1048576 之间")
 	}
-	
+
 	return nil
 }
 
@@ -537,17 +649,17 @@ func (c *Config) validateWebSocketConfig() error {
 	if c.WebSocket.Path == "" {
 		c.WebSocket.Path = "/ws"
 	}
-	
+
 	if !strings.HasPrefix(c.WebSocket.Path, "/") {
 		return fmt.Errorf("websocket.path 必须以 / 开头")
 	}
-	
+
 	if c.WebSocket.TLS {
 		if c.WebSocket.CertFile == "" || c.WebSocket.KeyFile == "" {
 			return fmt.Errorf("websocket TLS 模式需要配置 cert_file 和 key_file")
 		}
 	}
-	
+
 	return nil
 }
 
@@ -580,6 +692,32 @@ func (c *Config) syncRelatedConfig() {
 	}
 	if c.Tunnel.RestartDelaySec == 0 {
 		c.Tunnel.RestartDelaySec = 5
+	}
+
+	// 同步 ACME 默认值
+	if c.Tunnel.CertMode == "acme" {
+		if c.Tunnel.ACMEHTTPPort == 0 {
+			c.Tunnel.ACMEHTTPPort = 80
+		}
+		if c.Tunnel.ACMEProvider == "" {
+			c.Tunnel.ACMEProvider = "letsencrypt"
+		}
+		if c.Tunnel.ACMEChallengeType == "" {
+			c.Tunnel.ACMEChallengeType = "http-01"
+		}
+	}
+
+	// 同步 DuckDNS 配置 (简化字段 -> 结构体)
+	if c.Tunnel.DuckDNSToken != "" && c.Tunnel.DuckDNS.Token == "" {
+		c.Tunnel.DuckDNS.Token = c.Tunnel.DuckDNSToken
+	}
+	if c.Tunnel.DuckDNSDomain != "" && c.Tunnel.DuckDNS.Domains == "" {
+		c.Tunnel.DuckDNS.Domains = c.Tunnel.DuckDNSDomain
+	}
+
+	// 同步 ACME 域名
+	if c.Tunnel.CertMode == "acme" && len(c.Tunnel.ACMEDomains) == 0 && c.Tunnel.Domain != "" {
+		c.Tunnel.ACMEDomains = []string{c.Tunnel.Domain}
 	}
 }
 
@@ -630,19 +768,51 @@ func (c *TunnelConfig) IsDirectTunnel() bool {
 	return c.Mode == "direct"
 }
 
+// IsACMEEnabled 是否启用 ACME 证书
+func (c *TunnelConfig) IsACMEEnabled() bool {
+	return c.CertMode == "acme"
+}
+
 // GetLocalURL 获取本地服务 URL
 func (c *TunnelConfig) GetLocalURL() string {
 	addr := c.LocalAddr
 	if addr == "" {
 		addr = "127.0.0.1"
 	}
-	
+
 	protocol := c.Protocol
 	if protocol == "" {
 		protocol = "http"
 	}
-	
+
 	return fmt.Sprintf("%s://%s:%d", protocol, addr, c.LocalPort)
+}
+
+// GetACMEDomains 获取 ACME 域名列表
+func (c *TunnelConfig) GetACMEDomains() []string {
+	if len(c.ACMEDomains) > 0 {
+		return c.ACMEDomains
+	}
+	if c.Domain != "" {
+		return []string{c.Domain}
+	}
+	return nil
+}
+
+// GetDuckDNSToken 获取 DuckDNS Token
+func (c *TunnelConfig) GetDuckDNSToken() string {
+	if c.DuckDNSToken != "" {
+		return c.DuckDNSToken
+	}
+	return c.DuckDNS.Token
+}
+
+// GetDuckDNSDomain 获取 DuckDNS 域名
+func (c *TunnelConfig) GetDuckDNSDomain() string {
+	if c.DuckDNSDomain != "" {
+		return c.DuckDNSDomain
+	}
+	return c.DuckDNS.Domains
 }
 
 // =============================================================================
@@ -733,45 +903,130 @@ tunnel:
   enabled: false
   mode: "temp"                      # 隧道模式: temp (临时), fixed (固定), direct (直接 TCP)
   
+  # =========================================================================
   # 临时隧道 (mode: temp) - 无需额外配置
   # 自动获取 xxx.trycloudflare.com 域名
+  # =========================================================================
   
+  # =========================================================================
   # 固定隧道 (mode: fixed) - 需要以下配置
+  # =========================================================================
   cf_token: ""                      # Cloudflare Tunnel Token
   cf_tunnel_id: ""                  # Tunnel ID (可选)
   
+  # =========================================================================
   # 本地服务配置
+  # =========================================================================
   local_addr: "127.0.0.1"           # 本地地址
   local_port: 0                     # 本地端口 (0 = 自动使用主监听端口)
   protocol: "http"                  # 协议: http, https, tcp
   
+  # =========================================================================
   # 域名配置 (可选)
+  # =========================================================================
   domain_mode: "auto"               # 域名模式: auto, sslip, nip, duckdns, freedns, custom
   domain: ""                        # 自定义域名
   subdomain: ""                     # 子域名
   
-  # 证书配置 (可选)
-  cert_mode: "auto"                 # 证书模式: auto, selfsigned, letsencrypt, custom
+  # =========================================================================
+  # 证书配置
+  # =========================================================================
+  cert_mode: "auto"                 # 证书模式: auto, selfsigned, acme, letsencrypt, zerossl, cforigin, custom
   cert_file: ""                     # 自定义证书文件
   key_file: ""                      # 自定义密钥文件
+  cert_dir: ""                      # 证书存储目录 (默认: /tmp/phantom-certs)
   
+  # =========================================================================
+  # ACME 自动证书配置 (Let's Encrypt / ZeroSSL)
+  # cert_mode 设为 "acme" 或 "letsencrypt" 或 "zerossl" 时生效
+  # =========================================================================
+  acme_provider: "letsencrypt"      # ACME 提供商: letsencrypt, letsencrypt-staging, zerossl
+  acme_email: ""                    # ACME 账户邮箱 (必填)
+  acme_domains:                     # 要申请证书的域名列表
+    # - example.com
+    # - www.example.com
+  acme_challenge_type: "http-01"    # 挑战类型: http-01, tls-alpn-01
+  acme_http_port: 80                # HTTP-01 挑战端口
+  acme_use_tunnel: true             # 使用 Cloudflare 隧道进行 ACME 验证 (推荐)
+  
+  # ZeroSSL EAB 配置 (仅 zerossl 需要)
+  acme_eab_key_id: ""               # EAB Key ID
+  acme_eab_hmac_key: ""             # EAB HMAC Key
+  
+  # =========================================================================
   # DuckDNS 配置 (domain_mode: duckdns)
+  # =========================================================================
+  duckdns_token: ""                 # DuckDNS Token (简化配置)
+  duckdns_domain: ""                # DuckDNS 子域名 (简化配置)
+  # 或使用结构化配置:
   duckdns:
     token: ""
     domains: ""
   
-  # Let's Encrypt 配置 (cert_mode: letsencrypt)
+  # =========================================================================
+  # FreeDNS 配置 (domain_mode: freedns)
+  # =========================================================================
+  freedns:
+    token: ""
+    domain: ""
+  
+  # =========================================================================
+  # Let's Encrypt 旧版配置 (已废弃，推荐使用 acme_* 字段)
+  # =========================================================================
   letsencrypt:
     email: ""
     staging: false
     dns_provider: ""
     dns_token: ""
   
+  # =========================================================================
   # 高级配置
+  # =========================================================================
   auto_restart: true                # 自动重启
   max_restarts: 5                   # 最大重启次数
   restart_delay_sec: 5              # 重启延迟 (秒)
   log_level: "info"                 # 隧道日志级别
+
+# =============================================================================
+# ACME 证书使用示例
+# =============================================================================
+#
+# 示例 1: 使用 Let's Encrypt 获取证书 (推荐使用隧道验证)
+# tunnel:
+#   enabled: true
+#   mode: "fixed"
+#   cert_mode: "acme"
+#   acme_email: "admin@example.com"
+#   acme_domains:
+#     - example.com
+#     - www.example.com
+#   acme_use_tunnel: true            # 通过 Cloudflare 隧道进行验证
+#   cf_token: "your-cloudflare-token"
+#
+# 示例 2: 使用 Let's Encrypt Staging (测试环境)
+# tunnel:
+#   enabled: true
+#   mode: "direct"
+#   cert_mode: "acme"
+#   acme_provider: "letsencrypt-staging"
+#   acme_email: "admin@example.com"
+#   acme_domains:
+#     - test.example.com
+#   acme_use_tunnel: false
+#   acme_http_port: 80
+#
+# 示例 3: 使用 ZeroSSL
+# tunnel:
+#   enabled: true
+#   cert_mode: "acme"
+#   acme_provider: "zerossl"
+#   acme_email: "admin@example.com"
+#   acme_domains:
+#     - example.com
+#   acme_eab_key_id: "your-eab-key-id"
+#   acme_eab_hmac_key: "your-eab-hmac-key"
+#
+# =============================================================================
 `
 }
 
