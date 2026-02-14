@@ -1,4 +1,4 @@
-name: Build and Test
+name: Build All Platforms
 
 on:
   push:
@@ -7,8 +7,8 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
-    name: Build & Test
+  build-all:
+    name: Cross-Platform Build
     runs-on: ubuntu-latest
     
     steps:
@@ -20,50 +20,50 @@ jobs:
         with:
           go-version: '1.22.x'
 
+      # 使用 v2 key 解决之前的缓存报错
       - name: 缓存 Go 模块
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-1.22-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-1.22-v2-${{ hashFiles('**/go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-go-1.22-
+            ${{ runner.os }}-go-1.22-v2-
 
-      - name: 安装 eBPF 编译依赖
+      - name: 安装依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib libelf-dev
+          
+          # 处理 bpftool (虽然 eBPF 只能在 Linux 用，但编译流程需要它)
           curl -L https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz | sudo tar -xz -C /usr/local/bin
           sudo chmod +x /usr/local/bin/bpftool
           sudo rm -f /usr/bin/bpftool
           sudo ln -sf /usr/local/bin/bpftool /usr/bin/bpftool
-          bpftool version
-          clang --version
 
       - name: 整理依赖
         run: go mod tidy
 
-      - name: 构建 eBPF 程序
-        run: make ebpf
-
-      - name: 构建主程序
-        run: make build
-
-      - name: 验证构建产物
+      # 1. 先编译 eBPF (Linux 专用)
+      - name: 构建 eBPF 内核程序
         run: |
-          ls -l phantom-server
-          ls -l ebpf/*.o
+          sed -i 's/CFLAGS :=/CFLAGS := -Wno-address-of-packed-member -Wno-unused-function /' ebpf/Makefile
+          make ebpf
 
-      # ==========================================================
-      # 新增步骤：上传构建产物
-      # ==========================================================
-      - name: 上传构建产物 (Artifacts)
+      # 2. 关键修改：运行 make release 而不是 make build
+      # 这会触发 Makefile 中的循环，编译出 Windows, Mac, Linux 等所有版本
+      - name: 构建全平台主程序
+        run: make release
+
+      - name: 查看生成的文件
+        run: ls -R dist/
+
+      # 3. 上传所有平台的文件
+      - name: 上传所有构建产物
         uses: actions/upload-artifact@v4
         with:
-          # 打包后的文件名
-          name: phantom-server-binaries-ubuntu
-          # 要打包的文件路径
+          name: phantom-server-all-platforms
           path: |
-            ./phantom-server
-            ./ebpf/*.o
+            dist/*
+            ebpf/*.o
