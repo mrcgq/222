@@ -52,36 +52,7 @@ type FakeTCPClient struct {
 	synRetries    int32
 }
 
-// FakeTCPConfig 配置结构
-type FakeTCPConfig struct {
-	// NAT 穿透模式
-	NATMode NATTraversalMode
-
-	// 连接超时
-	ConnTimeout time.Duration
-
-	// 日志级别
-	LogLevel string
-
-	// 其他配置...
-	MSS             uint16
-	WindowSize      uint16
-	EnableSACK      bool
-	EnableTimestamp bool
-}
-
-// DefaultFakeTCPConfig 默认配置
-func DefaultFakeTCPConfig() *FakeTCPConfig {
-	return &FakeTCPConfig{
-		NATMode:         NATModeAuto,
-		ConnTimeout:     10 * time.Second,
-		LogLevel:        "info",
-		MSS:             1460,
-		WindowSize:      65535,
-		EnableSACK:      true,
-		EnableTimestamp: true,
-	}
-}
+// 注意: FakeTCPConfig 和 DefaultFakeTCPConfig 已在 faketcp_types.go 中定义，此处不再重复
 
 // NewFakeTCPClient 创建 FakeTCP 客户端
 func NewFakeTCPClient(serverAddr string, config *FakeTCPConfig) (*FakeTCPClient, error) {
