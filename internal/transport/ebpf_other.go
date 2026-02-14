@@ -14,34 +14,6 @@ import (
 )
 
 // =============================================================================
-// EBPFStats 存根
-// =============================================================================
-
-// EBPFStats eBPF 统计信息
-type EBPFStats struct {
-	PacketsRX       uint64
-	PacketsTX       uint64
-	BytesRX         uint64
-	BytesTX         uint64
-	PacketsDropped  uint64
-	SessionsCreated uint64
-	SessionsDeleted uint64
-	Errors          uint64
-}
-
-// EBPFAcceleratorStats 加速器统计
-type EBPFAcceleratorStats struct {
-	Active          bool
-	Uptime          time.Duration
-	XDPMode         string
-	Interface       string
-	ProgramLoaded   bool
-	ActiveSessions  int
-	EventsProcessed uint64
-	EBPFStats       EBPFStats
-}
-
-// =============================================================================
 // EBPFAccelerator 存根
 // =============================================================================
 
