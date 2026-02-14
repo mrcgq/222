@@ -1,0 +1,119 @@
+# .goreleaser.yml
+#
+# GoReleaser 配置文件，用于自动化构建、打包和发布 Phantom Server
+#
+# 更多信息: https://goreleaser.com/customization/
+#
+version: 2
+
+# 项目元数据
+project_name: phantom-server
+
+# 构建配置
+builds:
+  - # 主构建目标
+    id: phantom-server
+    # 主程序入口
+    main: ./cmd/phantom-server/
+    # 输出的二进制文件名
+    binary: phantom-server
+    # 注入版本信息 (与 Makefile 对应)
+    ldflags:
+      - -s -w -X main.Version={{.Version}} -X main.GitCommit={{.Commit}} -X main.BuildTime={{.Date}}
+    # 目标平台
+    goos:
+      - linux
+      - windows
+      - darwin
+      - freebsd
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - '7'
+    # 环境变量
+    env:
+      - CGO_ENABLED=0
+    # 在构建前执行的钩子 (用于编译 eBPF)
+    hooks:
+      pre:
+        - cmd: make ebpf
+
+# 打包配置
+archives:
+  - # 主打包配置
+    id: default
+    # 替换特定平台的模板变量
+    replacements:
+      darwin: Darwin
+      linux: Linux
+      windows: Windows
+      freebsd: FreeBSD
+      amd64: x86_64
+      arm64: arm64
+      arm: armv7
+    # 格式化
+    format: tar.gz
+    # 包内文件
+    files:
+      # 将 eBPF 程序仅包含在 Linux 包中
+      - src: ebpf/*.o
+        dst: ebpf/
+        strip_parent: true
+        info:
+          # 仅当 GOOS 是 linux 时包含此文件
+          goos:
+            - linux
+      # 包含配置文件示例
+      - src: configs/config.example.yaml
+        dst: config.example.yaml
+      # 包含安装脚本
+      - src: scripts/install.sh
+        dst: install.sh
+        info:
+          mode: 0755
+      # 包含 README
+      - README.md
+    # 为 Windows 单独设置 zip 格式
+    format_overrides:
+      - goos: windows
+        format: zip
+
+# Checksum 配置
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+# Snapshot 配置 (用于测试)
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+# Changelog 配置
+changelog:
+  sort: asc
+  filters:
+    # 排除一些不重要的提交信息
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'Merge pull request'
+      - 'Merge branch'
+
+# Release 配置 (GitHub)
+release:
+  # 如果设置为 true, GoReleaser 会自动发布
+  # 如果设置为 false, 它会创建草稿
+  draft: false
+  prerelease: auto
+  # 自定义 Release 说明
+  header: |
+    ## Phantom Server {{.Version}}
+    高性能多模式代理服务器
+
+    **eBPF + Hysteria2 + FakeTCP + WebSocket/CDN**
+  footer: |
+    ---
+    **感谢您的使用！**
+    - [GitHub Repository](https://github.com/mrcgq/211)

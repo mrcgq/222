@@ -1,0 +1,61 @@
+# .github/workflows/build.yml
+name: Build and Test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+
+      - name: 缓存 Go 模块
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-1.22-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-1.22-
+
+      - name: 安装 eBPF 编译依赖 (静态 bpftool)
+        run: |
+          sudo apt-get update
+          # 安装基础编译工具，排除掉那个会报错的 bpftool 包
+          sudo apt-get install -y clang llvm libbpf-dev gcc-multilib libelf-dev
+          
+          # 下载官方 libbpf 维护的静态编译版 bpftool (版本 v7.5.0)
+          # 这种版本不依赖本地内核版本，非常适合 CI 环境
+          curl -L https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz | sudo tar -xz -C /usr/local/bin
+          
+          # 验证安装情况
+          bpftool version
+          clang --version
+
+      - name: 整理依赖
+        run: go mod tidy
+
+      - name: 构建 eBPF 程序
+        run: make ebpf
+
+      - name: 构建主程序
+        run: make build
+
+      - name: 验证构建产物
+        run: |
+          ls -l phantom-server
+          ls -l ebpf/*.o
+          ./phantom-server -v

@@ -1,0 +1,131 @@
+
+
+
+
+
+# =============================================================================
+# 文件: configs/config.example.yaml 
+# 描述: 完整配置示例 - 包含隧道配置
+# =============================================================================
+
+# ═══════════════════════════════════════════════════════════════════
+# Phantom Server v4.0 Ultimate Edition 配置文件
+# ═══════════════════════════════════════════════════════════════════
+
+# 基础配置
+listen: ":54321"
+psk: "YOUR_PSK_HERE"
+time_window: 30
+log_level: "info"
+mode: "auto"
+
+# ─────────────────────────────────────────────────────────────────────
+# Cloudflare 隧道配置
+# ─────────────────────────────────────────────────────────────────────
+tunnel:
+  enabled: true
+  
+  # 隧道模式: temp(临时), fixed(固定), direct(直连)
+  mode: "temp"
+  
+  # 域名模式: auto, sslip, nip, duckdns, freedns, custom
+  domain_mode: "auto"
+  domain: ""           # 自定义域名时填写
+  subdomain: ""        # 子域名前缀
+  
+  # 证书模式: auto, selfsigned, letsencrypt, zerossl, cforigin, custom
+  cert_mode: "auto"
+  cert_file: ""        # 自定义证书路径
+  key_file: ""         # 自定义私钥路径
+  
+  # Cloudflare 配置 (固定隧道需要)
+  cf_token: ""
+  cf_tunnel_id: ""
+  
+  # DuckDNS 配置 (domain_mode=duckdns 时)
+  duckdns:
+    token: ""
+    domains: ""        # 逗号分隔的域名列表
+  
+  # FreeDNS 配置 (domain_mode=freedns 时)
+  freedns:
+    token: ""
+    domain: ""
+  
+  # Let's Encrypt 配置 (cert_mode=letsencrypt 时)
+  letsencrypt:
+    email: ""
+    staging: false     # 使用测试环境
+    dns_provider: ""   # dns_cf, dns_duckdns 等
+    dns_token: ""
+  
+  # 本地服务配置
+  local_addr: "127.0.0.1"
+  local_port: 54321
+  protocol: "http"     # http, https, tcp
+  no_tls_verify: false
+  metrics: ""
+
+# ─────────────────────────────────────────────────────────────────────
+# Hysteria2 拥塞控制 (暴力抗丢包)
+# ─────────────────────────────────────────────────────────────────────
+hysteria2:
+  enabled: true
+  up_mbps: 100
+  down_mbps: 100
+  initial_window: 32
+  max_window: 512
+  min_rtt_ms: 20
+  max_rtt_ms: 500
+  loss_threshold: 0.1
+
+# ─────────────────────────────────────────────────────────────────────
+# FakeTCP 配置 (绕过 UDP QoS)
+# ─────────────────────────────────────────────────────────────────────
+faketcp:
+  enabled: true
+  listen: ":54322"
+  interface: "eth0"
+  sequence_id: 0
+
+# ─────────────────────────────────────────────────────────────────────
+# WebSocket 配置 (CDN 友好)
+# ─────────────────────────────────────────────────────────────────────
+websocket:
+  enabled: true
+  listen: ":54323"
+  path: "/ws"
+  host: ""
+  tls: false
+
+# ─────────────────────────────────────────────────────────────────────
+# eBPF 配置 (内核级加速)
+# ─────────────────────────────────────────────────────────────────────
+ebpf:
+  enabled: false
+  interface: "eth0"
+  xdp_mode: "generic"
+  program_path: "/opt/phantom/ebpf"
+  map_size: 65536
+  enable_stats: true
+
+# ─────────────────────────────────────────────────────────────────────
+# 智能链路切换
+# ─────────────────────────────────────────────────────────────────────
+switcher:
+  enabled: true
+  check_interval_ms: 1000
+  fail_threshold: 3
+  recover_threshold: 5
+  rtt_threshold_ms: 300
+  loss_threshold: 0.3
+  priority:
+    - "ebpf"
+    - "faketcp"
+    - "udp"
+    - "websocket"
+
+
+
+
+

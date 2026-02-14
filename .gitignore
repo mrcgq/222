@@ -1,0 +1,60 @@
+
+
+// =============================================================================
+// 文件: .gitignore
+// =============================================================================
+
+
+ 
+		
+		  
+
+
+# Binaries
+phantom-server
+phantom-server.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build output
+/dist/
+/bin/
+
+# Test output
+*.test
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# eBPF
+ebpf/*.o
+ebpf/vmlinux.h
+
+# Configs with secrets
+config.yaml
+*.pem
+*.key
+*.crt
+
+# Logs
+*.log
+
+# Temp
+tmp/
+*.tmp
+

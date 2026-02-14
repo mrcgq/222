@@ -1,0 +1,58 @@
+# .github/workflows/release.yml
+#
+# GitHub Actions 工作流：用于发布新版本的 Phantom Server
+#
+# 何时触发:
+# - 当一个以 "v" 开头的标签被推送到仓库时 (例如: v4.0.1)
+#
+# 主要任务:
+# - 自动创建 GitHub Release
+# - 交叉编译适用于多个平台 (Linux, Windows, macOS) 的二进制文件
+# - 编译 eBPF 内核程序
+# - 将二进制文件、eBPF 程序、配置文件示例和安装脚本打包成 .tar.gz 或 .zip
+# - 将所有打包好的资产上传到 GitHub Release
+#
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write # 需要此权限来创建和上传 Release
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 获取所有历史记录，以便生成 changelog
+
+      - name: 设置 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+
+      - name: 缓存 Go 模块
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: 安装 eBPF 和交叉编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev bpftool gcc-multilib zip tar
+
+      - name: 运行 GoReleaser (自动完成所有发布工作)
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          # 使用 'goreleaser release' 命令
+          args: release --clean
+        env:
+          # GitHub Token 用于创建 Release 和上传文件
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
