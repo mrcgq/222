@@ -39,14 +39,21 @@ var CloudflaredVersions = map[string]BinaryInfo{
 		Name:       "cloudflared",
 		Version:    "2024.1.5",
 		URL:        "https://github.com/cloudflare/cloudflared/releases/download/2024.1.5/cloudflared-linux-amd64",
-		SHA256:     "a6b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3", // 示例哈希，部署时替换
+		SHA256:     "", // 留空表示跳过校验
 		InstallDir: "/usr/local/bin",
 	},
 	"linux-arm64": {
 		Name:       "cloudflared",
 		Version:    "2024.1.5",
 		URL:        "https://github.com/cloudflare/cloudflared/releases/download/2024.1.5/cloudflared-linux-arm64",
-		SHA256:     "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3", // 示例哈希，部署时替换
+		SHA256:     "",
+		InstallDir: "/usr/local/bin",
+	},
+	"linux-arm": {
+		Name:       "cloudflared",
+		Version:    "2024.1.5",
+		URL:        "https://github.com/cloudflare/cloudflared/releases/download/2024.1.5/cloudflared-linux-arm",
+		SHA256:     "",
 		InstallDir: "/usr/local/bin",
 	},
 	"darwin-amd64": {
@@ -67,6 +74,13 @@ var CloudflaredVersions = map[string]BinaryInfo{
 		Name:       "cloudflared.exe",
 		Version:    "2024.1.5",
 		URL:        "https://github.com/cloudflare/cloudflared/releases/download/2024.1.5/cloudflared-windows-amd64.exe",
+		SHA256:     "",
+		InstallDir: "",
+	},
+	"windows-386": {
+		Name:       "cloudflared.exe",
+		Version:    "2024.1.5",
+		URL:        "https://github.com/cloudflare/cloudflared/releases/download/2024.1.5/cloudflared-windows-386.exe",
 		SHA256:     "",
 		InstallDir: "",
 	},
@@ -113,7 +127,13 @@ func WithLogLevel(level int) DownloaderOption {
 // NewBinaryDownloader 创建下载器
 func NewBinaryDownloader(cacheDir string, opts ...DownloaderOption) *BinaryDownloader {
 	if cacheDir == "" {
-		cacheDir = filepath.Join(os.TempDir(), "phantom-binaries")
+		// 优先使用用户目录
+		homeDir, err := os.UserHomeDir()
+		if err == nil {
+			cacheDir = filepath.Join(homeDir, ".phantom", "bin")
+		} else {
+			cacheDir = filepath.Join(os.TempDir(), "phantom-binaries")
+		}
 	}
 	os.MkdirAll(cacheDir, 0755)
 
@@ -143,20 +163,17 @@ func NewBinaryDownloader(cacheDir string, opts ...DownloaderOption) *BinaryDownl
 func (d *BinaryDownloader) EnsureCloudflared() (string, error) {
 	// 1. 检查系统 PATH
 	if path, err := exec.LookPath("cloudflared"); err == nil {
-		version, _ := d.getCloudflaredVersion(path)
-		d.log(2, "发现系统 cloudflared: %s (版本: %s)", path, version)
-		return path, nil
+		if d.verifyCloudflared(path) {
+			version, _ := d.getCloudflaredVersion(path)
+			d.log(2, "发现系统 cloudflared: %s (版本: %s)", path, version)
+			return path, nil
+		}
 	}
 
 	// 2. 检查标准安装位置
-	standardPaths := []string{
-		"/usr/local/bin/cloudflared",
-		"/usr/bin/cloudflared",
-		filepath.Join(os.Getenv("HOME"), ".local/bin/cloudflared"),
-	}
-
+	standardPaths := d.getStandardPaths()
 	for _, p := range standardPaths {
-		if _, err := os.Stat(p); err == nil {
+		if d.verifyCloudflared(p) {
 			d.log(2, "发现已安装的 cloudflared: %s", p)
 			return p, nil
 		}
@@ -169,11 +186,7 @@ func (d *BinaryDownloader) EnsureCloudflared() (string, error) {
 		return "", fmt.Errorf("不支持的平台: %s", arch)
 	}
 
-	cachedPath := filepath.Join(d.cacheDir, fmt.Sprintf("cloudflared-%s-%s", info.Version, runtime.GOARCH))
-	if runtime.GOOS == "windows" {
-		cachedPath += ".exe"
-	}
-
+	cachedPath := d.getCachedPath(info)
 	if d.isValidBinary(cachedPath, info.SHA256) {
 		d.log(1, "使用缓存的 cloudflared: %s", cachedPath)
 		return cachedPath, nil
@@ -185,17 +198,88 @@ func (d *BinaryDownloader) EnsureCloudflared() (string, error) {
 		return "", fmt.Errorf("下载 cloudflared 失败: %w", err)
 	}
 
-	d.log(1, "cloudflared 已下载: %s", cachedPath)
+	// 5. 验证下载的文件
+	if !d.verifyCloudflared(cachedPath) {
+		os.Remove(cachedPath)
+		return "", fmt.Errorf("下载的 cloudflared 无法执行")
+	}
+
+	d.log(1, "cloudflared 已下载并验证: %s", cachedPath)
 	return cachedPath, nil
+}
+
+// getStandardPaths 获取标准安装路径
+func (d *BinaryDownloader) getStandardPaths() []string {
+	paths := []string{}
+
+	switch runtime.GOOS {
+	case "linux", "darwin":
+		paths = append(paths,
+			"/usr/local/bin/cloudflared",
+			"/usr/bin/cloudflared",
+		)
+		if home, err := os.UserHomeDir(); err == nil {
+			paths = append(paths, filepath.Join(home, ".local/bin/cloudflared"))
+		}
+	case "windows":
+		if programFiles := os.Getenv("ProgramFiles"); programFiles != "" {
+			paths = append(paths, filepath.Join(programFiles, "cloudflared", "cloudflared.exe"))
+		}
+		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+			paths = append(paths, filepath.Join(localAppData, "cloudflared", "cloudflared.exe"))
+		}
+	}
+
+	return paths
+}
+
+// getCachedPath 获取缓存路径
+func (d *BinaryDownloader) getCachedPath(info BinaryInfo) string {
+	name := fmt.Sprintf("cloudflared-%s-%s", info.Version, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	return filepath.Join(d.cacheDir, name)
+}
+
+// verifyCloudflared 验证 cloudflared 是否可用
+func (d *BinaryDownloader) verifyCloudflared(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() == 0 {
+		return false
+	}
+
+	// 检查是否可执行
+	if runtime.GOOS != "windows" {
+		if info.Mode()&0111 == 0 {
+			return false
+		}
+	}
+
+	// 尝试执行 --version
+	cmd := exec.Command(path, "--version")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	// 验证输出包含 cloudflared
+	return strings.Contains(strings.ToLower(string(output)), "cloudflared")
 }
 
 // downloadCloudflared 下载 cloudflared
 func (d *BinaryDownloader) downloadCloudflared(info BinaryInfo, destPath string) error {
+	// 确保目录存在
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return fmt.Errorf("创建目录失败: %w", err)
+	}
+
 	// 创建临时文件
 	tmpPath := destPath + ".tmp"
 	defer os.Remove(tmpPath)
 
 	// 发起请求
+	d.log(2, "请求: %s", info.URL)
 	resp, err := d.httpClient.Get(info.URL)
 	if err != nil {
 		return fmt.Errorf("HTTP 请求失败: %w", err)
@@ -243,7 +327,7 @@ func (d *BinaryDownloader) downloadCloudflared(info BinaryInfo, destPath string)
 	}
 
 	// 处理压缩文件（macOS）
-	if strings.HasSuffix(info.URL, ".tgz") {
+	if strings.HasSuffix(info.URL, ".tgz") || strings.HasSuffix(info.URL, ".tar.gz") {
 		if err := d.extractTgz(tmpPath, destPath); err != nil {
 			return fmt.Errorf("解压失败: %w", err)
 		}
@@ -266,8 +350,9 @@ func (d *BinaryDownloader) downloadCloudflared(info BinaryInfo, destPath string)
 
 // extractTgz 解压 tgz 文件
 func (d *BinaryDownloader) extractTgz(tgzPath, destPath string) error {
-	// 使用系统 tar 命令解压
 	destDir := filepath.Dir(destPath)
+
+	// 使用系统 tar 命令解压
 	cmd := exec.Command("tar", "-xzf", tgzPath, "-C", destDir)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("tar 解压失败: %w\n%s", err, string(output))
@@ -412,7 +497,8 @@ func VerifyCloudflaredIntegrity(path string) error {
 
 // GetLatestCloudflaredVersion 获取最新 cloudflared 版本（从 GitHub API）
 func GetLatestCloudflaredVersion() (string, error) {
-	resp, err := http.Get("https://api.github.com/repos/cloudflare/cloudflared/releases/latest")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("https://api.github.com/repos/cloudflare/cloudflared/releases/latest")
 	if err != nil {
 		return "", fmt.Errorf("获取版本信息失败: %w", err)
 	}
@@ -427,4 +513,37 @@ func GetLatestCloudflaredVersion() (string, error) {
 	}
 
 	return release.TagName, nil
+}
+
+// UpdateCloudflaredVersions 更新版本信息（用于自动更新场景）
+func UpdateCloudflaredVersions(version string) {
+	for arch := range CloudflaredVersions {
+		info := CloudflaredVersions[arch]
+		info.Version = version
+
+		// 更新下载 URL
+		var filename string
+		switch arch {
+		case "linux-amd64":
+			filename = "cloudflared-linux-amd64"
+		case "linux-arm64":
+			filename = "cloudflared-linux-arm64"
+		case "linux-arm":
+			filename = "cloudflared-linux-arm"
+		case "darwin-amd64":
+			filename = "cloudflared-darwin-amd64.tgz"
+		case "darwin-arm64":
+			filename = "cloudflared-darwin-arm64.tgz"
+		case "windows-amd64":
+			filename = "cloudflared-windows-amd64.exe"
+		case "windows-386":
+			filename = "cloudflared-windows-386.exe"
+		default:
+			continue
+		}
+
+		info.URL = fmt.Sprintf("https://github.com/cloudflare/cloudflared/releases/download/%s/%s", version, filename)
+		info.SHA256 = "" // 清空哈希，跳过校验
+		CloudflaredVersions[arch] = info
+	}
 }
