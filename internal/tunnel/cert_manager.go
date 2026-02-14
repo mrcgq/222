@@ -1,6 +1,6 @@
 // =============================================================================
 // 文件: internal/tunnel/cert_manager.go
-// 描述: 证书管理器 - 使用 Go 原生 ACME 客户端
+// 描述: 证书管理器 - 使用 Go 原生 ACME 客户端，支持 Cloudflare 隧道验证
 // =============================================================================
 package tunnel
 
@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -88,6 +89,9 @@ type ACMEConfig struct {
 	// ZeroSSL 特定
 	EABKeyID   string `yaml:"eab_key_id"`
 	EABHMACKey string `yaml:"eab_hmac_key"`
+
+	// 隧道验证配置
+	UseTunnelForValidation bool `yaml:"use_tunnel_for_validation"` // 使用隧道进行验证
 }
 
 // DefaultCertConfig 默认证书配置
@@ -96,13 +100,35 @@ func DefaultCertConfig() *CertConfig {
 		Mode:    CertAuto,
 		CertDir: filepath.Join(os.TempDir(), "phantom-certs"),
 		ACME: ACMEConfig{
-			Provider:      ACMELetsEncrypt,
-			AcceptTOS:     true,
-			ChallengeType: "http-01",
-			HTTPPort:      80,
-			TLSPort:       443,
+			Provider:               ACMELetsEncrypt,
+			AcceptTOS:              true,
+			ChallengeType:          "http-01",
+			HTTPPort:               80,
+			TLSPort:                443,
+			UseTunnelForValidation: true,
 		},
 	}
+}
+
+// =============================================================================
+// ACME 验证隧道接口
+// =============================================================================
+
+// ACMEValidationTunnel ACME 验证隧道接口
+type ACMEValidationTunnel interface {
+	// StartValidationTunnel 启动验证隧道
+	// localPort: 本地 HTTP 服务端口
+	// domain: 要验证的域名
+	StartValidationTunnel(ctx context.Context, localPort int, domain string) error
+
+	// StopValidationTunnel 停止验证隧道
+	StopValidationTunnel() error
+
+	// IsValidationTunnelRunning 检查验证隧道是否运行中
+	IsValidationTunnelRunning() bool
+
+	// GetValidationTunnelURL 获取验证隧道 URL
+	GetValidationTunnelURL() string
 }
 
 // =============================================================================
@@ -116,10 +142,25 @@ type CertManager struct {
 	// autocert 管理器
 	autocertManager *autocert.Manager
 
+	// 自定义 ACME 客户端（用于更多控制）
+	acmeClient *acme.Client
+	acmeKey    *ecdsa.PrivateKey
+
 	// 当前证书
 	certPath string
 	keyPath  string
 	cert     *tls.Certificate
+
+	// HTTP 服务器（用于 HTTP-01 挑战）
+	httpServer     *http.Server
+	httpServerAddr string
+
+	// 验证隧道
+	validationTunnel ACMEValidationTunnel
+
+	// 证书获取通道
+	certReady     chan struct{}
+	certReadyOnce sync.Once
 
 	// 控制
 	ctx      context.Context
@@ -127,12 +168,52 @@ type CertManager struct {
 	mu       sync.RWMutex
 	logLevel int
 
-	// HTTP 服务器（用于 HTTP-01 挑战）
-	httpServer *http.Server
+	// 回调
+	onCertObtained func(domains []string)
+	onCertRenewed  func(domains []string)
+	onError        func(err error)
+}
+
+// CertManagerOption 配置选项
+type CertManagerOption func(*CertManager)
+
+// WithValidationTunnel 设置验证隧道
+func WithValidationTunnel(tunnel ACMEValidationTunnel) CertManagerOption {
+	return func(m *CertManager) {
+		m.validationTunnel = tunnel
+	}
+}
+
+// WithCertLogLevel 设置日志级别
+func WithCertLogLevel(level int) CertManagerOption {
+	return func(m *CertManager) {
+		m.logLevel = level
+	}
+}
+
+// WithOnCertObtained 设置证书获取回调
+func WithOnCertObtained(fn func(domains []string)) CertManagerOption {
+	return func(m *CertManager) {
+		m.onCertObtained = fn
+	}
+}
+
+// WithOnCertRenewed 设置证书续期回调
+func WithOnCertRenewed(fn func(domains []string)) CertManagerOption {
+	return func(m *CertManager) {
+		m.onCertRenewed = fn
+	}
+}
+
+// WithOnCertError 设置错误回调
+func WithOnCertError(fn func(err error)) CertManagerOption {
+	return func(m *CertManager) {
+		m.onError = fn
+	}
 }
 
 // NewCertManager 创建证书管理器
-func NewCertManager(cfg *CertConfig) *CertManager {
+func NewCertManager(cfg *CertConfig, opts ...CertManagerOption) *CertManager {
 	if cfg == nil {
 		cfg = DefaultCertConfig()
 	}
@@ -140,10 +221,17 @@ func NewCertManager(cfg *CertConfig) *CertManager {
 	// 确保证书目录存在
 	os.MkdirAll(cfg.CertDir, 0700)
 
-	return &CertManager{
-		config:   cfg,
-		logLevel: 1,
+	m := &CertManager{
+		config:    cfg,
+		logLevel:  1,
+		certReady: make(chan struct{}),
 	}
+
+	for _, opt := range opts {
+		opt(m)
+	}
+
+	return m
 }
 
 // Start 启动证书管理器
@@ -153,6 +241,7 @@ func (m *CertManager) Start(ctx context.Context) error {
 	switch m.config.Mode {
 	case CertAuto:
 		m.log(1, "使用 Cloudflare 自动证书")
+		m.signalCertReady()
 		return nil
 
 	case CertSelfSigned:
@@ -183,6 +272,30 @@ func (m *CertManager) Stop() {
 		defer cancel()
 		m.httpServer.Shutdown(shutdownCtx)
 	}
+
+	// 停止验证隧道
+	if m.validationTunnel != nil {
+		m.validationTunnel.StopValidationTunnel()
+	}
+}
+
+// WaitForCert 等待证书就绪
+func (m *CertManager) WaitForCert(timeout time.Duration) error {
+	select {
+	case <-m.certReady:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("等待证书超时")
+	case <-m.ctx.Done():
+		return m.ctx.Err()
+	}
+}
+
+// signalCertReady 发送证书就绪信号
+func (m *CertManager) signalCertReady() {
+	m.certReadyOnce.Do(func() {
+		close(m.certReady)
+	})
 }
 
 // =============================================================================
@@ -197,7 +310,11 @@ func (m *CertManager) generateSelfSignedCert() error {
 	// 检查现有证书是否有效
 	if m.isCertValid(m.certPath, 30*24*time.Hour) {
 		m.log(1, "使用现有自签名证书")
-		return m.loadCertFromFiles()
+		if err := m.loadCertFromFiles(); err != nil {
+			return err
+		}
+		m.signalCertReady()
+		return nil
 	}
 
 	m.log(1, "生成新的自签名证书...")
@@ -281,7 +398,18 @@ func (m *CertManager) generateSelfSignedCert() error {
 	}
 
 	m.log(1, "自签名证书已生成: %s", m.certPath)
-	return m.loadCertFromFiles()
+
+	if err := m.loadCertFromFiles(); err != nil {
+		return err
+	}
+
+	m.signalCertReady()
+
+	if m.onCertObtained != nil {
+		m.onCertObtained(domains)
+	}
+
+	return nil
 }
 
 // =============================================================================
@@ -300,12 +428,27 @@ func (m *CertManager) setupACME() error {
 		return fmt.Errorf("ACME 需要邮箱地址")
 	}
 
+	m.log(1, "配置 ACME 证书: %v", cfg.Domains)
+
 	// 获取 ACME 目录 URL
 	directoryURL := m.getACMEDirectoryURL()
 
+	// 创建或加载账户密钥
+	if err := m.loadOrCreateACMEKey(); err != nil {
+		return fmt.Errorf("加载 ACME 密钥失败: %w", err)
+	}
+
 	// 创建 ACME 客户端
-	client := &acme.Client{
+	m.acmeClient = &acme.Client{
 		DirectoryURL: directoryURL,
+		Key:          m.acmeKey,
+	}
+
+	// 如果是 ZeroSSL 且需要 EAB
+	if cfg.Provider == ACMEZeroSSL && cfg.EABKeyID != "" {
+		if err := m.registerZeroSSLAccount(); err != nil {
+			return fmt.Errorf("ZeroSSL 账户注册失败: %w", err)
+		}
 	}
 
 	// 创建 autocert 管理器
@@ -314,15 +457,7 @@ func (m *CertManager) setupACME() error {
 		Cache:      autocert.DirCache(m.config.CertDir),
 		HostPolicy: autocert.HostWhitelist(cfg.Domains...),
 		Email:      cfg.Email,
-		Client:     client,
-	}
-
-	// 如果是 ZeroSSL，需要外部账户绑定 (EAB)
-	if cfg.Provider == ACMEZeroSSL && cfg.EABKeyID != "" {
-		m.log(1, "配置 ZeroSSL EAB...")
-		// autocert 不直接支持 EAB，需要自定义处理
-		// 这里使用自定义 ACME 流程
-		return m.setupZeroSSLWithEAB()
+		Client:     m.acmeClient,
 	}
 
 	// 根据挑战类型启动相应服务
@@ -334,6 +469,86 @@ func (m *CertManager) setupACME() error {
 	default:
 		return m.startHTTP01Challenge()
 	}
+}
+
+// loadOrCreateACMEKey 加载或创建 ACME 账户密钥
+func (m *CertManager) loadOrCreateACMEKey() error {
+	keyPath := filepath.Join(m.config.CertDir, "acme_account.key")
+
+	// 尝试加载现有密钥
+	if data, err := os.ReadFile(keyPath); err == nil {
+		block, _ := pem.Decode(data)
+		if block != nil && block.Type == "EC PRIVATE KEY" {
+			key, err := x509.ParseECPrivateKey(block.Bytes)
+			if err == nil {
+				m.acmeKey = key
+				m.log(2, "加载现有 ACME 账户密钥")
+				return nil
+			}
+		}
+	}
+
+	// 生成新密钥
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("生成 ACME 密钥失败: %w", err)
+	}
+
+	// 保存密钥
+	keyBytes, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return fmt.Errorf("编码 ACME 密钥失败: %w", err)
+	}
+
+	keyFile, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("创建 ACME 密钥文件失败: %w", err)
+	}
+	defer keyFile.Close()
+
+	if err := pem.Encode(keyFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}); err != nil {
+		return fmt.Errorf("保存 ACME 密钥失败: %w", err)
+	}
+
+	m.acmeKey = key
+	m.log(1, "生成新的 ACME 账户密钥")
+	return nil
+}
+
+// registerZeroSSLAccount 注册 ZeroSSL 账户（需要 EAB）
+func (m *CertManager) registerZeroSSLAccount() error {
+	cfg := m.config.ACME
+
+	m.log(1, "注册 ZeroSSL 账户 (EAB)...")
+
+	// 解码 HMAC 密钥
+	hmacKey, err := base64.RawURLEncoding.DecodeString(cfg.EABHMACKey)
+	if err != nil {
+		return fmt.Errorf("解码 EAB HMAC 密钥失败: %w", err)
+	}
+
+	account := &acme.Account{
+		Contact: []string{"mailto:" + cfg.Email},
+		ExternalAccountBinding: &acme.ExternalAccountBinding{
+			KID: cfg.EABKeyID,
+			Key: hmacKey,
+		},
+	}
+
+	registerCtx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer cancel()
+
+	_, err = m.acmeClient.Register(registerCtx, account, func(tosURL string) bool {
+		m.log(1, "接受 ZeroSSL 服务条款: %s", tosURL)
+		return cfg.AcceptTOS
+	})
+
+	if err != nil && err != acme.ErrAccountAlreadyExists {
+		return fmt.Errorf("注册 ZeroSSL 账户失败: %w", err)
+	}
+
+	m.log(1, "ZeroSSL 账户注册成功")
+	return nil
 }
 
 // getACMEDirectoryURL 获取 ACME 目录 URL
@@ -351,23 +566,81 @@ func (m *CertManager) getACMEDirectoryURL() string {
 // startHTTP01Challenge 启动 HTTP-01 挑战服务
 func (m *CertManager) startHTTP01Challenge() error {
 	cfg := m.config.ACME
-
-	addr := fmt.Sprintf(":%d", cfg.HTTPPort)
-
-	m.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: m.autocertManager.HTTPHandler(nil),
+	port := cfg.HTTPPort
+	if port == 0 {
+		port = 80
 	}
 
+	m.httpServerAddr = fmt.Sprintf(":%d", port)
+
+	// 创建 HTTP 处理器
+	handler := m.autocertManager.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 非 ACME 请求返回 404
+		http.NotFound(w, r)
+	}))
+
+	m.httpServer = &http.Server{
+		Addr:         m.httpServerAddr,
+		Handler:      handler,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	// 启动 HTTP 服务器
 	go func() {
-		m.log(1, "启动 HTTP-01 挑战服务: %s", addr)
+		m.log(1, "启动 ACME HTTP-01 挑战服务: %s", m.httpServerAddr)
 		if err := m.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			m.log(0, "HTTP-01 服务错误: %v", err)
+			if m.onError != nil {
+				m.onError(err)
+			}
 		}
 	}()
 
+	// 如果配置了使用隧道验证，启动验证隧道
+	if cfg.UseTunnelForValidation && m.validationTunnel != nil {
+		if err := m.startValidationTunnel(); err != nil {
+			m.log(0, "启动验证隧道失败: %v (尝试直接验证)", err)
+		}
+	}
+
 	// 预获取证书
 	go m.prefetchCertificates()
+
+	return nil
+}
+
+// startValidationTunnel 启动 ACME 验证隧道
+func (m *CertManager) startValidationTunnel() error {
+	cfg := m.config.ACME
+
+	if m.validationTunnel == nil {
+		return fmt.Errorf("验证隧道未配置")
+	}
+
+	port := cfg.HTTPPort
+	if port == 0 {
+		port = 80
+	}
+
+	// 为每个域名启动验证
+	// 注意：实际上 Cloudflare 隧道会自动处理所有请求
+	domain := cfg.Domains[0] // 主域名
+
+	m.log(1, "启动 ACME 验证隧道: %s -> localhost:%d", domain, port)
+
+	if err := m.validationTunnel.StartValidationTunnel(m.ctx, port, domain); err != nil {
+		return fmt.Errorf("启动验证隧道失败: %w", err)
+	}
+
+	m.log(1, "验证隧道已启动，等待 URL...")
+
+	// 等待隧道就绪
+	time.Sleep(3 * time.Second)
+
+	if m.validationTunnel.IsValidationTunnelRunning() {
+		m.log(1, "验证隧道 URL: %s", m.validationTunnel.GetValidationTunnelURL())
+	}
 
 	return nil
 }
@@ -388,92 +661,216 @@ func (m *CertManager) prefetchCertificates() {
 	// 等待服务启动
 	time.Sleep(2 * time.Second)
 
-	for _, domain := range m.config.ACME.Domains {
-		m.log(1, "预获取证书: %s", domain)
+	cfg := m.config.ACME
+	allSuccess := true
+
+	for _, domain := range cfg.Domains {
+		m.log(1, "获取证书: %s", domain)
 
 		fetchCtx, cancel := context.WithTimeout(m.ctx, 5*time.Minute)
-		_, err := m.autocertManager.GetCertificate(&tls.ClientHelloInfo{
+
+		cert, err := m.autocertManager.GetCertificate(&tls.ClientHelloInfo{
 			ServerName: domain,
 		})
 		cancel()
 
 		if err != nil {
 			m.log(0, "获取证书失败 %s: %v", domain, err)
+			allSuccess = false
+			if m.onError != nil {
+				m.onError(fmt.Errorf("获取证书失败 %s: %w", domain, err))
+			}
 		} else {
 			m.log(1, "证书获取成功: %s", domain)
+
+			// 保存证书引用
+			m.mu.Lock()
+			m.cert = cert
+			m.mu.Unlock()
+
+			if m.onCertObtained != nil {
+				m.onCertObtained([]string{domain})
+			}
 		}
 
-		// 使用 fetchCtx 检查是否被取消
+		// 检查是否被取消
 		select {
-		case <-fetchCtx.Done():
-			// context 已完成，继续下一个
+		case <-m.ctx.Done():
+			return
 		default:
-			// 正常继续
 		}
+	}
+
+	// 所有证书获取完成后，停止验证隧道
+	if m.validationTunnel != nil && m.validationTunnel.IsValidationTunnelRunning() {
+		m.log(1, "证书获取完成，停止验证隧道")
+		m.validationTunnel.StopValidationTunnel()
+	}
+
+	if allSuccess {
+		m.signalCertReady()
 	}
 }
 
-// setupZeroSSLWithEAB 使用 EAB 设置 ZeroSSL
-func (m *CertManager) setupZeroSSLWithEAB() error {
-	cfg := m.config.ACME
+// =============================================================================
+// 手动 ACME 流程（用于更多控制）
+// =============================================================================
 
-	m.log(1, "使用 EAB 配置 ZeroSSL...")
-
-	// 创建自定义 ACME 客户端
-	client := &acme.Client{
-		DirectoryURL: ZeroSSLProductionURL,
+// ObtainCertificateManual 手动获取证书（完整控制流程）
+func (m *CertManager) ObtainCertificateManual(domains []string) error {
+	if m.acmeClient == nil {
+		return fmt.Errorf("ACME 客户端未初始化")
 	}
 
-	// 获取目录
-	discoverCtx, discoverCancel := context.WithTimeout(m.ctx, 30*time.Second)
-	defer discoverCancel()
+	m.log(1, "手动获取 ACME 证书: %v", domains)
 
-	dir, err := client.Discover(discoverCtx)
+	// 1. 创建订单
+	orderCtx, orderCancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer orderCancel()
+
+	order, err := m.acmeClient.AuthorizeOrder(orderCtx, acme.DomainIDs(domains...))
 	if err != nil {
-		return fmt.Errorf("获取 ACME 目录失败: %w", err)
+		return fmt.Errorf("创建订单失败: %w", err)
 	}
 
-	// 创建带 EAB 的账户
-	account := &acme.Account{
-		Contact: []string{"mailto:" + cfg.Email},
-		ExternalAccountBinding: &acme.ExternalAccountBinding{
-			KID: cfg.EABKeyID,
-			Key: []byte(cfg.EABHMACKey),
-		},
+	m.log(2, "订单已创建: %s", order.URI)
+
+	// 2. 完成所有授权
+	for _, authzURL := range order.AuthzURLs {
+		if err := m.completeAuthorization(authzURL); err != nil {
+			return fmt.Errorf("授权失败: %w", err)
+		}
 	}
 
-	// 生成账户密钥
-	accountKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// 3. 等待订单就绪
+	waitCtx, waitCancel := context.WithTimeout(m.ctx, 5*time.Minute)
+	defer waitCancel()
+
+	order, err = m.acmeClient.WaitOrder(waitCtx, order.URI)
 	if err != nil {
-		return fmt.Errorf("生成账户密钥失败: %w", err)
-	}
-	client.Key = accountKey
-
-	// 注册账户
-	registerCtx, registerCancel := context.WithTimeout(m.ctx, 30*time.Second)
-	defer registerCancel()
-
-	_, err = client.Register(registerCtx, account, func(tosURL string) bool {
-		m.log(1, "接受服务条款: %s", tosURL)
-		return cfg.AcceptTOS
-	})
-	if err != nil && err != acme.ErrAccountAlreadyExists {
-		return fmt.Errorf("注册账户失败: %w", err)
+		return fmt.Errorf("等待订单失败: %w", err)
 	}
 
-	// 使用标准 autocert，但配置了自定义客户端
-	m.autocertManager = &autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		Cache:      autocert.DirCache(m.config.CertDir),
-		HostPolicy: autocert.HostWhitelist(cfg.Domains...),
-		Email:      cfg.Email,
-		Client:     client,
+	if order.Status != acme.StatusReady {
+		return fmt.Errorf("订单状态异常: %s", order.Status)
 	}
 
-	m.log(1, "ZeroSSL EAB 配置完成")
-	_ = dir // 使用目录信息（避免未使用警告）
+	// 4. 生成证书密钥
+	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("生成证书密钥失败: %w", err)
+	}
 
-	return m.startHTTP01Challenge()
+	// 5. 创建 CSR
+	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: domains[0]},
+	}, certKey)
+	if err != nil {
+		return fmt.Errorf("创建 CSR 失败: %w", err)
+	}
+
+	// 6. 完成订单
+	finalizeCtx, finalizeCancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer finalizeCancel()
+
+	certDER, _, err := m.acmeClient.CreateOrderCert(finalizeCtx, order.FinalizeURL, csr, true)
+	if err != nil {
+		return fmt.Errorf("获取证书失败: %w", err)
+	}
+
+	// 7. 保存证书和密钥
+	m.certPath = filepath.Join(m.config.CertDir, "acme.crt")
+	m.keyPath = filepath.Join(m.config.CertDir, "acme.key")
+
+	// 保存证书
+	certFile, err := os.OpenFile(m.certPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("创建证书文件失败: %w", err)
+	}
+	defer certFile.Close()
+
+	for _, der := range certDER {
+		if err := pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+			return fmt.Errorf("写入证书失败: %w", err)
+		}
+	}
+
+	// 保存私钥
+	keyFile, err := os.OpenFile(m.keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("创建私钥文件失败: %w", err)
+	}
+	defer keyFile.Close()
+
+	keyBytes, err := x509.MarshalECPrivateKey(certKey)
+	if err != nil {
+		return fmt.Errorf("编码私钥失败: %w", err)
+	}
+
+	if err := pem.Encode(keyFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}); err != nil {
+		return fmt.Errorf("保存私钥失败: %w", err)
+	}
+
+	m.log(1, "ACME 证书已保存: %s", m.certPath)
+
+	// 加载证书
+	if err := m.loadCertFromFiles(); err != nil {
+		return err
+	}
+
+	m.signalCertReady()
+
+	if m.onCertObtained != nil {
+		m.onCertObtained(domains)
+	}
+
+	return nil
+}
+
+// completeAuthorization 完成单个授权
+func (m *CertManager) completeAuthorization(authzURL string) error {
+	authzCtx, authzCancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer authzCancel()
+
+	authz, err := m.acmeClient.GetAuthorization(authzCtx, authzURL)
+	if err != nil {
+		return fmt.Errorf("获取授权失败: %w", err)
+	}
+
+	if authz.Status == acme.StatusValid {
+		return nil // 已经验证过
+	}
+
+	// 查找 HTTP-01 挑战
+	var challenge *acme.Challenge
+	for _, ch := range authz.Challenges {
+		if ch.Type == "http-01" {
+			challenge = ch
+			break
+		}
+	}
+
+	if challenge == nil {
+		return fmt.Errorf("未找到 HTTP-01 挑战")
+	}
+
+	// 接受挑战
+	acceptCtx, acceptCancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer acceptCancel()
+
+	if _, err := m.acmeClient.Accept(acceptCtx, challenge); err != nil {
+		return fmt.Errorf("接受挑战失败: %w", err)
+	}
+
+	// 等待授权完成
+	waitCtx, waitCancel := context.WithTimeout(m.ctx, 5*time.Minute)
+	defer waitCancel()
+
+	if _, err := m.acmeClient.WaitAuthorization(waitCtx, authzURL); err != nil {
+		return fmt.Errorf("等待授权失败: %w", err)
+	}
+
+	return nil
 }
 
 // =============================================================================
@@ -492,11 +889,14 @@ func (m *CertManager) setupCFOriginCert() error {
 	// 检查现有证书
 	if m.isCertValid(m.certPath, 30*24*time.Hour) {
 		m.log(1, "使用现有 Cloudflare Origin 证书")
-		return m.loadCertFromFiles()
+		if err := m.loadCertFromFiles(); err != nil {
+			return err
+		}
+		m.signalCertReady()
+		return nil
 	}
 
 	// 需要通过 Cloudflare API 获取
-	// 这里提供占位实现，实际需要调用 CF API
 	m.log(1, "Cloudflare Origin 证书需要通过 Cloudflare Dashboard 或 API 获取")
 	m.log(1, "请将证书文件放置到: %s", m.certPath)
 	m.log(1, "请将私钥文件放置到: %s", m.keyPath)
@@ -529,7 +929,12 @@ func (m *CertManager) loadCustomCert() error {
 		return fmt.Errorf("证书已过期或即将过期")
 	}
 
-	return m.loadCertFromFiles()
+	if err := m.loadCertFromFiles(); err != nil {
+		return err
+	}
+
+	m.signalCertReady()
+	return nil
 }
 
 // =============================================================================
@@ -609,6 +1014,7 @@ func (m *CertManager) GetTLSConfig() *tls.Config {
 			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 		},
+		NextProtos: []string{"h2", "http/1.1", "acme-tls/1"}, // 支持 TLS-ALPN-01
 	}
 }
 
@@ -620,6 +1026,14 @@ func (m *CertManager) GetCertPaths() (certPath, keyPath string) {
 // GetAutocertManager 获取 autocert 管理器（用于集成）
 func (m *CertManager) GetAutocertManager() *autocert.Manager {
 	return m.autocertManager
+}
+
+// GetHTTPHandler 获取 HTTP 处理器（用于 ACME 挑战）
+func (m *CertManager) GetHTTPHandler() http.Handler {
+	if m.autocertManager != nil {
+		return m.autocertManager.HTTPHandler(nil)
+	}
+	return nil
 }
 
 // log 日志输出
@@ -662,18 +1076,50 @@ func (m *CertManager) checkAndRenew() {
 	case CertSelfSigned:
 		if !m.isCertValid(m.certPath, 7*24*time.Hour) {
 			m.log(1, "自签名证书即将过期，重新生成...")
-			m.generateSelfSignedCert()
+			if err := m.generateSelfSignedCert(); err != nil {
+				m.log(0, "重新生成证书失败: %v", err)
+			} else if m.onCertRenewed != nil {
+				m.onCertRenewed(m.config.ACME.Domains)
+			}
 		}
 
 	case CertACME:
-		// autocert 自动处理续期，这里只做日志
+		// autocert 自动处理续期
 		for _, domain := range m.config.ACME.Domains {
+			// 检查缓存中的证书
 			cachePath := filepath.Join(m.config.CertDir, domain)
 			if m.isCertValid(cachePath, 30*24*time.Hour) {
 				m.log(2, "证书有效: %s", domain)
 			} else {
 				m.log(1, "证书需要续期: %s（将自动处理）", domain)
+				// autocert 会在下次 GetCertificate 时自动续期
 			}
 		}
 	}
+}
+
+// GetCertInfo 获取当前证书信息
+func (m *CertManager) GetCertInfo() map[string]interface{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	info := map[string]interface{}{
+		"mode":      string(m.config.Mode),
+		"cert_path": m.certPath,
+		"key_path":  m.keyPath,
+	}
+
+	if m.cert != nil && len(m.cert.Certificate) > 0 {
+		if cert, err := x509.ParseCertificate(m.cert.Certificate[0]); err == nil {
+			info["subject"] = cert.Subject.CommonName
+			info["issuer"] = cert.Issuer.CommonName
+			info["not_before"] = cert.NotBefore
+			info["not_after"] = cert.NotAfter
+			info["dns_names"] = cert.DNSNames
+			info["valid"] = time.Now().Before(cert.NotAfter) && time.Now().After(cert.NotBefore)
+			info["expires_in"] = cert.NotAfter.Sub(time.Now()).String()
+		}
+	}
+
+	return info
 }
