@@ -22,6 +22,9 @@ type FakeTCPClient struct {
 	localAddr  *net.UDPAddr
 	logLevel   int
 
+	// NAT 穿透模式
+	natMode NATTraversalMode
+
 	// NAT 穿透辅助器
 	natHelper *NATHelper
 
@@ -52,8 +55,6 @@ type FakeTCPClient struct {
 	synRetries    int32
 }
 
-// 注意: FakeTCPConfig 和 DefaultFakeTCPConfig 已在 faketcp_types.go 中定义，此处不再重复
-
 // NewFakeTCPClient 创建 FakeTCP 客户端
 func NewFakeTCPClient(serverAddr string, config *FakeTCPConfig) (*FakeTCPClient, error) {
 	if config == nil {
@@ -77,17 +78,23 @@ func NewFakeTCPClient(serverAddr string, config *FakeTCPConfig) (*FakeTCPClient,
 		config:        config,
 		serverAddr:    addr,
 		logLevel:      level,
+		natMode:       NATModeAuto, // 默认自动检测
 		recvChan:      make(chan []byte, 256),
 		maxRetries:    3,
 		retryInterval: 500 * time.Millisecond,
 	}, nil
 }
 
+// SetNATMode 设置 NAT 穿透模式
+func (c *FakeTCPClient) SetNATMode(mode NATTraversalMode) {
+	c.natMode = mode
+}
+
 // Connect 连接到服务器 (增强版)
 func (c *FakeTCPClient) Connect(ctx context.Context) error {
 	// 步骤 1: 初始化 NAT 辅助器
 	localPort := c.generateLocalPort()
-	natHelper, err := NewNATHelper(c.config.NATMode, localPort, c.serverAddr)
+	natHelper, err := NewNATHelper(c.natMode, localPort, c.serverAddr)
 	if err != nil {
 		return fmt.Errorf("NAT 辅助器初始化失败: %w", err)
 	}
