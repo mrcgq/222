@@ -249,7 +249,7 @@ func (s *Switcher) startTransports(ctx context.Context) error {
 		)
 
 		// 启动 eBPF，禁用其内部的用户态监听回退
-		if err := s.ebpf.Start(ctx, s.cfg.Listen, true); err != nil {
+		if err := s.ebpf.Start(ctx, s.cfg.Listen); err != nil {
 			s.log(1, "eBPF 启动失败: %v (将使用 UDP 模式)", err)
 			s.ebpf = nil
 		} else if s.ebpf.IsActive() {
