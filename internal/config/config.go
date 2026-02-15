@@ -1,9 +1,7 @@
-
-
 // =============================================================================
 // 文件: internal/config/config.go
 // 描述: 配置管理 - 修复配置隐性关联、端口冲突检测、ARQ 优先级验证
-//       增加 ACME 自动证书配置支持和 DDNS 动态域名支持
+//       增加 ACME 自动证书配置支持、DDNS 动态域名支持和 TLS 指纹伪装配置
 // =============================================================================
 package config
 
@@ -33,6 +31,49 @@ type Config struct {
 	Switcher  SwitcherConfig  `yaml:"switcher"`
 	Metrics   MetricsConfig   `yaml:"metrics"`
 	ARQ       ARQConfig       `yaml:"arq"`
+	TLS       TLSConfig       `yaml:"tls"` // 新增：TLS 指纹伪装配置
+}
+
+// TLSConfig TLS 指纹伪装配置
+type TLSConfig struct {
+	// 基础配置
+	Enabled    bool   `yaml:"enabled"`     // 是否启用 TLS 伪装
+	ServerName string `yaml:"server_name"` // SNI 域名 (如 www.bing.com)
+
+	// 指纹配置
+	Fingerprint string `yaml:"fingerprint"` // 浏览器指纹: chrome, firefox, safari, ios, android, edge, qq, 360
+
+	// ECH 配置 (Encrypted Client Hello)
+	EnableECH   bool   `yaml:"enable_ech"`   // 是否启用 ECH
+	ECHConfig   string `yaml:"ech_config"`   // ECH 配置 (Base64 编码)
+	ECHProvider string `yaml:"ech_provider"` // ECH 配置提供商: cloudflare, custom
+
+	// 服务端配置
+	FallbackEnabled bool   `yaml:"fallback_enabled"` // 是否启用回落
+	FallbackAddr    string `yaml:"fallback_addr"`    // 探测流量回落地址 (如 127.0.0.1:80)
+	FallbackTimeout int    `yaml:"fallback_timeout"` // 回落超时 (秒)
+
+	// 证书配置 (服务端)
+	CertFile   string `yaml:"cert_file"`   // TLS 证书文件
+	KeyFile    string `yaml:"key_file"`    // TLS 私钥文件
+	AutoCert   bool   `yaml:"auto_cert"`   // 自动从 CertManager 获取证书
+	VerifyCert bool   `yaml:"verify_cert"` // 客户端是否验证证书 (生产环境建议 true)
+
+	// 高级配置
+	ALPN              []string `yaml:"alpn"`                // ALPN 协议列表 (如 ["h2", "http/1.1"])
+	MinVersion        string   `yaml:"min_version"`         // 最低 TLS 版本: tls10, tls11, tls12, tls13
+	MaxVersion        string   `yaml:"max_version"`         // 最高 TLS 版本
+	SessionTicket     bool     `yaml:"session_ticket"`      // 启用会话票据
+	InsecureSkipAuth  bool     `yaml:"insecure_skip_auth"`  // 跳过 PSK 认证 (仅用于测试)
+	RandomSNI         bool     `yaml:"random_sni"`          // 随机 SNI (从预定义列表选择)
+	SNIList           []string `yaml:"sni_list"`            // 随机 SNI 列表
+	PaddingEnabled    bool     `yaml:"padding_enabled"`     // 启用 TLS 记录填充
+	PaddingMinSize    int      `yaml:"padding_min_size"`    // 最小填充大小
+	PaddingMaxSize    int      `yaml:"padding_max_size"`    // 最大填充大小
+	FragmentEnabled   bool     `yaml:"fragment_enabled"`    // 启用 ClientHello 分片
+	FragmentSize      int      `yaml:"fragment_size"`       // 分片大小
+	FragmentSleepMs   int      `yaml:"fragment_sleep_ms"`   // 分片间隔 (毫秒)
+	MimicBrowserOrder bool     `yaml:"mimic_browser_order"` // 模拟浏览器扩展顺序
 }
 
 // ARQConfig ARQ 增强层配置 (不是独立模式，是 UDP 的增强层)
@@ -325,6 +366,38 @@ func DefaultConfig() *Config {
 			ACMEHTTPPort:      80,
 			ACMEUseTunnel:     true,
 		},
+
+		// 默认 TLS 配置
+		TLS: TLSConfig{
+			Enabled:           false,
+			ServerName:        "www.microsoft.com",
+			Fingerprint:       "chrome",
+			EnableECH:         false,
+			FallbackEnabled:   true,
+			FallbackAddr:      "127.0.0.1:80",
+			FallbackTimeout:   10,
+			AutoCert:          true,
+			VerifyCert:        false,
+			ALPN:              []string{"h2", "http/1.1"},
+			MinVersion:        "tls12",
+			MaxVersion:        "tls13",
+			SessionTicket:     true,
+			PaddingEnabled:    false,
+			PaddingMinSize:    16,
+			PaddingMaxSize:    256,
+			FragmentEnabled:   false,
+			FragmentSize:      40,
+			FragmentSleepMs:   10,
+			MimicBrowserOrder: true,
+			SNIList: []string{
+				"www.microsoft.com",
+				"www.bing.com",
+				"www.apple.com",
+				"www.cloudflare.com",
+				"www.amazon.com",
+				"www.google.com",
+			},
+		},
 	}
 }
 
@@ -437,6 +510,86 @@ func (c *Config) Validate() error {
 	if c.WebSocket.Enabled {
 		if err := c.validateWebSocketConfig(); err != nil {
 			return fmt.Errorf("websocket 配置错误: %w", err)
+		}
+	}
+
+	// 验证 TLS 配置
+	if c.TLS.Enabled {
+		if err := c.validateTLSConfig(); err != nil {
+			return fmt.Errorf("tls 配置错误: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// validateTLSConfig 验证 TLS 伪装配置
+func (c *Config) validateTLSConfig() error {
+	// 如果启用 TLS，ServerName 不能为空
+	if c.TLS.ServerName == "" && !c.TLS.RandomSNI {
+		return fmt.Errorf("tls.server_name 不能为空 (或启用 random_sni)")
+	}
+
+	// 验证指纹类型
+	validFingerprints := map[string]bool{
+		"chrome": true, "firefox": true, "safari": true, "ios": true,
+		"android": true, "edge": true, "qq": true, "360": true,
+		"random": true, "custom": true, "":true,
+	}
+	if !validFingerprints[strings.ToLower(c.TLS.Fingerprint)] {
+		return fmt.Errorf("tls.fingerprint 无效: %s (支持: chrome, firefox, safari, ios, android, edge, qq, 360, random)", c.TLS.Fingerprint)
+	}
+
+	// 验证 TLS 版本
+	validVersions := map[string]bool{
+		"tls10": true, "tls11": true, "tls12": true, "tls13": true, "": true,
+	}
+	if !validVersions[strings.ToLower(c.TLS.MinVersion)] {
+		return fmt.Errorf("tls.min_version 无效: %s", c.TLS.MinVersion)
+	}
+	if !validVersions[strings.ToLower(c.TLS.MaxVersion)] {
+		return fmt.Errorf("tls.max_version 无效: %s", c.TLS.MaxVersion)
+	}
+
+	// 验证回落配置
+	if c.TLS.FallbackEnabled {
+		if c.TLS.FallbackAddr == "" {
+			return fmt.Errorf("tls.fallback_addr 不能为空 (fallback 已启用)")
+		}
+		if _, _, err := net.SplitHostPort(c.TLS.FallbackAddr); err != nil {
+			return fmt.Errorf("tls.fallback_addr 格式错误: %w", err)
+		}
+	}
+
+	// 验证填充配置
+	if c.TLS.PaddingEnabled {
+		if c.TLS.PaddingMinSize < 0 || c.TLS.PaddingMinSize > 65535 {
+			return fmt.Errorf("tls.padding_min_size 需在 0-65535 之间")
+		}
+		if c.TLS.PaddingMaxSize < c.TLS.PaddingMinSize || c.TLS.PaddingMaxSize > 65535 {
+			return fmt.Errorf("tls.padding_max_size 需大于等于 padding_min_size 且不超过 65535")
+		}
+	}
+
+	// 验证分片配置
+	if c.TLS.FragmentEnabled {
+		if c.TLS.FragmentSize < 1 || c.TLS.FragmentSize > 65535 {
+			return fmt.Errorf("tls.fragment_size 需在 1-65535 之间")
+		}
+	}
+
+	// 验证随机 SNI 列表
+	if c.TLS.RandomSNI && len(c.TLS.SNIList) == 0 {
+		return fmt.Errorf("tls.sni_list 不能为空 (random_sni 已启用)")
+	}
+
+	// 验证证书配置 (仅服务端)
+	if !c.TLS.AutoCert {
+		if c.TLS.CertFile != "" && c.TLS.KeyFile == "" {
+			return fmt.Errorf("tls.key_file 不能为空 (已指定 cert_file)")
+		}
+		if c.TLS.KeyFile != "" && c.TLS.CertFile == "" {
+			return fmt.Errorf("tls.cert_file 不能为空 (已指定 key_file)")
 		}
 	}
 
@@ -832,6 +985,25 @@ func (c *Config) syncRelatedConfig() {
 			c.Tunnel.DDNS.FreeDNS.Domain = c.Tunnel.FreeDNS.Domain
 		}
 	}
+
+	// 同步 TLS 配置默认值
+	if c.TLS.Enabled {
+		if c.TLS.Fingerprint == "" {
+			c.TLS.Fingerprint = "chrome"
+		}
+		if len(c.TLS.ALPN) == 0 {
+			c.TLS.ALPN = []string{"h2", "http/1.1"}
+		}
+		if c.TLS.MinVersion == "" {
+			c.TLS.MinVersion = "tls12"
+		}
+		if c.TLS.MaxVersion == "" {
+			c.TLS.MaxVersion = "tls13"
+		}
+		if c.TLS.FallbackTimeout == 0 {
+			c.TLS.FallbackTimeout = 10
+		}
+	}
 }
 
 // parsePort 解析端口号
@@ -860,7 +1032,6 @@ func (c *Config) GetListenHost() string {
 	}
 	return host
 }
-
 
 // ToTunnelConfig 转换为 tunnel 包的配置类型
 func (c *TunnelConfig) ToTunnelConfig() interface{} {
@@ -960,6 +1131,28 @@ func (c *TunnelConfig) GetDDNSUpdateInterval() string {
 }
 
 // =============================================================================
+// TLS 配置辅助方法
+// =============================================================================
+
+// GetRandomSNI 获取随机 SNI
+func (c *TLSConfig) GetRandomSNI() string {
+	if !c.RandomSNI || len(c.SNIList) == 0 {
+		return c.ServerName
+	}
+	// 使用简单随机选择
+	idx := int(time.Now().UnixNano()) % len(c.SNIList)
+	return c.SNIList[idx]
+}
+
+// GetEffectiveSNI 获取有效的 SNI
+func (c *TLSConfig) GetEffectiveSNI() string {
+	if c.RandomSNI {
+		return c.GetRandomSNI()
+	}
+	return c.ServerName
+}
+
+// =============================================================================
 // 配置文件示例生成
 // =============================================================================
 
@@ -974,6 +1167,55 @@ psk: "your-secret-psk-here"         # 预共享密钥 (使用 --gen-psk 生成)
 time_window: 30                     # 时间窗口 (秒)
 log_level: "info"                   # 日志级别: debug, info, warn, error
 mode: "auto"                        # 运行模式: auto, udp, faketcp, websocket, ebpf
+
+# =============================================================================
+# TLS 指纹伪装配置 (重要！用于绕过 DPI)
+# =============================================================================
+tls:
+  enabled: false                    # 是否启用 TLS 伪装
+  server_name: "www.microsoft.com"  # SNI 域名 (伪装目标)
+  fingerprint: "chrome"             # 浏览器指纹: chrome, firefox, safari, ios, android, edge, qq, 360
+  
+  # ECH (Encrypted Client Hello) 配置
+  enable_ech: false                 # 是否启用 ECH
+  ech_provider: "cloudflare"        # ECH 配置来源: cloudflare, custom
+  # ech_config: ""                  # 自定义 ECH 配置 (Base64)
+  
+  # 服务端回落配置 (防探测)
+  fallback_enabled: true            # 是否启用回落
+  fallback_addr: "127.0.0.1:80"     # 探测流量回落地址 (Nginx/Apache)
+  fallback_timeout: 10              # 回落超时 (秒)
+  
+  # 证书配置 (服务端)
+  auto_cert: true                   # 自动从 CertManager 获取证书
+  # cert_file: "/path/to/cert.pem"  # 手动指定证书
+  # key_file: "/path/to/key.pem"    # 手动指定私钥
+  verify_cert: false                # 客户端是否验证证书
+  
+  # 高级配置
+  alpn:                             # ALPN 协议
+    - "h2"
+    - "http/1.1"
+  min_version: "tls12"              # 最低 TLS 版本
+  max_version: "tls13"              # 最高 TLS 版本
+  session_ticket: true              # 启用会话票据
+  
+  # 随机 SNI (增强抗检测)
+  random_sni: false                 # 随机选择 SNI
+  sni_list:                         # SNI 候选列表
+    - "www.microsoft.com"
+    - "www.bing.com"
+    - "www.apple.com"
+    - "www.cloudflare.com"
+  
+  # 流量混淆
+  padding_enabled: false            # 启用 TLS 记录填充
+  padding_min_size: 16              # 最小填充大小
+  padding_max_size: 256             # 最大填充大小
+  fragment_enabled: false           # 启用 ClientHello 分片
+  fragment_size: 40                 # 分片大小
+  fragment_sleep_ms: 10             # 分片间隔 (毫秒)
+  mimic_browser_order: true         # 模拟浏览器扩展顺序
 
 # ARQ 可靠传输层 (UDP 增强，非独立模式)
 arq:
@@ -1046,193 +1288,11 @@ metrics:
 tunnel:
   enabled: false
   mode: "temp"                      # 隧道模式: temp (临时), fixed (固定), direct (直接 TCP)
-  
-  # =========================================================================
-  # 临时隧道 (mode: temp) - 无需额外配置
-  # 自动获取 xxx.trycloudflare.com 域名
-  # =========================================================================
-  
-  # =========================================================================
-  # 固定隧道 (mode: fixed) - 需要以下配置
-  # =========================================================================
-  cf_token: ""                      # Cloudflare Tunnel Token
-  cf_tunnel_id: ""                  # Tunnel ID (可选)
-  
-  # =========================================================================
-  # 本地服务配置
-  # =========================================================================
   local_addr: "127.0.0.1"           # 本地地址
   local_port: 0                     # 本地端口 (0 = 自动使用主监听端口)
   protocol: "http"                  # 协议: http, https, tcp
-  
-  # =========================================================================
-  # 域名配置
-  # =========================================================================
   domain_mode: "auto"               # 域名模式: auto, sslip, nip, duckdns, freedns, custom
-  domain: ""                        # 自定义域名
-  subdomain: ""                     # 子域名
-  
-  # =========================================================================
-  # DDNS 动态域名配置
-  # =========================================================================
-  #
-  # 方式 1: 通过 domain_mode 简化配置
-  # domain_mode: "duckdns"
-  # duckdns_token: "your-token"
-  # duckdns_domain: "your-subdomain"  # 不含 .duckdns.org
-  #
-  # 方式 2: 完整 DDNS 配置块
-  # ddns:
-  #   enabled: true
-  #   provider: "duckdns"             # duckdns, freedns, noip
-  #   update_interval: "5m"           # 更新间隔
-  #   duckdns:
-  #     token: "your-token"
-  #     domains:
-  #       - your-subdomain
-  #
-  # DuckDNS 示例:
-  #   1. 访问 https://www.duckdns.org/ 登录获取 token
-  #   2. 创建子域名，如 myserver (完整域名: myserver.duckdns.org)
-  #   3. 配置:
-  #      duckdns_token: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-  #      duckdns_domain: "myserver"
-  #
-  # FreeDNS 示例:
-  #   1. 访问 https://freedns.afraid.org/ 注册
-  #   2. 获取 Direct URL 中的 token
-  #   3. 配置:
-  #      freedns:
-  #        token: "your-update-token"
-  #        domain: "myserver.mooo.com"
-  #
-  # No-IP 示例:
-  #   ddns:
-  #     enabled: true
-  #     provider: "noip"
-  #     update_interval: "5m"
-  #     noip:
-  #       username: "your-email@example.com"
-  #       password: "your-password"
-  #       hostname:
-  #         - myserver.ddns.net
-  #
-  # =========================================================================
-  
-  # DuckDNS 简化配置
-  duckdns_token: ""                 # DuckDNS Token
-  duckdns_domain: ""                # DuckDNS 子域名
-  
-  # DuckDNS 结构体配置
-  duckdns:
-    token: ""
-    domains: ""
-  
-  # FreeDNS 配置
-  freedns:
-    token: ""
-    domain: ""
-  
-  # DDNS 完整配置
-  # ddns:
-  #   enabled: false
-  #   provider: ""
-  #   update_interval: "5m"
-  
-  # =========================================================================
-  # 证书配置
-  # =========================================================================
   cert_mode: "auto"                 # 证书模式: auto, selfsigned, acme, letsencrypt, zerossl, cforigin, custom
-  cert_file: ""                     # 自定义证书文件
-  key_file: ""                      # 自定义密钥文件
-  cert_dir: ""                      # 证书存储目录 (默认: /tmp/phantom-certs)
-  
-  # =========================================================================
-  # ACME 自动证书配置 (Let's Encrypt / ZeroSSL)
-  # cert_mode 设为 "acme" 或 "letsencrypt" 或 "zerossl" 时生效
-  # =========================================================================
-  acme_provider: "letsencrypt"      # ACME 提供商: letsencrypt, letsencrypt-staging, zerossl
-  acme_email: ""                    # ACME 账户邮箱 (必填)
-  acme_domains:                     # 要申请证书的域名列表
-    # - example.com
-    # - www.example.com
-  acme_challenge_type: "http-01"    # 挑战类型: http-01, tls-alpn-01
-  acme_http_port: 80                # HTTP-01 挑战端口
-  acme_use_tunnel: true             # 使用 Cloudflare 隧道进行 ACME 验证 (推荐)
-  
-  # ZeroSSL EAB 配置 (仅 zerossl 需要)
-  acme_eab_key_id: ""               # EAB Key ID
-  acme_eab_hmac_key: ""             # EAB HMAC Key
-  
-  # =========================================================================
-  # Let's Encrypt 旧版配置 (已废弃，推荐使用 acme_* 字段)
-  # =========================================================================
-  letsencrypt:
-    email: ""
-    staging: false
-    dns_provider: ""
-    dns_token: ""
-  
-  # =========================================================================
-  # 高级配置
-  # =========================================================================
-  auto_restart: true                # 自动重启
-  max_restarts: 5                   # 最大重启次数
-  restart_delay_sec: 5              # 重启延迟 (秒)
-  log_level: "info"                 # 隧道日志级别
-
-# =============================================================================
-# 完整 DDNS 配置示例
-# =============================================================================
-#
-# 示例 1: DuckDNS (推荐，免费且稳定)
-# tunnel:
-#   enabled: true
-#   mode: "direct"
-#   domain_mode: "duckdns"
-#   duckdns_token: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-#   duckdns_domain: "myserver"
-#   # 完整域名将是: myserver.duckdns.org
-#   # DDNS 会自动每 5 分钟更新一次 IP
-#
-# 示例 2: FreeDNS
-# tunnel:
-#   enabled: true
-#   mode: "direct"
-#   domain_mode: "freedns"
-#   freedns:
-#     token: "your-freedns-update-token"
-#     domain: "myserver.mooo.com"
-#
-# 示例 3: 独立 DDNS 配置（更灵活）
-# tunnel:
-#   enabled: true
-#   mode: "direct"
-#   domain_mode: "custom"
-#   domain: "myserver.duckdns.org"
-#   ddns:
-#     enabled: true
-#     provider: "duckdns"
-#     update_interval: "5m"
-#     duckdns:
-#       token: "your-token"
-#       domains:
-#         - myserver
-#
-# 示例 4: DDNS + ACME 证书
-# tunnel:
-#   enabled: true
-#   mode: "direct"
-#   domain_mode: "duckdns"
-#   duckdns_token: "your-token"
-#   duckdns_domain: "myserver"
-#   cert_mode: "acme"
-#   acme_email: "admin@example.com"
-#   acme_domains:
-#     - myserver.duckdns.org
-#   acme_use_tunnel: false          # 直接模式下不使用隧道验证
-#
-# =============================================================================
 `
 }
 
