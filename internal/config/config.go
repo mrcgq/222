@@ -1,7 +1,9 @@
+
+
 // =============================================================================
 // 文件: internal/config/config.go
 // 描述: 配置管理 - 修复配置隐性关联、端口冲突检测、ARQ 优先级验证
-//       增加 ACME 自动证书配置支持
+//       增加 ACME 自动证书配置支持和 DDNS 动态域名支持
 // =============================================================================
 package config
 
@@ -141,11 +143,18 @@ type TunnelConfig struct {
 	CFToken    string `yaml:"cf_token"`
 	CFTunnelID string `yaml:"cf_tunnel_id"`
 
-	// 免费域名 API 配置
-	DuckDNS       DuckDNSConfig `yaml:"duckdns"`
-	FreeDNS       FreeDNSConfig `yaml:"freedns"`
-	DuckDNSToken  string        `yaml:"duckdns_token"`  // 简化配置
-	DuckDNSDomain string        `yaml:"duckdns_domain"` // 简化配置
+	// DuckDNS 配置（简化）
+	DuckDNSToken  string `yaml:"duckdns_token"`
+	DuckDNSDomain string `yaml:"duckdns_domain"`
+
+	// DuckDNS 配置（结构体）
+	DuckDNS DuckDNSConfig `yaml:"duckdns"`
+
+	// FreeDNS 配置
+	FreeDNS FreeDNSConfig `yaml:"freedns"`
+
+	// DDNS 完整配置
+	DDNS *DDNSConfig `yaml:"ddns"`
 
 	// Let's Encrypt 配置 (旧版兼容)
 	LetsEncrypt LetsEncryptConfig `yaml:"letsencrypt"`
@@ -174,6 +183,34 @@ type DuckDNSConfig struct {
 type FreeDNSConfig struct {
 	Token  string `yaml:"token"`
 	Domain string `yaml:"domain"`
+}
+
+// DDNSConfig DDNS 完整配置
+type DDNSConfig struct {
+	Enabled        bool     `yaml:"enabled"`
+	Provider       string   `yaml:"provider"` // duckdns, freedns, noip
+	UpdateInterval string   `yaml:"update_interval"`
+	Token          string   `yaml:"token"`
+	Domains        []string `yaml:"domains"`
+
+	// DuckDNS
+	DuckDNS struct {
+		Token   string   `yaml:"token"`
+		Domains []string `yaml:"domains"`
+	} `yaml:"duckdns"`
+
+	// FreeDNS
+	FreeDNS struct {
+		Token  string `yaml:"token"`
+		Domain string `yaml:"domain"`
+	} `yaml:"freedns"`
+
+	// No-IP
+	NoIP struct {
+		Username string   `yaml:"username"`
+		Password string   `yaml:"password"`
+		Hostname []string `yaml:"hostname"`
+	} `yaml:"noip"`
 }
 
 // LetsEncryptConfig Let's Encrypt 配置 (旧版兼容，推荐使用 ACME* 字段)
@@ -510,6 +547,16 @@ func (c *Config) validateTunnelConfig() error {
 		if c.Tunnel.FreeDNS.Token == "" {
 			return fmt.Errorf("FreeDNS 模式需要配置 freedns.token")
 		}
+		if c.Tunnel.FreeDNS.Domain == "" {
+			return fmt.Errorf("FreeDNS 模式需要配置 freedns.domain")
+		}
+	}
+
+	// 验证 DDNS 配置
+	if c.Tunnel.DDNS != nil && c.Tunnel.DDNS.Enabled {
+		if err := c.validateDDNSConfig(); err != nil {
+			return fmt.Errorf("DDNS 配置错误: %w", err)
+		}
 	}
 
 	// 验证 Let's Encrypt 配置 (旧版兼容)
@@ -601,6 +648,54 @@ func (c *Config) validateACMEConfig() error {
 	// 如果没有指定域名，尝试从 Domain 字段获取
 	if len(c.Tunnel.ACMEDomains) == 0 && c.Tunnel.Domain != "" {
 		c.Tunnel.ACMEDomains = []string{c.Tunnel.Domain}
+	}
+
+	return nil
+}
+
+// validateDDNSConfig 验证 DDNS 配置
+func (c *Config) validateDDNSConfig() error {
+	ddns := c.Tunnel.DDNS
+
+	switch ddns.Provider {
+	case "duckdns":
+		token := ddns.DuckDNS.Token
+		if token == "" {
+			token = ddns.Token
+		}
+		if token == "" {
+			return fmt.Errorf("DuckDNS 需要配置 token")
+		}
+		domains := ddns.DuckDNS.Domains
+		if len(domains) == 0 {
+			domains = ddns.Domains
+		}
+		if len(domains) == 0 {
+			return fmt.Errorf("DuckDNS 需要配置 domains")
+		}
+
+	case "freedns":
+		token := ddns.FreeDNS.Token
+		if token == "" {
+			token = ddns.Token
+		}
+		if token == "" {
+			return fmt.Errorf("FreeDNS 需要配置 token")
+		}
+
+	case "noip":
+		if ddns.NoIP.Username == "" || ddns.NoIP.Password == "" {
+			return fmt.Errorf("No-IP 需要配置 username 和 password")
+		}
+		if len(ddns.NoIP.Hostname) == 0 {
+			return fmt.Errorf("No-IP 需要配置 hostname")
+		}
+
+	case "":
+		return fmt.Errorf("DDNS 需要配置 provider")
+
+	default:
+		return fmt.Errorf("不支持的 DDNS 提供商: %s (支持: duckdns, freedns, noip)", ddns.Provider)
 	}
 
 	return nil
@@ -719,6 +814,24 @@ func (c *Config) syncRelatedConfig() {
 	if c.Tunnel.CertMode == "acme" && len(c.Tunnel.ACMEDomains) == 0 && c.Tunnel.Domain != "" {
 		c.Tunnel.ACMEDomains = []string{c.Tunnel.Domain}
 	}
+
+	// 同步 DDNS 配置（如果使用 domain_mode 但没有独立 DDNS 配置）
+	if c.Tunnel.DDNS == nil && (c.Tunnel.DomainMode == "duckdns" || c.Tunnel.DomainMode == "freedns") {
+		c.Tunnel.DDNS = &DDNSConfig{
+			Enabled:        true,
+			UpdateInterval: "5m",
+		}
+		switch c.Tunnel.DomainMode {
+		case "duckdns":
+			c.Tunnel.DDNS.Provider = "duckdns"
+			c.Tunnel.DDNS.DuckDNS.Token = c.Tunnel.GetDuckDNSToken()
+			c.Tunnel.DDNS.DuckDNS.Domains = []string{c.Tunnel.GetDuckDNSDomain()}
+		case "freedns":
+			c.Tunnel.DDNS.Provider = "freedns"
+			c.Tunnel.DDNS.FreeDNS.Token = c.Tunnel.FreeDNS.Token
+			c.Tunnel.DDNS.FreeDNS.Domain = c.Tunnel.FreeDNS.Domain
+		}
+	}
 }
 
 // parsePort 解析端口号
@@ -748,6 +861,7 @@ func (c *Config) GetListenHost() string {
 	return host
 }
 
+
 // ToTunnelConfig 转换为 tunnel 包的配置类型
 func (c *TunnelConfig) ToTunnelConfig() interface{} {
 	return c
@@ -771,6 +885,14 @@ func (c *TunnelConfig) IsDirectTunnel() bool {
 // IsACMEEnabled 是否启用 ACME 证书
 func (c *TunnelConfig) IsACMEEnabled() bool {
 	return c.CertMode == "acme"
+}
+
+// IsDDNSEnabled 是否启用 DDNS
+func (c *TunnelConfig) IsDDNSEnabled() bool {
+	if c.DDNS != nil && c.DDNS.Enabled {
+		return true
+	}
+	return c.DomainMode == "duckdns" || c.DomainMode == "freedns"
 }
 
 // GetLocalURL 获取本地服务 URL
@@ -813,6 +935,28 @@ func (c *TunnelConfig) GetDuckDNSDomain() string {
 		return c.DuckDNSDomain
 	}
 	return c.DuckDNS.Domains
+}
+
+// GetDDNSProvider 获取 DDNS 提供商
+func (c *TunnelConfig) GetDDNSProvider() string {
+	if c.DDNS != nil {
+		return c.DDNS.Provider
+	}
+	switch c.DomainMode {
+	case "duckdns":
+		return "duckdns"
+	case "freedns":
+		return "freedns"
+	}
+	return ""
+}
+
+// GetDDNSUpdateInterval 获取 DDNS 更新间隔
+func (c *TunnelConfig) GetDDNSUpdateInterval() string {
+	if c.DDNS != nil && c.DDNS.UpdateInterval != "" {
+		return c.DDNS.UpdateInterval
+	}
+	return "5m"
 }
 
 // =============================================================================
@@ -922,11 +1066,78 @@ tunnel:
   protocol: "http"                  # 协议: http, https, tcp
   
   # =========================================================================
-  # 域名配置 (可选)
+  # 域名配置
   # =========================================================================
   domain_mode: "auto"               # 域名模式: auto, sslip, nip, duckdns, freedns, custom
   domain: ""                        # 自定义域名
   subdomain: ""                     # 子域名
+  
+  # =========================================================================
+  # DDNS 动态域名配置
+  # =========================================================================
+  #
+  # 方式 1: 通过 domain_mode 简化配置
+  # domain_mode: "duckdns"
+  # duckdns_token: "your-token"
+  # duckdns_domain: "your-subdomain"  # 不含 .duckdns.org
+  #
+  # 方式 2: 完整 DDNS 配置块
+  # ddns:
+  #   enabled: true
+  #   provider: "duckdns"             # duckdns, freedns, noip
+  #   update_interval: "5m"           # 更新间隔
+  #   duckdns:
+  #     token: "your-token"
+  #     domains:
+  #       - your-subdomain
+  #
+  # DuckDNS 示例:
+  #   1. 访问 https://www.duckdns.org/ 登录获取 token
+  #   2. 创建子域名，如 myserver (完整域名: myserver.duckdns.org)
+  #   3. 配置:
+  #      duckdns_token: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  #      duckdns_domain: "myserver"
+  #
+  # FreeDNS 示例:
+  #   1. 访问 https://freedns.afraid.org/ 注册
+  #   2. 获取 Direct URL 中的 token
+  #   3. 配置:
+  #      freedns:
+  #        token: "your-update-token"
+  #        domain: "myserver.mooo.com"
+  #
+  # No-IP 示例:
+  #   ddns:
+  #     enabled: true
+  #     provider: "noip"
+  #     update_interval: "5m"
+  #     noip:
+  #       username: "your-email@example.com"
+  #       password: "your-password"
+  #       hostname:
+  #         - myserver.ddns.net
+  #
+  # =========================================================================
+  
+  # DuckDNS 简化配置
+  duckdns_token: ""                 # DuckDNS Token
+  duckdns_domain: ""                # DuckDNS 子域名
+  
+  # DuckDNS 结构体配置
+  duckdns:
+    token: ""
+    domains: ""
+  
+  # FreeDNS 配置
+  freedns:
+    token: ""
+    domain: ""
+  
+  # DDNS 完整配置
+  # ddns:
+  #   enabled: false
+  #   provider: ""
+  #   update_interval: "5m"
   
   # =========================================================================
   # 证书配置
@@ -954,23 +1165,6 @@ tunnel:
   acme_eab_hmac_key: ""             # EAB HMAC Key
   
   # =========================================================================
-  # DuckDNS 配置 (domain_mode: duckdns)
-  # =========================================================================
-  duckdns_token: ""                 # DuckDNS Token (简化配置)
-  duckdns_domain: ""                # DuckDNS 子域名 (简化配置)
-  # 或使用结构化配置:
-  duckdns:
-    token: ""
-    domains: ""
-  
-  # =========================================================================
-  # FreeDNS 配置 (domain_mode: freedns)
-  # =========================================================================
-  freedns:
-    token: ""
-    domain: ""
-  
-  # =========================================================================
   # Let's Encrypt 旧版配置 (已废弃，推荐使用 acme_* 字段)
   # =========================================================================
   letsencrypt:
@@ -988,43 +1182,55 @@ tunnel:
   log_level: "info"                 # 隧道日志级别
 
 # =============================================================================
-# ACME 证书使用示例
+# 完整 DDNS 配置示例
 # =============================================================================
 #
-# 示例 1: 使用 Let's Encrypt 获取证书 (推荐使用隧道验证)
-# tunnel:
-#   enabled: true
-#   mode: "fixed"
-#   cert_mode: "acme"
-#   acme_email: "admin@example.com"
-#   acme_domains:
-#     - example.com
-#     - www.example.com
-#   acme_use_tunnel: true            # 通过 Cloudflare 隧道进行验证
-#   cf_token: "your-cloudflare-token"
-#
-# 示例 2: 使用 Let's Encrypt Staging (测试环境)
+# 示例 1: DuckDNS (推荐，免费且稳定)
 # tunnel:
 #   enabled: true
 #   mode: "direct"
-#   cert_mode: "acme"
-#   acme_provider: "letsencrypt-staging"
-#   acme_email: "admin@example.com"
-#   acme_domains:
-#     - test.example.com
-#   acme_use_tunnel: false
-#   acme_http_port: 80
+#   domain_mode: "duckdns"
+#   duckdns_token: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#   duckdns_domain: "myserver"
+#   # 完整域名将是: myserver.duckdns.org
+#   # DDNS 会自动每 5 分钟更新一次 IP
 #
-# 示例 3: 使用 ZeroSSL
+# 示例 2: FreeDNS
 # tunnel:
 #   enabled: true
+#   mode: "direct"
+#   domain_mode: "freedns"
+#   freedns:
+#     token: "your-freedns-update-token"
+#     domain: "myserver.mooo.com"
+#
+# 示例 3: 独立 DDNS 配置（更灵活）
+# tunnel:
+#   enabled: true
+#   mode: "direct"
+#   domain_mode: "custom"
+#   domain: "myserver.duckdns.org"
+#   ddns:
+#     enabled: true
+#     provider: "duckdns"
+#     update_interval: "5m"
+#     duckdns:
+#       token: "your-token"
+#       domains:
+#         - myserver
+#
+# 示例 4: DDNS + ACME 证书
+# tunnel:
+#   enabled: true
+#   mode: "direct"
+#   domain_mode: "duckdns"
+#   duckdns_token: "your-token"
+#   duckdns_domain: "myserver"
 #   cert_mode: "acme"
-#   acme_provider: "zerossl"
 #   acme_email: "admin@example.com"
 #   acme_domains:
-#     - example.com
-#   acme_eab_key_id: "your-eab-key-id"
-#   acme_eab_hmac_key: "your-eab-hmac-key"
+#     - myserver.duckdns.org
+#   acme_use_tunnel: false          # 直接模式下不使用隧道验证
 #
 # =============================================================================
 `
