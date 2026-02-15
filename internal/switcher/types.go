@@ -3,6 +3,7 @@
 // =============================================================================
 // 文件: internal/switcher/types.go
 // 描述: 智能链路切换 - 类型定义 (ARQ 已从独立模式中移除)
+//       新增：eBPF 端口独占状态标记
 // =============================================================================
 package switcher
 
@@ -48,6 +49,24 @@ func (s TransportState) String() string {
 	names := []string{"unknown", "starting", "running", "degraded", "failed", "stopped"}
 	if int(s) < len(names) {
 		return names[s]
+	}
+	return "unknown"
+}
+
+// PortOwnership 端口所有权状态
+type PortOwnership int
+
+const (
+	PortOwnerNone    PortOwnership = iota // 无所有者
+	PortOwnerUDP                          // UDP 独占
+	PortOwnerEBPF                         // eBPF 独占
+	PortOwnerShared                       // 共享 (理论上不应该发生)
+)
+
+func (p PortOwnership) String() string {
+	names := []string{"none", "udp", "ebpf", "shared"}
+	if int(p) < len(names) {
+		return names[p]
 	}
 	return "unknown"
 }
@@ -212,6 +231,7 @@ type SwitcherStats struct {
 	CurrentModeTime  time.Duration
 	ARQEnabled       bool
 	ARQActiveConns   int64
+	PortOwnership    PortOwnership // 新增：端口所有权状态
 }
 
 // ModeStats 模式统计
@@ -225,7 +245,4 @@ type ModeStats struct {
 	FailureCount   uint64
 	LastActive     time.Time
 }
-
-
-
 
