@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Phantom Server 一键安装脚本 v5.6
-# 修复：eBPF 程序下载验证 + cloudflared 权限 + bpftool 安装
+# Phantom Server 一键安装脚本 v5.7
+# 修复：eBPF 程序下载验证 + cloudflared 权限 + bpftool 安装 + 消除警告
 # =============================================================================
 
 [[ ! -t 0 ]] && exec 0</dev/tty
@@ -95,7 +95,6 @@ install_dependencies() {
         for pkg in "${need_install[@]}"; do
             case "$pkg" in
                 bpftool)
-                    # Ubuntu/Debian 上 bpftool 在 linux-tools 包中
                     apt-get install -y -qq linux-tools-common 2>/dev/null
                     apt-get install -y -qq "linux-tools-$(uname -r)" 2>/dev/null || \
                     apt-get install -y -qq linux-tools-generic 2>/dev/null || \
@@ -156,7 +155,6 @@ check_ebpf_support() {
     local jit=$(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo "0")
     if [[ "$jit" != "1" ]]; then
         echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null
-        # 持久化
         if ! grep -q "bpf_jit_enable" /etc/sysctl.conf 2>/dev/null; then
             echo "net.core.bpf_jit_enable = 1" >> /etc/sysctl.conf
         fi
@@ -201,7 +199,7 @@ cleanup_ebpf_hooks() {
 }
 
 # =============================================================================
-# 下载功能
+# 文件验证功能（使用 od 避免 null byte 警告）
 # =============================================================================
 
 # 验证下载的文件是否为有效的 ELF 文件
@@ -211,7 +209,8 @@ is_valid_elf() {
     [[ ! -s "$file" ]] && return 1
     
     # 检查 ELF magic number: 0x7f 'E' 'L' 'F'
-    local magic=$(xxd -l 4 -p "$file" 2>/dev/null)
+    # 使用 od 代替 xxd，避免 null byte 警告
+    local magic=$(od -A n -t x1 -N 4 "$file" 2>/dev/null | tr -d ' ')
     [[ "$magic" == "7f454c46" ]]
 }
 
@@ -221,8 +220,8 @@ is_valid_executable() {
     [[ ! -f "$file" ]] && return 1
     [[ ! -s "$file" ]] && return 1
     
-    # 检查是否为 ELF 可执行文件或脚本
-    local magic=$(xxd -l 4 -p "$file" 2>/dev/null)
+    # 检查是否为 ELF 可执行文件
+    local magic=$(od -A n -t x1 -N 4 "$file" 2>/dev/null | tr -d ' ')
     [[ "$magic" == "7f454c46" ]] && return 0
     
     # 检查是否为脚本 (#!)
@@ -231,6 +230,10 @@ is_valid_executable() {
     
     return 1
 }
+
+# =============================================================================
+# 下载功能
+# =============================================================================
 
 download_file() {
     local filename="$1" output="$2"
@@ -325,7 +328,6 @@ fix_cloudflared_permissions() {
         find "$cloudflared_dir" -type f -name "cloudflared*" -exec chmod +x {} \; 2>/dev/null
     fi
     
-    # 也检查其他可能的位置
     for dir in "/usr/local/bin" "/opt/phantom/bin" "/root/.phantom/bin"; do
         if [[ -d "$dir" ]]; then
             find "$dir" -type f -name "cloudflared*" -exec chmod +x {} \; 2>/dev/null
@@ -490,7 +492,6 @@ guided_install() {
         chmod +x "$INSTALL_DIR/phantom-server"
         info "使用本地文件"
     elif [[ -x "$INSTALL_DIR/phantom-server" ]]; then
-        # 验证已存在的文件
         if is_valid_executable "$INSTALL_DIR/phantom-server"; then
             info "使用已安装版本"
         else
@@ -534,7 +535,7 @@ guided_install() {
     local iface=$(get_iface)
     
     cat > "$CONFIG_FILE" << EOF
-# Phantom Server 配置 v5.6
+# Phantom Server 配置 v5.7
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 listen: ":${PORT}"
 psk: "${PSK}"
@@ -620,8 +621,6 @@ EOF
     # 第 6 步：Systemd
     echo ""
     step "第 6 步：配置服务"
-    
-    local iface_escaped=$(printf '%s\n' "$iface" | sed 's/[[\.*^$()+?{|]/\\&/g')
     
     cat > "$SERVICE_FILE" << EOF
 [Unit]
