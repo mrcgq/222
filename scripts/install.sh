@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Phantom Server v5.3 - 修复 Base64 PSK
+# =============================================================================
+# Phantom Server 一键安装脚本 v5.4
+# 修复：eBPF 监听冲突 + Base64 PSK + 环境预检测
+# =============================================================================
 
 [[ ! -t 0 ]] && exec 0</dev/tty
 
@@ -47,26 +50,36 @@ get_iface() {
     ip route 2>/dev/null | grep default | awk '{print $5}' | head -1 || echo "eth0"
 }
 
-# 【核心修复】生成正确的 Base64 PSK
-# 32 字节随机数 -> Base64 编码 -> 约 44 字符
-# 解码后正好 32 字节
+# Base64 PSK 生成
 generate_psk() {
-    openssl rand -base64 32 2>/dev/null | tr -d '\n' || {
-        # 备用方案
-        head -c 32 /dev/urandom | base64 | tr -d '\n'
-    }
+    openssl rand -base64 32 2>/dev/null | tr -d '\n' || head -c 32 /dev/urandom | base64 | tr -d '\n'
 }
 
-# 验证 PSK（模拟程序的验证逻辑）
 validate_psk() {
     local psk="$1"
-    # 尝试 Base64 解码并检查长度
     local decoded_len=$(echo -n "$psk" | base64 -d 2>/dev/null | wc -c)
-    if [[ "$decoded_len" -eq 32 ]]; then
-        return 0
-    else
-        return 1
-    fi
+    [[ "$decoded_len" -eq 32 ]]
+}
+
+# eBPF 环境检测
+check_ebpf_support() {
+    local supported="full"
+    
+    # 内核版本检查
+    local kv=$(uname -r | cut -d. -f1)
+    [[ $kv -lt 5 ]] && supported="none"
+    
+    # 虚拟化检查
+    local virt=$(systemd-detect-virt 2>/dev/null || echo "none")
+    case "$virt" in
+        openvz|lxc|docker) supported="none" ;;
+    esac
+    
+    # BPF JIT
+    local jit=$(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo "0")
+    [[ "$jit" != "1" ]] && echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null
+    
+    echo "$supported"
 }
 
 download_file() {
@@ -105,131 +118,117 @@ guided_install() {
     print_logo
     echo -e "${BOLD}欢迎使用 Phantom Server 安装向导${NC}"
     echo ""
-    echo "本向导将引导你完成安装，大部分情况下直接回车即可。"
-    echo ""
-    read -rp "准备好了吗？开始安装 [Y/n]: " confirm
+    read -rp "开始安装 [Y/n]: " confirm
     [[ "$confirm" =~ ^[Nn]$ ]] && exit 0
     
-    # ═══════════════════════════════════════════════════════════════════════
     # 第 1 步：基础配置
-    # ═══════════════════════════════════════════════════════════════════════
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     step "第 1 步：基础配置"
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
-    echo -e "${CYAN}[?]${NC} 监听端口"
-    read -rp "  直接回车使用 54321: " input_port
+    read -rp "  监听端口 [54321]: " input_port
     local PORT=${input_port:-54321}
     info "端口: ${PORT}"
     
-    # 【修复】生成正确的 Base64 PSK
     local PSK=$(generate_psk)
-    
-    # 验证 PSK
     if validate_psk "$PSK"; then
-        local decoded_len=$(echo -n "$PSK" | base64 -d 2>/dev/null | wc -c)
-        info "PSK 密钥已生成: ${CYAN}${PSK}${NC}"
-        echo "  (Base64 编码，解码后 ${decoded_len} 字节，请保存此密钥)"
+        info "PSK 已生成: ${CYAN}${PSK}${NC}"
     else
-        error "PSK 生成失败，使用备用方案"
-        PSK="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        error "PSK 生成失败"; exit 1
     fi
     
-    # ═══════════════════════════════════════════════════════════════════════
-    # 第 2 步：连接方式
-    # ═══════════════════════════════════════════════════════════════════════
+    # 第 2 步：环境检测
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    step "第 2 步：选择连接方式"
+    step "第 2 步：环境检测"
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo "你希望如何访问服务器？"
+    
+    local ebpf_support=$(check_ebpf_support)
+    local ebpf_enabled="false"
+    local xdp_mode="generic"
+    
+    case "$ebpf_support" in
+        full)
+            ebpf_enabled="true"
+            xdp_mode="native"
+            info "eBPF: ${GREEN}完全支持${NC} (native 模式)"
+            ;;
+        partial)
+            ebpf_enabled="true"
+            xdp_mode="generic"
+            info "eBPF: ${YELLOW}部分支持${NC} (generic 模式)"
+            ;;
+        none)
+            ebpf_enabled="false"
+            warn "eBPF: ${RED}不支持${NC} (将使用 FakeTCP)"
+            ;;
+    esac
+    
+    # 第 3 步：连接方式
     echo ""
-    echo -e "  ${CYAN}1${NC}. 使用服务器 IP 直连 ${GREEN}(最简单)${NC}"
-    echo -e "  ${CYAN}2${NC}. 使用 Cloudflare 隧道 ${GREEN}(推荐，免费隐藏IP)${NC}"
-    echo -e "  ${CYAN}3${NC}. 使用自己的域名"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    step "第 3 步：选择连接方式"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    read -rp "请选择 [1-3，默认 1]: " conn_choice
-    conn_choice=${conn_choice:-1}
+    echo -e "  ${CYAN}1${NC}. IP 直连 ${GREEN}(最简单)${NC}"
+    echo -e "  ${CYAN}2${NC}. Cloudflare 隧道 ${GREEN}(推荐)${NC}"
+    echo -e "  ${CYAN}3${NC}. 自己的域名"
+    echo ""
+    read -rp "选择 [1-3，默认 1]: " conn_choice
     
     local USE_TUNNEL="false"
     local TUNNEL_MODE="temp"
     local CF_TOKEN=""
     local DOMAIN=""
     
-    case $conn_choice in
+    case ${conn_choice:-1} in
         2)
             USE_TUNNEL="true"
             echo ""
-            echo "Cloudflare 隧道模式："
-            echo -e "  ${CYAN}a${NC}. 临时隧道 - 无需配置，域名每次重启会变"
-            echo -e "  ${CYAN}b${NC}. 固定隧道 - 需要 CF 账号，域名永久固定"
-            echo ""
-            read -rp "选择 [a/b，默认 a]: " tunnel_choice
-            
-            if [[ "$tunnel_choice" =~ ^[Bb]$ ]]; then
+            read -rp "临时隧道(a) 或 固定隧道(b) [a]: " tm
+            if [[ "$tm" =~ ^[Bb]$ ]]; then
                 TUNNEL_MODE="fixed"
-                echo ""
-                echo "获取 Token: https://one.dash.cloudflare.com → Tunnels → Create"
-                read -rp "粘贴 Token: " CF_TOKEN
-                [[ -z "$CF_TOKEN" ]] && { warn "未输入Token，使用临时隧道"; TUNNEL_MODE="temp"; }
+                read -rp "CF Token: " CF_TOKEN
+                [[ -z "$CF_TOKEN" ]] && TUNNEL_MODE="temp"
             fi
-            info "隧道模式: ${TUNNEL_MODE}"
+            info "隧道: ${TUNNEL_MODE}"
             ;;
         3)
-            echo ""
-            read -rp "输入域名 (如 vpn.example.com): " DOMAIN
-            [[ -n "$DOMAIN" ]] && info "域名: ${DOMAIN}"
+            read -rp "域名: " DOMAIN
             ;;
     esac
     
-    # ═══════════════════════════════════════════════════════════════════════
-    # 第 3 步：下载程序
-    # ═══════════════════════════════════════════════════════════════════════
+    # 第 4 步：下载
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    step "第 3 步：下载程序文件"
+    step "第 4 步：下载程序"
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
     local arch=$(get_arch)
-    info "检测系统: linux/${arch}"
+    info "系统: linux/${arch}"
     
     if [[ -f "./phantom-server" ]]; then
         cp "./phantom-server" "$INSTALL_DIR/phantom-server"
         chmod +x "$INSTALL_DIR/phantom-server"
         info "使用本地文件"
-    elif [[ -x "$INSTALL_DIR/phantom-server" ]]; then
-        echo ""
-        read -rp "发现已安装版本，重新下载？ [y/N]: " redown
-        if [[ "$redown" =~ ^[Yy]$ ]]; then
-            rm -f "$INSTALL_DIR/phantom-server"
-        else
-            info "使用现有版本"
-        fi
-    fi
-    
-    if [[ ! -x "$INSTALL_DIR/phantom-server" ]]; then
-        echo "正在下载..."
+    elif [[ ! -x "$INSTALL_DIR/phantom-server" ]]; then
         if ! download_file "phantom-server-linux-${arch}" "$INSTALL_DIR/phantom-server"; then
-            download_file "phantom-server" "$INSTALL_DIR/phantom-server" || {
-                error "下载失败，请手动下载到 $INSTALL_DIR/phantom-server"
-                exit 1
-            }
+            download_file "phantom-server" "$INSTALL_DIR/phantom-server" || { error "下载失败"; exit 1; }
         fi
         chmod +x "$INSTALL_DIR/phantom-server"
+    else
+        info "使用已安装版本"
     fi
-    info "程序准备完成"
     
-    # ═══════════════════════════════════════════════════════════════════════
-    # 第 4 步：生成配置
-    # ═══════════════════════════════════════════════════════════════════════
+    # 第 5 步：生成配置
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    step "第 4 步：生成配置文件"
+    step "第 5 步：生成配置"
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
@@ -237,9 +236,6 @@ guided_install() {
     
     cat > "$CONFIG_FILE" << EOF
 # Phantom Server 配置
-# 生成: $(date '+%Y-%m-%d %H:%M:%S')
-# PSK: Base64 编码，解码后 32 字节
-
 listen: ":${PORT}"
 psk: "${PSK}"
 mode: "auto"
@@ -254,10 +250,19 @@ tunnel:
 domain:
   name: "${DOMAIN}"
 
+# 【修复】eBPF - 根据环境自动配置
+ebpf:
+  enabled: ${ebpf_enabled}
+  interface: "${iface}"
+  xdp_mode: "${xdp_mode}"
+  enable_tc: true
+
+# FakeTCP - 独立端口，不会与 eBPF/UDP 冲突
 faketcp:
   enabled: true
   listen: ":$((PORT+1))"
   interface: "${iface}"
+  use_ebpf: false
 
 websocket:
   enabled: true
@@ -272,8 +277,6 @@ hysteria2:
 arq:
   enabled: true
   window_size: 256
-  rto_min_ms: 100
-  rto_max_ms: 3000
 
 switcher:
   enabled: true
@@ -285,39 +288,20 @@ switcher:
     - "udp"
     - "websocket"
 
-ebpf:
-  enabled: true
-  interface: "${iface}"
-  xdp_mode: "generic"
-
 tls:
   enabled: false
   server_name: "${DOMAIN:-www.microsoft.com}"
-  fingerprint: "chrome"
 
 metrics:
   enabled: true
   listen: ":9100"
 EOF
     
-    # 验证写入的 PSK
-    local saved_psk=$(grep "^psk:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-    if validate_psk "$saved_psk"; then
-        local decoded_len=$(echo -n "$saved_psk" | base64 -d 2>/dev/null | wc -c)
-        info "配置文件已生成 (PSK 解码后 ${decoded_len} 字节)"
-    else
-        error "配置文件 PSK 验证失败"
-        exit 1
-    fi
+    info "配置已生成"
     
-    # ═══════════════════════════════════════════════════════════════════════
-    # 第 5 步：系统服务
-    # ═══════════════════════════════════════════════════════════════════════
+    # 第 6 步：Systemd
     echo ""
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    step "第 5 步：配置系统服务"
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
+    step "第 6 步：配置服务"
     
     cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -333,7 +317,7 @@ Restart=always
 RestartSec=5
 LimitNOFILE=1048576
 LimitMEMLOCK=infinity
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_BPF CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_BPF CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_IPC_LOCK
 
 [Install]
 WantedBy=multi-user.target
@@ -341,16 +325,11 @@ EOF
     
     systemctl daemon-reload
     systemctl enable phantom 2>/dev/null
-    info "系统服务已配置"
+    info "服务已配置"
     
-    # ═══════════════════════════════════════════════════════════════════════
-    # 第 6 步：启动
-    # ═══════════════════════════════════════════════════════════════════════
+    # 第 7 步：启动
     echo ""
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    step "第 6 步：启动服务"
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
+    step "第 7 步：启动服务"
     
     systemctl stop phantom 2>/dev/null
     sleep 1
@@ -362,173 +341,72 @@ EOF
         
         local TUNNEL_URL=""
         if [[ "$USE_TUNNEL" == "true" ]]; then
-            echo "正在获取隧道地址..."
             sleep 5
             TUNNEL_URL=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
         fi
         
-        local SERVER_IP=$(curl -s4 --connect-timeout 5 ip.sb 2>/dev/null || echo "你的服务器IP")
+        local SERVER_IP=$(curl -s4 --connect-timeout 5 ip.sb 2>/dev/null || echo "你的IP")
         
         echo ""
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${GREEN}${BOLD}           🎉 安装完成！${NC}"
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
-        echo -e "${BOLD}【连接信息】${NC}"
-        [[ -n "$TUNNEL_URL" ]] && echo -e "  🌐 隧道: ${CYAN}${BOLD}${TUNNEL_URL}${NC}"
+        [[ -n "$TUNNEL_URL" ]] && echo -e "  🌐 隧道: ${CYAN}${TUNNEL_URL}${NC}"
         echo -e "  📍 IP:   ${CYAN}${SERVER_IP}${NC}"
         echo -e "  🔌 端口: ${CYAN}${PORT}${NC}"
-        echo -e "  🔑 PSK:  ${CYAN}${BOLD}${PSK}${NC}"
+        echo -e "  🔑 PSK:  ${CYAN}${PSK}${NC}"
+        [[ "$ebpf_enabled" == "true" ]] && echo -e "  ⚡ eBPF: ${GREEN}已启用 (${xdp_mode})${NC}"
         echo ""
-        echo -e "${BOLD}【常用命令】${NC}"
-        echo "  状态: systemctl status phantom"
-        echo "  日志: journalctl -u phantom -f"
-        echo "  重启: systemctl restart phantom"
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        
     else
-        error "服务启动失败"
-        echo ""
-        echo "错误日志："
+        error "启动失败"
         journalctl -u phantom -n 10 --no-pager
-        echo ""
-        echo "调试信息："
-        local cfg_psk=$(grep "^psk:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-        echo "  配置 PSK: ${cfg_psk}"
-        echo "  字符长度: ${#cfg_psk}"
-        local decoded_len=$(echo -n "$cfg_psk" | base64 -d 2>/dev/null | wc -c)
-        echo "  解码后字节数: ${decoded_len}"
         exit 1
     fi
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 管理菜单
-# ─────────────────────────────────────────────────────────────────────────────
+# 管理菜单（简化版）
 show_menu() {
     while true; do
         print_logo
-        
         local status=$(systemctl is-active phantom 2>/dev/null || echo "未安装")
         case "$status" in
-            active)   echo -e "状态: ${GREEN}● 运行中${NC}" ;;
-            inactive) echo -e "状态: ${YELLOW}○ 已停止${NC}" ;;
-            *)        echo -e "状态: ${RED}✗ 未安装${NC}" ;;
+            active) echo -e "状态: ${GREEN}● 运行中${NC}" ;;
+            *) echo -e "状态: ${RED}✗ 未运行${NC}" ;;
         esac
         
-        if [[ -f "$CONFIG_FILE" ]]; then
-            local port=$(grep "^listen:" "$CONFIG_FILE" | grep -oP '\d+')
-            local psk=$(grep "^psk:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-            # 显示 PSK 前 20 个字符
-            local psk_display="${psk:0:20}..."
-            echo -e "端口: ${CYAN}${port}${NC}  PSK: ${CYAN}${psk_display}${NC}"
-            
-            if grep -q "enabled: true" <(grep -A1 "^tunnel:" "$CONFIG_FILE"); then
-                local url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
-                [[ -n "$url" ]] && echo -e "隧道: ${CYAN}${url}${NC}"
-            fi
-        fi
-        
         echo ""
-        echo -e "${BOLD}════════════ 菜单 ════════════${NC}"
-        echo ""
-        echo "  1. 重新安装"
-        echo "  2. 卸载"
-        echo ""
-        echo "  3. 启动   4. 停止   5. 重启"
-        echo "  6. 日志"
-        echo ""
-        echo "  7. 修改端口"
-        echo "  8. 重置PSK"
-        echo "  9. 隧道设置"
-        echo "  10. 查看配置"
-        echo "  11. 显示完整PSK"
-        echo ""
+        echo "  1. 重新安装   2. 卸载"
+        echo "  3. 启动       4. 停止      5. 重启"
+        echo "  6. 日志       7. 修改端口  8. 重置PSK"
+        echo "  9. 隧道      10. 查看配置"
         echo "  0. 退出"
         echo ""
-        read -rp "选择: " choice
+        read -rp "选择: " c
         
-        case $choice in
-            1) guided_install; read -rp "Enter继续..." _ ;;
-            2)
-                read -rp "确认卸载? [y/N]: " c
-                [[ "$c" =~ ^[Yy]$ ]] && {
-                    systemctl stop phantom; systemctl disable phantom
-                    rm -rf "$INSTALL_DIR" "$CONFIG_DIR" "$SERVICE_FILE"
-                    systemctl daemon-reload
-                    info "已卸载"
-                }
-                read -rp "Enter继续..." _
-                ;;
-            3) systemctl start phantom && info "已启动" || error "失败"; read -rp "Enter..." _ ;;
-            4) systemctl stop phantom && info "已停止" || error "失败"; read -rp "Enter..." _ ;;
-            5) systemctl restart phantom && info "已重启" || error "失败"; read -rp "Enter..." _ ;;
-            6) echo "Ctrl+C 退出"; journalctl -u phantom -f -n 50 ;;
-            7)
-                read -rp "新端口: " p
-                [[ "$p" =~ ^[0-9]+$ ]] && {
-                    yaml_set "listen" "\":${p}\""
-                    yaml_set_section "tunnel" "local_port" "$p"
-                    yaml_set_section "faketcp" "listen" "\":$((p+1))\""
-                    yaml_set_section "websocket" "listen" "\":$((p+2))\""
-                    systemctl restart phantom && info "已修改"
-                }
-                read -rp "Enter..." _
-                ;;
-            8)
-                # 【修复】重置 PSK 也使用 Base64
-                local new_psk=$(generate_psk)
-                if validate_psk "$new_psk"; then
-                    yaml_set "psk" "\"${new_psk}\""
-                    systemctl restart phantom
-                    info "新PSK: ${CYAN}${new_psk}${NC}"
-                else
-                    error "PSK 生成失败"
-                fi
-                read -rp "Enter..." _
-                ;;
-            9)
-                echo ""
-                echo "  1. 临时隧道  2. 固定隧道  3. 禁用  4. 查看地址"
-                read -rp "选择: " t
-                case $t in
-                    1) yaml_set_section "tunnel" "enabled" "true"; yaml_set_section "tunnel" "mode" "\"temp\""; systemctl restart phantom; sleep 5
-                       url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
-                       [[ -n "$url" ]] && info "隧道: ${url}" || warn "等待中..." ;;
-                    2) read -rp "Token: " tk; [[ -n "$tk" ]] && {
-                       yaml_set_section "tunnel" "enabled" "true"; yaml_set_section "tunnel" "mode" "\"fixed\""; yaml_set_section "tunnel" "token" "\"${tk}\""
-                       systemctl restart phantom; info "已配置"; } ;;
-                    3) yaml_set_section "tunnel" "enabled" "false"; systemctl restart phantom; info "已禁用" ;;
-                    4) url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
-                       [[ -n "$url" ]] && info "隧道: ${url}" || warn "未找到" ;;
-                esac
-                read -rp "Enter..." _
-                ;;
-            10) cat "$CONFIG_FILE" 2>/dev/null; read -rp "Enter..." _ ;;
-            11)
-                local psk=$(grep "^psk:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-                echo ""
-                echo -e "完整 PSK: ${CYAN}${psk}${NC}"
-                echo ""
-                local decoded_len=$(echo -n "$psk" | base64 -d 2>/dev/null | wc -c)
-                echo "字符长度: ${#psk}, 解码后: ${decoded_len} 字节"
-                read -rp "Enter..." _
-                ;;
+        case $c in
+            1) guided_install; read -rp "Enter..." _ ;;
+            2) systemctl stop phantom; rm -rf "$INSTALL_DIR" "$CONFIG_DIR" "$SERVICE_FILE"; systemctl daemon-reload; info "已卸载"; read -rp "Enter..." _ ;;
+            3) systemctl start phantom; read -rp "Enter..." _ ;;
+            4) systemctl stop phantom; read -rp "Enter..." _ ;;
+            5) systemctl restart phantom; read -rp "Enter..." _ ;;
+            6) journalctl -u phantom -f -n 50 ;;
+            7) read -rp "新端口: " p; yaml_set "listen" "\":${p}\""; systemctl restart phantom; read -rp "Enter..." _ ;;
+            8) local np=$(generate_psk); yaml_set "psk" "\"${np}\""; systemctl restart phantom; info "新PSK: $np"; read -rp "Enter..." _ ;;
+            9) yaml_set_section "tunnel" "enabled" "true"; systemctl restart phantom; sleep 5; journalctl -u phantom -n 50 | grep trycloudflare; read -rp "Enter..." _ ;;
+            10) cat "$CONFIG_FILE"; read -rp "Enter..." _ ;;
             0) exit 0 ;;
         esac
     done
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 入口
-# ─────────────────────────────────────────────────────────────────────────────
 check_root
-
-if [[ -f "$CONFIG_FILE" ]] && systemctl is-enabled phantom &>/dev/null 2>&1; then
+if [[ -f "$CONFIG_FILE" ]]; then
     show_menu
 else
     guided_install
-    echo ""
-    read -rp "按 Enter 继续..." _
+    read -rp "Enter继续..." _
     show_menu
 fi
