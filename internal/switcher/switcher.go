@@ -1,7 +1,7 @@
 // =============================================================================
 // 文件: internal/switcher/switcher.go
-// 描述: 智能链路切换 - 核心切换器 (修复锁竞争、ARQ 逻辑、质量异步更新)
-//       修复：eBPF 和 UDP 端口互斥，避免 bind: address already in use
+// 描述: 智能链路切换 - 核心切换器
+//       修复：UDP 始终先启动持有端口，eBPF 作为内核加速插件附加
 // =============================================================================
 package switcher
 
@@ -27,7 +27,7 @@ type Switcher struct {
 	switchCfg *SwitcherConfig
 	crypto    *crypto.Crypto
 	handler   *handler.UnifiedHandler
-	metrics   *metrics.PhantomMetrics // 指标收集器
+	metrics   *metrics.PhantomMetrics
 
 	transports map[TransportMode]TransportHandler
 	udpServer  *transport.UDPServer
@@ -44,10 +44,10 @@ type Switcher struct {
 	currentMode TransportMode
 	modeStats   map[TransportMode]*ModeStats
 
-	// 端口所有权状态 (新增)
-	portOwnership PortOwnership
+	// eBPF 是否成功挂载（作为 UDP 的加速插件）
+	ebpfAttached bool
 
-	// 异步质量更新队列 (修复锁竞争)
+	// 异步质量更新队列
 	qualityUpdates chan *qualityUpdate
 
 	totalSwitches   uint64
@@ -136,7 +136,6 @@ func New(cfg *config.Config, cry *crypto.Crypto, h *handler.UnifiedHandler) *Swi
 		decision:       NewDecisionEngine(switchCfg),
 		prober:         NewProber(switchCfg),
 		modeStats:      make(map[TransportMode]*ModeStats),
-		portOwnership:  PortOwnerNone,
 		qualityUpdates: make(chan *qualityUpdate, 1000),
 		startTime:      time.Now(),
 		ctx:            ctx,
@@ -191,11 +190,11 @@ func (s *Switcher) Start(ctx context.Context) error {
 		}
 	}
 
-	s.log(1, "智能链路切换器已启动, 当前模式: %s, 端口所有权: %s", s.currentMode, s.portOwnership)
+	s.log(1, "智能链路切换器已启动, 当前模式: %s, eBPF加速: %v", s.currentMode, s.ebpfAttached)
 	return nil
 }
 
-// qualityUpdateLoop 异步质量更新循环 (修复锁竞争)
+// qualityUpdateLoop 异步质量更新循环
 func (s *Switcher) qualityUpdateLoop() {
 	defer s.wg.Done()
 
@@ -224,20 +223,45 @@ func (s *Switcher) qualityUpdateLoop() {
 	}
 }
 
-// startTransports 启动所有传输层 (核心修复：eBPF 和 UDP 互斥)
+// startTransports 启动所有传输层
+// 核心逻辑：UDP 始终先启动持有端口，eBPF 作为内核加速插件附加
 func (s *Switcher) startTransports(ctx context.Context) error {
 	logLevel := s.cfg.LogLevel
 
 	// ==========================================================================
-	// 核心修复：先尝试启动 eBPF，如果成功则独占主端口，UDP 不监听
+	// 1. UDP 服务器 (始终先启动，持有主端口)
 	// ==========================================================================
+	s.udpServer = transport.NewUDPServer(s.cfg.Listen, s.handler, logLevel)
+	if s.congestion != nil {
+		s.udpServer.SetCongestionController(s.congestion)
+	}
 
-	ebpfActive := false
+	// 启用 ARQ 增强层
+	if s.cfg.ARQ.Enabled {
+		arqConfig := &transport.ARQConnConfig{
+			MaxWindowSize:   s.cfg.ARQ.WindowSize,
+			RTOMin:          time.Duration(s.cfg.ARQ.RTOMinMs) * time.Millisecond,
+			RTOMax:          time.Duration(s.cfg.ARQ.RTOMaxMs) * time.Millisecond,
+			MaxRetries:      s.cfg.ARQ.MaxRetries,
+			EnableSACK:      s.cfg.ARQ.EnableSACK,
+			EnableTimestamp: s.cfg.ARQ.EnableTimestamp,
+		}
+		arqHandler := &arqHandlerWrapper{handler: s.handler}
+		s.udpServer.EnableARQ(arqConfig, arqHandler)
+		s.log(1, "ARQ 增强层已启用 (窗口: %d)", s.cfg.ARQ.WindowSize)
+	}
 
-	// 1. 尝试启动 eBPF (如果配置启用)
+	if err := s.udpServer.Start(ctx); err != nil {
+		return fmt.Errorf("UDP 启动失败: %w", err)
+	}
+	s.registerTransport(ModeUDP, NewUDPTransportWrapper(s.udpServer))
+	s.modeStats[ModeUDP].State = StateRunning
+	s.log(1, "UDP 服务器已启动: %s", s.cfg.Listen)
+
+	// ==========================================================================
+	// 2. eBPF 加速插件 (附加到已有的 UDP 之上，不再监听端口)
+	// ==========================================================================
 	if s.cfg.EBPF.Enabled {
-		s.log(1, "尝试启动 eBPF 加速器...")
-
 		s.ebpf = transport.NewEBPFAccelerator(
 			s.cfg.EBPF.Interface,
 			s.cfg.EBPF.XDPMode,
@@ -248,85 +272,24 @@ func (s *Switcher) startTransports(ctx context.Context) error {
 			logLevel,
 		)
 
-		// 启动 eBPF，禁用其内部的用户态监听回退
-		if err := s.ebpf.Start(ctx, s.cfg.Listen, true); err != nil {
-			s.log(1, "eBPF 启动失败: %v (将使用 UDP 模式)", err)
+		// eBPF 只挂载内核程序，不监听端口
+		if err := s.ebpf.Start(ctx, s.cfg.Listen); err != nil {
+			s.log(1, "eBPF 加速挂载失败: %v (使用标准 UDP 模式)", err)
 			s.ebpf = nil
 		} else if s.ebpf.IsActive() {
-			// eBPF 成功启动并处于活跃状态
-			ebpfActive = true
-			s.portOwnership = PortOwnerEBPF
+			s.ebpfAttached = true
 			s.registerTransport(ModeEBPF, NewEBPFTransportWrapper(s.ebpf))
 			s.modeStats[ModeEBPF].State = StateRunning
-			s.log(1, "eBPF 加速器已启动，独占主端口 %s", s.cfg.Listen)
+			s.log(1, "eBPF 内核加速已就绪，正在加速 UDP 流量")
 		} else {
-			s.log(1, "eBPF 加速器未激活 (回退到 UDP)")
+			s.log(1, "eBPF 未激活")
 			s.ebpf = nil
 		}
 	}
 
-	// 2. UDP 服务器 (根据 eBPF 状态决定是否监听)
-	if ebpfActive {
-		// eBPF 独占端口，UDP 仅作为发送通道（不监听）
-		s.log(1, "eBPF 已独占端口，UDP 作为发送通道启动")
-		s.udpServer = transport.NewUDPServerSendOnly(s.cfg.Listen, s.handler, logLevel)
-
-		if s.congestion != nil {
-			s.udpServer.SetCongestionController(s.congestion)
-		}
-
-		// 启用 ARQ 增强层 (仍然可用于发送)
-		if s.cfg.ARQ.Enabled {
-			arqConfig := &transport.ARQConnConfig{
-				MaxWindowSize:   s.cfg.ARQ.WindowSize,
-				RTOMin:          time.Duration(s.cfg.ARQ.RTOMinMs) * time.Millisecond,
-				RTOMax:          time.Duration(s.cfg.ARQ.RTOMaxMs) * time.Millisecond,
-				MaxRetries:      s.cfg.ARQ.MaxRetries,
-				EnableSACK:      s.cfg.ARQ.EnableSACK,
-				EnableTimestamp: s.cfg.ARQ.EnableTimestamp,
-			}
-			arqHandler := &arqHandlerWrapper{handler: s.handler}
-			s.udpServer.EnableARQ(arqConfig, arqHandler)
-			s.log(1, "ARQ 增强层已启用 (发送模式)")
-		}
-
-		// UDP 不作为独立传输层注册，因为 eBPF 已处理接收
-		// 但仍然标记为可用（用于回退）
-		s.modeStats[ModeUDP].State = StateDegraded // 降级状态，表示可回退
-
-	} else {
-		// 无 eBPF，UDP 正常监听
-		s.portOwnership = PortOwnerUDP
-		s.udpServer = transport.NewUDPServer(s.cfg.Listen, s.handler, logLevel)
-
-		if s.congestion != nil {
-			s.udpServer.SetCongestionController(s.congestion)
-		}
-
-		// 启用 ARQ 增强层
-		if s.cfg.ARQ.Enabled {
-			arqConfig := &transport.ARQConnConfig{
-				MaxWindowSize:   s.cfg.ARQ.WindowSize,
-				RTOMin:          time.Duration(s.cfg.ARQ.RTOMinMs) * time.Millisecond,
-				RTOMax:          time.Duration(s.cfg.ARQ.RTOMaxMs) * time.Millisecond,
-				MaxRetries:      s.cfg.ARQ.MaxRetries,
-				EnableSACK:      s.cfg.ARQ.EnableSACK,
-				EnableTimestamp: s.cfg.ARQ.EnableTimestamp,
-			}
-			arqHandler := &arqHandlerWrapper{handler: s.handler}
-			s.udpServer.EnableARQ(arqConfig, arqHandler)
-			s.log(1, "ARQ 增强层已启用 (窗口: %d)", s.cfg.ARQ.WindowSize)
-		}
-
-		if err := s.udpServer.Start(ctx); err != nil {
-			return fmt.Errorf("UDP 启动失败: %w", err)
-		}
-		s.registerTransport(ModeUDP, NewUDPTransportWrapper(s.udpServer))
-		s.modeStats[ModeUDP].State = StateRunning
-		s.log(1, "UDP 服务器已启动: %s", s.cfg.Listen)
-	}
-
-	// 3. TCP (使用独立端口，不冲突)
+	// ==========================================================================
+	// 3. TCP (使用相同端口，TCP 和 UDP 可以共存)
+	// ==========================================================================
 	s.tcpServer = transport.NewTCPServer(s.cfg.Listen, s.handler, logLevel)
 	if err := s.tcpServer.Start(ctx); err != nil {
 		s.log(1, "TCP 启动失败: %v (继续运行)", err)
@@ -335,16 +298,17 @@ func (s *Switcher) startTransports(ctx context.Context) error {
 		s.modeStats[ModeTCP].State = StateRunning
 	}
 
-	// 4. FakeTCP (使用独立端口，集成 eBPF TC 加速)
+	// ==========================================================================
+	// 4. FakeTCP (使用独立端口)
+	// ==========================================================================
 	if s.cfg.FakeTCP.Enabled {
 		s.fakeTCP = transport.NewFakeTCPServer(
-			s.cfg.FakeTCP.Listen, // 使用 FakeTCP 专用端口
+			s.cfg.FakeTCP.Listen,
 			s.cfg.FakeTCP.Interface,
 			s.handler,
 			logLevel,
 		)
 
-		// 如果配置了 eBPF TC 加速
 		if s.cfg.FakeTCP.UseEBPF && s.cfg.EBPF.ProgramPath != "" {
 			if err := s.fakeTCP.EnableEBPFTC(s.cfg.EBPF.ProgramPath); err != nil {
 				s.log(1, "FakeTCP eBPF TC 加速失败: %v (回退到用户态)", err)
@@ -359,10 +323,12 @@ func (s *Switcher) startTransports(ctx context.Context) error {
 		}
 	}
 
+	// ==========================================================================
 	// 5. WebSocket (使用独立端口)
+	// ==========================================================================
 	if s.cfg.WebSocket.Enabled {
 		s.webSocket = transport.NewWebSocketServer(
-			s.cfg.WebSocket.Listen, // 使用 WebSocket 专用端口
+			s.cfg.WebSocket.Listen,
 			s.cfg.WebSocket.Path,
 			s.cfg.WebSocket.Host,
 			s.cfg.WebSocket.TLS,
@@ -393,6 +359,19 @@ func (s *Switcher) selectInitialMode() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 如果 eBPF 已挂载，优先使用 eBPF 模式
+	if s.ebpfAttached {
+		if stats, ok := s.modeStats[ModeEBPF]; ok && stats.State == StateRunning {
+			s.currentMode = ModeEBPF
+			s.modeStartTime = time.Now()
+			s.modeStats[ModeEBPF].LastActive = time.Now()
+			s.modeStats[ModeEBPF].SwitchInCount++
+			s.log(1, "初始模式: %s (内核加速)", ModeEBPF)
+			return
+		}
+	}
+
+	// 按优先级选择
 	for _, mode := range s.switchCfg.Priority {
 		if stats, ok := s.modeStats[mode]; ok && stats.State == StateRunning {
 			s.currentMode = mode
@@ -404,14 +383,7 @@ func (s *Switcher) selectInitialMode() {
 		}
 	}
 
-	// 如果没有 Running 状态的，尝试 Degraded 状态的 UDP
-	if stats, ok := s.modeStats[ModeUDP]; ok && stats.State == StateDegraded {
-		s.currentMode = ModeUDP
-		s.modeStartTime = time.Now()
-		s.log(1, "初始模式: %s (降级模式)", ModeUDP)
-		return
-	}
-
+	// 默认 UDP
 	s.currentMode = ModeUDP
 	s.modeStartTime = time.Now()
 }
@@ -457,7 +429,7 @@ func (s *Switcher) doSwitch(fromMode, toMode TransportMode, reason SwitchReason)
 	}
 
 	toStats, ok := s.modeStats[toMode]
-	if !ok || (toStats.State != StateRunning && toStats.State != StateDegraded) {
+	if !ok || toStats.State != StateRunning {
 		s.mu.Unlock()
 		s.log(2, "目标模式 %s 不可用, 取消切换", toMode)
 		return
@@ -490,7 +462,6 @@ func (s *Switcher) doSwitch(fromMode, toMode TransportMode, reason SwitchReason)
 	atomic.AddUint64(&s.totalSwitches, 1)
 	atomic.AddUint64(&s.successSwitches, 1)
 
-	// 更新指标
 	if s.metrics != nil {
 		s.metrics.RecordModeSwitch(string(oldMode), string(toMode))
 	}
@@ -552,47 +523,18 @@ func (s *Switcher) probeInactiveModes() {
 	}
 }
 
-// SendTo 发送数据 (异步质量更新避免锁竞争)
+// SendTo 发送数据
 func (s *Switcher) SendTo(data []byte, addr *net.UDPAddr) error {
 	s.mu.RLock()
 	mode := s.currentMode
-	portOwner := s.portOwnership
+	t := s.transports[mode]
 	s.mu.RUnlock()
 
-	var err error
-
-	// 根据端口所有权决定发送方式
-	switch portOwner {
-	case PortOwnerEBPF:
-		// eBPF 独占模式：通过 eBPF 发送
-		if s.ebpf != nil && s.ebpf.IsActive() {
-			err = s.ebpf.SendTo(data, addr)
-		} else if s.udpServer != nil {
-			// 回退到 UDP 发送
-			err = s.udpServer.SendTo(data, addr)
-		} else {
-			err = fmt.Errorf("无可用发送通道")
-		}
-
-	case PortOwnerUDP:
-		// UDP 独占模式：根据当前模式发送
-		t := s.transports[mode]
-		if t != nil {
-			err = t.Send(data, addr)
-		} else if s.udpServer != nil {
-			err = s.udpServer.SendTo(data, addr)
-		} else {
-			err = fmt.Errorf("传输层不可用: %s", mode)
-		}
-
-	default:
-		// 默认使用 UDP
-		if s.udpServer != nil {
-			err = s.udpServer.SendTo(data, addr)
-		} else {
-			err = fmt.Errorf("无可用发送通道")
-		}
+	if t == nil {
+		return fmt.Errorf("传输层不可用: %s", mode)
 	}
+
+	err := t.Send(data, addr)
 
 	// 异步更新质量
 	select {
@@ -602,10 +544,8 @@ func (s *Switcher) SendTo(data []byte, addr *net.UDPAddr) error {
 		bytes:   int64(len(data)),
 	}:
 	default:
-		// 队列满，丢弃更新
 	}
 
-	// 更新指标
 	if s.metrics != nil && err == nil {
 		s.metrics.AddBytesSent(int64(len(data)))
 	}
@@ -620,19 +560,11 @@ func (s *Switcher) CurrentMode() string {
 	return string(s.currentMode)
 }
 
-// GetPortOwnership 获取端口所有权状态
-func (s *Switcher) GetPortOwnership() PortOwnership {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.portOwnership
-}
-
 // HasEBPF 是否启用 eBPF
 func (s *Switcher) HasEBPF() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	stats, ok := s.modeStats[ModeEBPF]
-	return ok && stats.State == StateRunning
+	return s.ebpfAttached
 }
 
 // HasFakeTCP 是否启用 FakeTCP
@@ -656,7 +588,7 @@ func (s *Switcher) HasWebSocket() bool {
 	return ok && stats.State == StateRunning
 }
 
-// HasARQ 是否启用 ARQ (UDP 的属性)
+// HasARQ 是否启用 ARQ
 func (s *Switcher) HasARQ() bool {
 	return s.cfg.ARQ.Enabled && s.udpServer != nil && s.udpServer.GetARQManager() != nil
 }
@@ -672,8 +604,8 @@ func (s *Switcher) SwitchMode(mode TransportMode) error {
 		return fmt.Errorf("未知模式: %s", mode)
 	}
 
-	if stats.State != StateRunning && stats.State != StateDegraded {
-		return fmt.Errorf("模式不可用: %s (状态: %s)", mode, stats.State)
+	if stats.State != StateRunning {
+		return fmt.Errorf("模式不可用: %s", mode)
 	}
 
 	s.doSwitch(currentMode, mode, ReasonManual)
@@ -694,7 +626,6 @@ func (s *Switcher) GetStats() *SwitcherStats {
 		CurrentModeTime: time.Since(s.modeStartTime),
 		ModeStats:       make(map[TransportMode]*ModeStats),
 		ARQEnabled:      s.cfg.ARQ.Enabled,
-		PortOwnership:   s.portOwnership,
 	}
 
 	if monitor := s.decision.GetQualityMonitor(s.currentMode); monitor != nil {
@@ -748,7 +679,6 @@ func (s *Switcher) Stop() {
 		s.ebpf.Stop()
 	}
 
-	// 关闭质量更新通道，等待处理完成
 	close(s.qualityUpdates)
 	s.wg.Wait()
 	s.log(1, "智能链路切换器已停止")
