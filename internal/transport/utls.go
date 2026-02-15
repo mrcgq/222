@@ -228,11 +228,24 @@ func (c *UTLSClient) DialWithConn(ctx context.Context, conn net.Conn, network, a
 	}
 
 	// 如果启用 ECH 且有配置
-    if c.config.EnableECH && len(c.config.ECHConfigs) > 0 {
-    // uTLS 中对应的字段名称是 ECHConfigs
-    tlsConfig.ECHConfigs = c.config.ECHConfigs
-    atomic.AddUint64(&c.stats.ECHUsed, 1)
-    }
+	if c.config.EnableECH && len(c.config.ECHConfigs) > 0 {
+		var allParsedConfigs []utls.ECHConfig
+		for _, rawConfig := range c.config.ECHConfigs {
+			// 解析原始的 ECH 字节数据
+			parsedConfigs, err := utls.UnmarshalECHConfigs(rawConfig)
+			if err != nil {
+				// 如果解析失败，记录日志并跳过
+				c.log(0, "解析 ECH 配置失败: %v", err)
+				continue
+			}
+			allParsedConfigs = append(allParsedConfigs, parsedConfigs...)
+		}
+
+		if len(allParsedConfigs) > 0 {
+			tlsConfig.ECHConfigs = allParsedConfigs
+			atomic.AddUint64(&c.stats.ECHUsed, 1)
+		}
+	}
 
 	// 创建 uTLS 连接
 	clientHelloID := c.getClientHelloID()
