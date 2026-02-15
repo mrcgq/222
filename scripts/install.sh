@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Phantom Server 一键安装脚本 v5.5
-# 修复：eBPF 内核资产下载 + 旧钩子清理 + 监听冲突
+# Phantom Server 一键安装脚本 v5.6
+# 修复：eBPF 程序下载验证 + cloudflared 权限 + bpftool 安装
 # =============================================================================
 
 [[ ! -t 0 ]] && exec 0</dev/tty
@@ -43,7 +43,7 @@ check_root() {
 
 get_arch() {
     case "$(uname -m)" in
-        x86_64) echo "amd64" ;; aarch64) echo "arm64" ;; *) echo "amd64" ;;
+        x86_64) echo "amd64" ;; aarch64) echo "arm64" ;; armv7l) echo "arm" ;; *) echo "amd64" ;;
     esac
 }
 
@@ -63,6 +63,70 @@ validate_psk() {
 }
 
 # =============================================================================
+# 系统依赖安装
+# =============================================================================
+
+install_dependencies() {
+    echo -n "  检查系统依赖... "
+    
+    local need_install=()
+    
+    # 检查 bpftool
+    if ! command -v bpftool &>/dev/null; then
+        need_install+=("bpftool")
+    fi
+    
+    # 检查 curl
+    if ! command -v curl &>/dev/null; then
+        need_install+=("curl")
+    fi
+    
+    if [[ ${#need_install[@]} -eq 0 ]]; then
+        echo -e "${GREEN}完成${NC}"
+        return 0
+    fi
+    
+    echo ""
+    echo "    安装依赖: ${need_install[*]}"
+    
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq 2>/dev/null
+        
+        for pkg in "${need_install[@]}"; do
+            case "$pkg" in
+                bpftool)
+                    # Ubuntu/Debian 上 bpftool 在 linux-tools 包中
+                    apt-get install -y -qq linux-tools-common 2>/dev/null
+                    apt-get install -y -qq "linux-tools-$(uname -r)" 2>/dev/null || \
+                    apt-get install -y -qq linux-tools-generic 2>/dev/null || \
+                    apt-get install -y -qq bpftool 2>/dev/null
+                    ;;
+                *)
+                    apt-get install -y -qq "$pkg" 2>/dev/null
+                    ;;
+            esac
+        done
+        
+    elif command -v yum &>/dev/null; then
+        for pkg in "${need_install[@]}"; do
+            yum install -y -q "$pkg" 2>/dev/null
+        done
+        
+    elif command -v dnf &>/dev/null; then
+        for pkg in "${need_install[@]}"; do
+            dnf install -y -q "$pkg" 2>/dev/null
+        done
+        
+    elif command -v apk &>/dev/null; then
+        for pkg in "${need_install[@]}"; do
+            apk add --quiet "$pkg" 2>/dev/null
+        done
+    fi
+    
+    info "依赖安装完成"
+}
+
+# =============================================================================
 # eBPF 环境检测与清理
 # =============================================================================
 
@@ -71,7 +135,7 @@ check_ebpf_support() {
     
     # 内核版本检查 (需要 5.4+)
     local kv_major=$(uname -r | cut -d. -f1)
-    local kv_minor=$(uname -r | cut -d. -f2)
+    local kv_minor=$(uname -r | cut -d. -f2 | cut -d- -f1)
     if [[ $kv_major -lt 5 ]] || [[ $kv_major -eq 5 && $kv_minor -lt 4 ]]; then
         supported="none"
     fi
@@ -79,25 +143,29 @@ check_ebpf_support() {
     # 虚拟化检查
     local virt=$(systemd-detect-virt 2>/dev/null || echo "none")
     case "$virt" in
-        openvz|lxc|docker) supported="none" ;;
+        openvz|lxc) supported="none" ;;
+        docker|podman) supported="partial" ;;
     esac
     
     # BTF 支持检查
-    [[ ! -f "/sys/kernel/btf/vmlinux" ]] && supported="partial"
+    if [[ ! -f "/sys/kernel/btf/vmlinux" ]]; then
+        [[ "$supported" == "full" ]] && supported="partial"
+    fi
     
     # BPF JIT 启用
     local jit=$(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo "0")
     if [[ "$jit" != "1" ]]; then
         echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null
         # 持久化
-        grep -q "bpf_jit_enable" /etc/sysctl.conf 2>/dev/null || \
+        if ! grep -q "bpf_jit_enable" /etc/sysctl.conf 2>/dev/null; then
             echo "net.core.bpf_jit_enable = 1" >> /etc/sysctl.conf
+        fi
     fi
     
     echo "$supported"
 }
 
-# 清理旧的 eBPF 钩子 (关键修复)
+# 清理旧的 eBPF 钩子
 cleanup_ebpf_hooks() {
     local iface=$(get_iface)
     
@@ -119,58 +187,84 @@ cleanup_ebpf_hooks() {
     fi
     
     # 3. 清理 BPF 文件系统中的 pinned maps
-    if [[ -d "/sys/fs/bpf/phantom" ]]; then
-        rm -rf /sys/fs/bpf/phantom 2>/dev/null
-    fi
+    rm -rf /sys/fs/bpf/phantom 2>/dev/null
     
     # 4. 使用 bpftool 清理 (如果可用)
     if command -v bpftool &>/dev/null; then
-        # 列出并卸载与 phantom 相关的程序
-        bpftool prog list 2>/dev/null | grep -E "xdp_phantom|tc_phantom" | \
+        bpftool prog list 2>/dev/null | grep -E "xdp_phantom|tc_phantom|phantom" | \
             awk '{print $1}' | tr -d ':' | while read id; do
-                bpftool prog detach id "$id" 2>/dev/null
-            done
-        
-        # 清理 orphaned maps
-        bpftool map list 2>/dev/null | grep -E "phantom" | \
-            awk '{print $1}' | tr -d ':' | while read id; do
-                bpftool map delete id "$id" 2>/dev/null
+                [[ -n "$id" ]] && bpftool prog detach id "$id" 2>/dev/null
             done
     fi
     
     echo -e "${GREEN}完成${NC}"
 }
 
-# 安装 eBPF 依赖工具
-install_ebpf_tools() {
-    # 检查并安装必要工具
-    if ! command -v bpftool &>/dev/null; then
-        if command -v apt-get &>/dev/null; then
-            apt-get update -qq && apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) 2>/dev/null
-        elif command -v yum &>/dev/null; then
-            yum install -y -q bpftool 2>/dev/null
-        fi
-    fi
-}
-
 # =============================================================================
 # 下载功能
 # =============================================================================
 
-download_file() {
-    local filename="$1" output="$2"
-    for base_url in "${DOWNLOAD_URLS[@]}"; do
-        echo -n "    尝试 $(echo $base_url | cut -d'/' -f3)... "
-        if curl -fsSL --connect-timeout 10 -o "$output" "${base_url}/${filename}" 2>/dev/null && [[ -s "$output" ]]; then
-            echo -e "${GREEN}成功${NC}"
-            return 0
-        fi
-        echo -e "${RED}失败${NC}"
-    done
+# 验证下载的文件是否为有效的 ELF 文件
+is_valid_elf() {
+    local file="$1"
+    [[ ! -f "$file" ]] && return 1
+    [[ ! -s "$file" ]] && return 1
+    
+    # 检查 ELF magic number: 0x7f 'E' 'L' 'F'
+    local magic=$(xxd -l 4 -p "$file" 2>/dev/null)
+    [[ "$magic" == "7f454c46" ]]
+}
+
+# 验证下载的文件是否为有效的可执行文件
+is_valid_executable() {
+    local file="$1"
+    [[ ! -f "$file" ]] && return 1
+    [[ ! -s "$file" ]] && return 1
+    
+    # 检查是否为 ELF 可执行文件或脚本
+    local magic=$(xxd -l 4 -p "$file" 2>/dev/null)
+    [[ "$magic" == "7f454c46" ]] && return 0
+    
+    # 检查是否为脚本 (#!)
+    local head=$(head -c 2 "$file" 2>/dev/null)
+    [[ "$head" == "#!" ]] && return 0
+    
     return 1
 }
 
-# 下载 eBPF 内核字节码 (关键新增)
+download_file() {
+    local filename="$1" output="$2"
+    local temp_file="${output}.tmp"
+    
+    for base_url in "${DOWNLOAD_URLS[@]}"; do
+        echo -n "    尝试 $(echo $base_url | cut -d'/' -f3)... "
+        
+        rm -f "$temp_file"
+        
+        if curl -fsSL --connect-timeout 15 --max-time 60 -o "$temp_file" "${base_url}/${filename}" 2>/dev/null; then
+            # 检查文件是否下载成功且不是 HTML 错误页面
+            if [[ -s "$temp_file" ]]; then
+                local head=$(head -c 10 "$temp_file" 2>/dev/null)
+                if [[ "$head" == "<!DOCTYPE"* ]] || [[ "$head" == "<html"* ]] || [[ "$head" == "<!doctype"* ]]; then
+                    echo -e "${RED}失败 (HTML)${NC}"
+                    rm -f "$temp_file"
+                    continue
+                fi
+                
+                mv "$temp_file" "$output"
+                echo -e "${GREEN}成功${NC}"
+                return 0
+            fi
+        fi
+        
+        echo -e "${RED}失败${NC}"
+        rm -f "$temp_file"
+    done
+    
+    return 1
+}
+
+# 下载 eBPF 内核字节码
 download_ebpf_programs() {
     echo "  下载 eBPF 内核程序..."
     
@@ -178,38 +272,65 @@ download_ebpf_programs() {
     
     local arch=$(get_arch)
     local files=("xdp_phantom.o" "tc_phantom.o")
-    local success=true
+    local success_count=0
     
     for file in "${files[@]}"; do
-        # 尝试下载架构特定版本
-        if download_file "ebpf/${arch}/${file}" "${EBPF_DIR}/${file}"; then
-            continue
-        fi
+        local downloaded=false
         
-        # 尝试下载通用版本
-        if download_file "ebpf/${file}" "${EBPF_DIR}/${file}"; then
-            continue
-        fi
+        # 尝试多种下载路径
+        local paths=(
+            "ebpf-${arch}/${file}"
+            "ebpf/${arch}/${file}"
+            "ebpf/${file}"
+            "${file}"
+        )
         
-        # 尝试直接下载
-        if download_file "${file}" "${EBPF_DIR}/${file}"; then
-            continue
-        fi
+        for path in "${paths[@]}"; do
+            if download_file "$path" "${EBPF_DIR}/${file}"; then
+                # 验证是否为有效的 ELF 文件
+                if is_valid_elf "${EBPF_DIR}/${file}"; then
+                    info "    ${file} 验证通过"
+                    ((success_count++))
+                    downloaded=true
+                    break
+                else
+                    warn "    ${file} 格式无效，删除"
+                    rm -f "${EBPF_DIR}/${file}"
+                fi
+            fi
+        done
         
-        warn "无法下载 ${file} (将使用用户态回退)"
-        success=false
+        if ! $downloaded; then
+            warn "    无法下载 ${file}"
+        fi
     done
     
     # 设置权限
     chmod 644 "${EBPF_DIR}"/*.o 2>/dev/null
     
-    if $success && [[ -f "${EBPF_DIR}/xdp_phantom.o" ]]; then
-        info "eBPF 内核程序已就绪"
+    if [[ $success_count -ge 1 ]] && [[ -f "${EBPF_DIR}/xdp_phantom.o" ]]; then
+        info "eBPF 内核程序已就绪 (${success_count}/2)"
         return 0
     else
         warn "eBPF 程序不完整，将使用用户态模式"
         return 1
     fi
+}
+
+# 修复 cloudflared 权限
+fix_cloudflared_permissions() {
+    local cloudflared_dir="$HOME/.phantom/bin"
+    
+    if [[ -d "$cloudflared_dir" ]]; then
+        find "$cloudflared_dir" -type f -name "cloudflared*" -exec chmod +x {} \; 2>/dev/null
+    fi
+    
+    # 也检查其他可能的位置
+    for dir in "/usr/local/bin" "/opt/phantom/bin" "/root/.phantom/bin"; do
+        if [[ -d "$dir" ]]; then
+            find "$dir" -type f -name "cloudflared*" -exec chmod +x {} \; 2>/dev/null
+        fi
+    done
 }
 
 yaml_set() {
@@ -233,14 +354,11 @@ yaml_set_section() {
 # 服务管理
 # =============================================================================
 
-# 安全停止服务并清理
 safe_stop_service() {
     echo -n "  停止服务... "
     
-    # 停止服务
     systemctl stop phantom 2>/dev/null
     
-    # 等待进程完全退出
     local max_wait=10
     local waited=0
     while pgrep -f "phantom-server" &>/dev/null && [[ $waited -lt $max_wait ]]; do
@@ -248,20 +366,18 @@ safe_stop_service() {
         ((waited++))
     done
     
-    # 强制终止残留进程
     pkill -9 -f "phantom-server" 2>/dev/null
     
     echo -e "${GREEN}完成${NC}"
 }
 
-# 启动前完整清理
 pre_start_cleanup() {
     step "执行启动前清理"
     
     safe_stop_service
     cleanup_ebpf_hooks
+    fix_cloudflared_permissions
     
-    # 等待资源释放
     sleep 2
 }
 
@@ -300,6 +416,9 @@ guided_install() {
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
+    # 安装依赖
+    install_dependencies
+    
     local ebpf_support=$(check_ebpf_support)
     local ebpf_enabled="false"
     local xdp_mode="generic"
@@ -318,11 +437,6 @@ guided_install() {
             warn "eBPF 环境: ${RED}不支持${NC} (将使用 FakeTCP)"
             ;;
     esac
-    
-    # 安装 eBPF 工具
-    if [[ "$ebpf_support" != "none" ]]; then
-        install_ebpf_tools
-    fi
     
     # 第 3 步：连接方式
     echo ""
@@ -375,23 +489,38 @@ guided_install() {
         cp "./phantom-server" "$INSTALL_DIR/phantom-server"
         chmod +x "$INSTALL_DIR/phantom-server"
         info "使用本地文件"
-    elif [[ ! -x "$INSTALL_DIR/phantom-server" ]]; then
+    elif [[ -x "$INSTALL_DIR/phantom-server" ]]; then
+        # 验证已存在的文件
+        if is_valid_executable "$INSTALL_DIR/phantom-server"; then
+            info "使用已安装版本"
+        else
+            warn "已安装版本无效，重新下载"
+            rm -f "$INSTALL_DIR/phantom-server"
+            if ! download_file "phantom-server-linux-${arch}" "$INSTALL_DIR/phantom-server"; then
+                download_file "phantom-server" "$INSTALL_DIR/phantom-server" || { error "下载失败"; exit 1; }
+            fi
+            chmod +x "$INSTALL_DIR/phantom-server"
+        fi
+    else
         if ! download_file "phantom-server-linux-${arch}" "$INSTALL_DIR/phantom-server"; then
             download_file "phantom-server" "$INSTALL_DIR/phantom-server" || { error "下载失败"; exit 1; }
         fi
         chmod +x "$INSTALL_DIR/phantom-server"
-    else
-        info "使用已安装版本"
     fi
     
-    # 下载 eBPF 程序 (关键新增)
+    # 验证主程序
+    if ! is_valid_executable "$INSTALL_DIR/phantom-server"; then
+        error "下载的程序文件无效"
+        exit 1
+    fi
+    
+    # 下载 eBPF 程序
     if [[ "$ebpf_support" != "none" ]]; then
         if download_ebpf_programs; then
             ebpf_enabled="true"
             ebpf_programs_ok=true
         else
             ebpf_enabled="false"
-            warn "eBPF 程序下载失败，将使用用户态模式"
         fi
     fi
     
@@ -405,7 +534,7 @@ guided_install() {
     local iface=$(get_iface)
     
     cat > "$CONFIG_FILE" << EOF
-# Phantom Server 配置 v5.5
+# Phantom Server 配置 v5.6
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 listen: ":${PORT}"
 psk: "${PSK}"
@@ -418,9 +547,8 @@ tunnel:
   mode: "${TUNNEL_MODE}"
   cf_token: "${CF_TOKEN}"
   local_port: ${PORT}
-
-domain:
-  name: "${DOMAIN}"
+  local_addr: "127.0.0.1"
+  protocol: "http"
 
 # eBPF 加速 (内核层，与 UDP 共存)
 ebpf:
@@ -430,7 +558,6 @@ ebpf:
   program_path: "${EBPF_DIR}"
   map_size: 65536
   enable_stats: true
-  enable_tc: true
 
 # FakeTCP - 独立端口
 faketcp:
@@ -494,7 +621,9 @@ EOF
     echo ""
     step "第 6 步：配置服务"
     
-    cat > "$SERVICE_FILE" << 'SERVICEFILE'
+    local iface_escaped=$(printf '%s\n' "$iface" | sed 's/[[\.*^$()+?{|]/\\&/g')
+    
+    cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Phantom Server
 Documentation=https://github.com/mrcgq/222
@@ -504,15 +633,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/phantom
-ExecStartPre=/bin/bash -c 'ip link set $(ip route | grep default | awk "{print \$5}" | head -1) xdp off 2>/dev/null || true'
-ExecStartPre=/bin/bash -c 'rm -rf /sys/fs/bpf/phantom 2>/dev/null || true'
-SERVICEFILE
-
-    cat >> "$SERVICE_FILE" << EOF
+WorkingDirectory=${INSTALL_DIR}
+ExecStartPre=-/sbin/ip link set dev ${iface} xdp off
+ExecStartPre=-/bin/rm -rf /sys/fs/bpf/phantom
 ExecStart=${INSTALL_DIR}/phantom-server -c ${CONFIG_FILE}
-ExecStopPost=/bin/bash -c 'ip link set ${iface} xdp off 2>/dev/null || true'
-ExecStopPost=/bin/bash -c 'rm -rf /sys/fs/bpf/phantom 2>/dev/null || true'
+ExecStopPost=-/sbin/ip link set dev ${iface} xdp off
+ExecStopPost=-/bin/rm -rf /sys/fs/bpf/phantom
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
@@ -536,7 +662,6 @@ EOF
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
-    # 执行启动前清理 (关键)
     pre_start_cleanup
     
     echo -n "  启动服务... "
@@ -546,10 +671,12 @@ EOF
     if systemctl is-active --quiet phantom; then
         echo -e "${GREEN}成功${NC}"
         
-        # 检查实际运行状态
         sleep 2
-        local actual_mode=$(journalctl -u phantom -n 20 --no-pager 2>/dev/null | grep -oP '初始模式: \K\w+' | tail -1)
-        local ebpf_status=$(journalctl -u phantom -n 20 --no-pager 2>/dev/null | grep -q "eBPF 内核加速已就绪" && echo "active" || echo "inactive")
+        local actual_mode=$(journalctl -u phantom -n 30 --no-pager 2>/dev/null | grep -oP '初始模式: \K\w+' | tail -1)
+        local ebpf_status="inactive"
+        if journalctl -u phantom -n 30 --no-pager 2>/dev/null | grep -q "eBPF 内核加速已就绪\|eBPF 加速引擎已挂载"; then
+            ebpf_status="active"
+        fi
         
         local TUNNEL_URL=""
         if [[ "$USE_TUNNEL" == "true" ]]; then
@@ -557,7 +684,7 @@ EOF
             TUNNEL_URL=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
         fi
         
-        local SERVER_IP=$(curl -s4 --connect-timeout 5 ip.sb 2>/dev/null || echo "你的IP")
+        local SERVER_IP=$(curl -s4 --connect-timeout 5 ip.sb 2>/dev/null || curl -s4 --connect-timeout 5 ifconfig.me 2>/dev/null || echo "你的IP")
         
         echo ""
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -569,11 +696,10 @@ EOF
         echo -e "  🔌 端口: ${CYAN}${PORT}${NC}"
         echo -e "  🔑 PSK:  ${CYAN}${PSK}${NC}"
         
-        # 显示真实 eBPF 状态
         if [[ "$ebpf_status" == "active" ]]; then
             echo -e "  ⚡ eBPF: ${GREEN}已启用 (${xdp_mode} 模式)${NC}"
         elif [[ "$ebpf_enabled" == "true" ]]; then
-            echo -e "  ⚡ eBPF: ${YELLOW}已配置，等待激活${NC}"
+            echo -e "  ⚡ eBPF: ${YELLOW}已配置 (等待激活)${NC}"
         else
             echo -e "  ⚡ eBPF: ${RED}不可用${NC}"
         fi
@@ -585,7 +711,7 @@ EOF
         error "启动失败"
         echo ""
         echo "最近日志:"
-        journalctl -u phantom -n 20 --no-pager
+        journalctl -u phantom -n 30 --no-pager
         exit 1
     fi
 }
@@ -602,7 +728,6 @@ show_menu() {
             *) echo -e "状态: ${RED}✗ 未运行${NC}" ;;
         esac
         
-        # 显示当前模式
         if [[ "$status" == "active" ]]; then
             local mode=$(journalctl -u phantom -n 50 --no-pager 2>/dev/null | grep -oP '当前模式: \K\w+' | tail -1)
             [[ -n "$mode" ]] && echo -e "模式: ${CYAN}${mode}${NC}"
@@ -626,6 +751,7 @@ show_menu() {
                 systemctl daemon-reload
                 info "已卸载"
                 read -rp "Enter..." _ 
+                exit 0
                 ;;
             3) 
                 pre_start_cleanup
@@ -652,6 +778,7 @@ show_menu() {
                 yaml_set "listen" "\":${p}\""
                 yaml_set_section "faketcp" "listen" "\":$((p+1))\""
                 yaml_set_section "websocket" "listen" "\":$((p+2))\""
+                yaml_set_section "tunnel" "local_port" "${p}"
                 pre_start_cleanup
                 systemctl start phantom
                 read -rp "Enter..." _ 
@@ -665,12 +792,13 @@ show_menu() {
                 ;;
             9) 
                 yaml_set_section "tunnel" "enabled" "true"
+                fix_cloudflared_permissions
                 systemctl restart phantom
                 sleep 5
-                journalctl -u phantom -n 50 | grep trycloudflare
+                journalctl -u phantom -n 50 --no-pager | grep -E "trycloudflare|隧道"
                 read -rp "Enter..." _ 
                 ;;
-            10) cat "$CONFIG_FILE"; read -rp "Enter..." _ ;;
+            10) cat "$CONFIG_FILE" 2>/dev/null || echo "配置文件不存在"; read -rp "Enter..." _ ;;
             11)
                 echo "手动清理 eBPF 钩子..."
                 cleanup_ebpf_hooks
@@ -684,20 +812,21 @@ show_menu() {
                 echo ""
                 echo "=== eBPF 状态 ==="
                 if command -v bpftool &>/dev/null; then
-                    echo "XDP 程序:"
-                    bpftool prog list 2>/dev/null | grep -E "xdp|phantom" || echo "  无"
-                    echo "TC 程序:"
-                    bpftool prog list 2>/dev/null | grep -E "tc|phantom" || echo "  无"
+                    echo "已加载的 BPF 程序:"
+                    bpftool prog list 2>/dev/null | head -20 || echo "  无"
                 else
-                    echo "bpftool 未安装"
+                    echo "bpftool 未安装 (可运行: apt install linux-tools-common)"
                 fi
                 echo ""
                 echo "=== 网卡 XDP 状态 ==="
                 local iface=$(get_iface)
-                ip link show "$iface" 2>/dev/null | grep -E "xdp|prog"
+                ip link show "$iface" 2>/dev/null | grep -E "xdp|prog" || echo "  无 XDP 程序"
+                echo ""
+                echo "=== eBPF 程序文件 ==="
+                ls -la "${EBPF_DIR}/" 2>/dev/null || echo "  目录不存在"
                 echo ""
                 echo "=== 端口监听 ==="
-                ss -ulnp | grep -E "$(grep -oP 'listen: ":\K\d+' $CONFIG_FILE 2>/dev/null | head -1)" 2>/dev/null || echo "  无"
+                ss -tulnp 2>/dev/null | grep -E "phantom|$(grep -oP 'listen: ":\K\d+' $CONFIG_FILE 2>/dev/null | head -1)" || echo "  无"
                 echo ""
                 read -rp "Enter..." _
                 ;;
@@ -715,6 +844,9 @@ check_root
 if ! mountpoint -q /sys/fs/bpf 2>/dev/null; then
     mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
 fi
+
+# 确保必要目录存在
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" 2>/dev/null
 
 if [[ -f "$CONFIG_FILE" ]]; then
     show_menu
