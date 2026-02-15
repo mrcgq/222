@@ -1126,3 +1126,180 @@ func (m *CertManager) GetCertInfo() map[string]interface{} {
 
 	return info
 }
+
+
+
+
+
+
+
+
+// =============================================================================
+// 以下内容添加到 cert_manager.go 文件末尾
+// =============================================================================
+
+// =============================================================================
+// 实现 TLSCertProvider 接口
+// =============================================================================
+
+// 确保 CertManager 实现 transport.TLSCertProvider 接口
+// var _ transport.TLSCertProvider = (*CertManager)(nil)
+
+// GetCertificateForSNI 根据 SNI 获取证书
+func (m *CertManager) GetCertificateForSNI(sni string) (*tls.Certificate, error) {
+	m.log(2, "请求证书: SNI=%s", sni)
+
+	// 首先检查是否有 autocert 管理器
+	if m.autocertManager != nil {
+		cert, err := m.autocertManager.GetCertificate(&tls.ClientHelloInfo{
+			ServerName: sni,
+		})
+		if err == nil {
+			return cert, nil
+		}
+		m.log(2, "autocert 获取证书失败: %v", err)
+	}
+
+	// 返回预加载的证书
+	m.mu.RLock()
+	cert := m.cert
+	m.mu.RUnlock()
+
+	if cert == nil {
+		// 如果没有预加载证书，尝试生成自签名证书
+		m.log(1, "没有预加载证书，为 %s 生成自签名证书", sni)
+		return m.GenerateSelfSignedCertForSNI(sni)
+	}
+
+	return cert, nil
+}
+
+// GetTLSConfigForServer 获取服务端 TLS 配置
+func (m *CertManager) GetTLSConfigForServer() *tls.Config {
+	return &tls.Config{
+		GetCertificate: m.GetCertificate,
+		MinVersion:     tls.VersionTLS12,
+		MaxVersion:     tls.VersionTLS13,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		},
+		NextProtos: []string{"h2", "http/1.1", "acme-tls/1"},
+		// 启用会话复用
+		SessionTicketsDisabled: false,
+	}
+}
+
+// GenerateSelfSignedCertForSNI 为指定 SNI 生成自签名证书
+func (m *CertManager) GenerateSelfSignedCertForSNI(sni string) (*tls.Certificate, error) {
+	m.log(2, "为 SNI 生成自签名证书: %s", sni)
+
+	// 生成私钥
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("生成私钥失败: %w", err)
+	}
+
+	// 准备证书模板
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("生成序列号失败: %w", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"Phantom Server"},
+			CommonName:   sni,
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(1, 0, 0),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{sni},
+	}
+
+	// 如果 SNI 看起来像 IP，也添加到 IP 地址列表
+	if ip := net.ParseIP(sni); ip != nil {
+		template.IPAddresses = append(template.IPAddresses, ip)
+	}
+
+	// 创建证书
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("创建证书失败: %w", err)
+	}
+
+	cert := &tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  privateKey,
+	}
+
+	// 解析证书以填充 Leaf
+	cert.Leaf, _ = x509.ParseCertificate(certDER)
+
+	m.log(1, "自签名证书已生成: SNI=%s, 有效期至=%s", sni, template.NotAfter.Format("2006-01-02"))
+
+	return cert, nil
+}
+
+// SNICertificateCache SNI 证书缓存
+type SNICertificateCache struct {
+	cache   map[string]*tls.Certificate
+	mu      sync.RWMutex
+	manager *CertManager
+}
+
+// NewSNICertificateCache 创建 SNI 证书缓存
+func NewSNICertificateCache(manager *CertManager) *SNICertificateCache {
+	return &SNICertificateCache{
+		cache:   make(map[string]*tls.Certificate),
+		manager: manager,
+	}
+}
+
+// GetCertificate 获取或生成证书
+func (c *SNICertificateCache) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	sni := hello.ServerName
+
+	// 先检查缓存
+	c.mu.RLock()
+	cert, ok := c.cache[sni]
+	c.mu.RUnlock()
+
+	if ok {
+		return cert, nil
+	}
+
+	// 尝试从 CertManager 获取
+	if c.manager != nil {
+		cert, err := c.manager.GetCertificateForSNI(sni)
+		if err == nil {
+			c.mu.Lock()
+			c.cache[sni] = cert
+			c.mu.Unlock()
+			return cert, nil
+		}
+	}
+
+	return nil, fmt.Errorf("无法获取证书: %s", sni)
+}
+
+// Clear 清除缓存
+func (c *SNICertificateCache) Clear() {
+	c.mu.Lock()
+	c.cache = make(map[string]*tls.Certificate)
+	c.mu.Unlock()
+}
+
+// Size 返回缓存大小
+func (c *SNICertificateCache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.cache)
+}
