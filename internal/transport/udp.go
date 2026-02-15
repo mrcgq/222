@@ -1,9 +1,8 @@
 
-
-
 // =============================================================================
 // 文件: internal/transport/udp.go
-// 描述: 增强版 UDP 服务器 - ARQ 作为增强层集成（修复版 v2）
+// 描述: 增强版 UDP 服务器 - ARQ 作为增强层集成（修复版 v3）
+//       新增：SendOnly 模式，仅创建发送通道，不监听端口
 // =============================================================================
 package transport
 
@@ -150,8 +149,9 @@ type UDPServer struct {
 	nextPacketNum uint64
 
 	// 状态标志
-	running int32
-	started int32
+	running  int32
+	started  int32
+	sendOnly bool // 新增：仅发送模式
 
 	// 统计信息
 	packetsRecv    uint64
@@ -164,9 +164,9 @@ type UDPServer struct {
 	connectGroup singleflight.Group
 
 	// 连接状态缓存（避免频繁锁操作）
-	connCache     sync.Map // map[string]*arqConnState
-	connCacheMu   sync.RWMutex
-	connCacheTTL  time.Duration
+	connCache    sync.Map // map[string]*arqConnState
+	connCacheMu  sync.RWMutex
+	connCacheTTL time.Duration
 
 	mu sync.RWMutex
 }
@@ -209,7 +209,16 @@ func NewUDPServer(addr string, h PacketHandler, logLevel string) *UDPServer {
 		nextPacketNum: 1,
 		bufferConfig:  DefaultBufferConfig(),
 		connCacheTTL:  time.Second * 5,
+		sendOnly:      false,
 	}
+}
+
+// NewUDPServerSendOnly 创建仅发送模式的 UDP 服务器
+// 不监听端口，仅用于发送数据 (配合 eBPF 使用)
+func NewUDPServerSendOnly(addr string, h PacketHandler, logLevel string) *UDPServer {
+	server := NewUDPServer(addr, h, logLevel)
+	server.sendOnly = true
+	return server
 }
 
 // NewUDPServerWithConfig 使用配置创建 UDP 服务器
@@ -259,6 +268,40 @@ func (s *UDPServer) EnableARQ(config *ARQConnConfig, handler ARQHandler) {
 
 // Start 启动服务器
 func (s *UDPServer) Start(ctx context.Context) error {
+	// SendOnly 模式：仅创建发送连接
+	if s.sendOnly {
+		return s.startSendOnly(ctx)
+	}
+
+	// 正常模式：监听并接收
+	return s.startNormal(ctx)
+}
+
+// startSendOnly 仅发送模式启动
+func (s *UDPServer) startSendOnly(ctx context.Context) error {
+	// 创建一个不绑定特定端口的 UDP socket，仅用于发送
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return fmt.Errorf("创建发送 socket 失败: %w", err)
+	}
+
+	s.conn = conn
+
+	// 设置写缓冲区
+	_, writeSize := s.bufferConfig.calculateBufferSize()
+	if err := s.conn.SetWriteBuffer(writeSize); err != nil {
+		s.log(1, "写缓冲区设置失败: %v", err)
+	}
+
+	atomic.StoreInt32(&s.running, 1)
+	atomic.StoreInt32(&s.started, 1)
+
+	s.log(1, "UDP 服务器已启动 (SendOnly 模式)")
+	return nil
+}
+
+// startNormal 正常模式启动
+func (s *UDPServer) startNormal(ctx context.Context) error {
 	addr, err := net.ResolveUDPAddr("udp", s.addr)
 	if err != nil {
 		return fmt.Errorf("解析地址: %w", err)
@@ -469,8 +512,8 @@ func (s *UDPServer) SendTo(data []byte, addr *net.UDPAddr) error {
 		return fmt.Errorf("连接未初始化")
 	}
 
-	// 如果 ARQ 已启用，检查缓存的连接状态
-	if s.arqEnabled && s.arqManager != nil {
+	// 如果 ARQ 已启用且连接已建立，通过 ARQ 发送
+	if s.arqEnabled && s.arqManager != nil && !s.sendOnly {
 		if s.isARQConnEstablished(addr) {
 			if conn := s.arqManager.GetConn(addr); conn != nil {
 				return conn.Send(data)
@@ -649,13 +692,12 @@ func (s *UDPServer) IsRunning() bool {
 	if s.conn == nil {
 		return false
 	}
-	// 验证连接有效性
-	localAddr := s.conn.LocalAddr()
-	if localAddr == nil {
-		return false
-	}
-	_, ok := localAddr.(*net.UDPAddr)
-	return ok
+	return true
+}
+
+// IsSendOnly 是否为仅发送模式
+func (s *UDPServer) IsSendOnly() bool {
+	return s.sendOnly
 }
 
 // OnAck 处理 ACK（供外部调用，如非 ARQ 场景）
@@ -695,6 +737,13 @@ func (s *UDPServer) GetStats() map[string]uint64 {
 		stats["arq_total_conns"] = s.arqManager.GetTotalConns()
 	}
 
+	// 标记是否为 SendOnly 模式
+	if s.sendOnly {
+		stats["send_only_mode"] = 1
+	} else {
+		stats["send_only_mode"] = 0
+	}
+
 	return stats
 }
 
@@ -715,6 +764,7 @@ func (s *UDPServer) GetBufferStats() map[string]interface{} {
 		"read_buffer_bytes":     readSize,
 		"write_buffer_bytes":    writeSize,
 		"buffer_multiplier":     s.bufferConfig.BufferMultiplier,
+		"send_only_mode":        s.sendOnly,
 	}
 }
 
@@ -730,10 +780,15 @@ func (s *UDPServer) Stop() {
 
 	close(s.stopCh)
 
-	for _, ch := range s.workerChs {
-		close(ch)
+	// 仅在非 SendOnly 模式下关闭 worker
+	if !s.sendOnly {
+		for _, ch := range s.workerChs {
+			if ch != nil {
+				close(ch)
+			}
+		}
+		s.workerWg.Wait()
 	}
-	s.workerWg.Wait()
 
 	if s.arqManager != nil {
 		s.arqManager.Close()
@@ -746,6 +801,12 @@ func (s *UDPServer) Stop() {
 
 	// 清理连接缓存
 	s.connCache = sync.Map{}
+
+	if s.sendOnly {
+		s.log(1, "UDP 服务器已停止 (SendOnly 模式)")
+	} else {
+		s.log(1, "UDP 服务器已停止")
+	}
 }
 
 // =============================================================================
@@ -759,7 +820,3 @@ func (s *UDPServer) log(level int, format string, args ...interface{}) {
 	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
 	fmt.Printf("%s %s [UDP] %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
-
-
-
-
