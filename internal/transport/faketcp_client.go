@@ -1,7 +1,8 @@
 //go:build linux
 
 // =============================================================================
-// internal/transport/faketcp_client.go         增强版 FakeTCP 客户端
+// internal/transport/faketcp_client.go
+// 描述: 增强版 FakeTCP 客户端 - 集成 TLS 指纹伪装
 // =============================================================================
 
 package transport
@@ -15,6 +16,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/mrcgq/211/internal/config"
 )
 
 // FakeTCPClient FakeTCP 客户端 (NAT 穿透增强版)
@@ -40,6 +43,11 @@ type FakeTCPClient struct {
 	// 接收通道
 	recvChan chan []byte
 
+	// TLS 配置
+	tlsConfig  *config.TLSConfig
+	utlsClient *UTLSClient
+	tlsConn    net.Conn // TLS 连接（如果启用）
+
 	// 统计
 	stats FakeTCPStats
 
@@ -58,9 +66,9 @@ type FakeTCPClient struct {
 }
 
 // NewFakeTCPClient 创建 FakeTCP 客户端
-func NewFakeTCPClient(serverAddr string, config *FakeTCPConfig) (*FakeTCPClient, error) {
-	if config == nil {
-		config = DefaultFakeTCPConfig()
+func NewFakeTCPClient(serverAddr string, cfg *FakeTCPConfig) (*FakeTCPClient, error) {
+	if cfg == nil {
+		cfg = DefaultFakeTCPConfig()
 	}
 
 	addr, err := net.ResolveUDPAddr("udp", serverAddr)
@@ -69,7 +77,7 @@ func NewFakeTCPClient(serverAddr string, config *FakeTCPConfig) (*FakeTCPClient,
 	}
 
 	level := 1
-	switch config.LogLevel {
+	switch cfg.LogLevel {
 	case "debug":
 		level = 2
 	case "error":
@@ -77,7 +85,7 @@ func NewFakeTCPClient(serverAddr string, config *FakeTCPConfig) (*FakeTCPClient,
 	}
 
 	return &FakeTCPClient{
-		config:        config,
+		config:        cfg,
 		serverAddr:    addr,
 		logLevel:      level,
 		natMode:       NATModeAuto, // 默认自动检测
@@ -85,6 +93,41 @@ func NewFakeTCPClient(serverAddr string, config *FakeTCPConfig) (*FakeTCPClient,
 		maxRetries:    3,
 		retryInterval: 500 * time.Millisecond,
 	}, nil
+}
+
+// NewFakeTCPClientWithTLS 创建带 TLS 的 FakeTCP 客户端
+func NewFakeTCPClientWithTLS(serverAddr string, cfg *FakeTCPConfig, tlsCfg *config.TLSConfig) (*FakeTCPClient, error) {
+	client, err := NewFakeTCPClient(serverAddr, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if tlsCfg != nil && tlsCfg.Enabled {
+		client.tlsConfig = tlsCfg
+
+		// 创建 uTLS 客户端
+		utlsConfig := &UTLSConfig{
+			ServerName:         tlsCfg.GetEffectiveSNI(),
+			Fingerprint:        Fingerprint(tlsCfg.Fingerprint),
+			InsecureSkipVerify: !tlsCfg.VerifyCert,
+			ALPN:               tlsCfg.ALPN,
+			MinVersion:         ParseTLSVersion(tlsCfg.MinVersion),
+			MaxVersion:         ParseTLSVersion(tlsCfg.MaxVersion),
+			FragmentEnabled:    tlsCfg.FragmentEnabled,
+			FragmentSize:       tlsCfg.FragmentSize,
+			FragmentSleepMs:    tlsCfg.FragmentSleepMs,
+			PaddingEnabled:     tlsCfg.PaddingEnabled,
+			PaddingMinSize:     tlsCfg.PaddingMinSize,
+			PaddingMaxSize:     tlsCfg.PaddingMaxSize,
+			EnableECH:          tlsCfg.EnableECH,
+			HandshakeTimeout:   10 * time.Second,
+			LogLevel:           client.logLevel,
+		}
+
+		client.utlsClient = NewUTLSClient(utlsConfig)
+	}
+
+	return client, nil
 }
 
 // SetNATMode 设置 NAT 穿透模式
@@ -159,8 +202,38 @@ func (c *FakeTCPClient) Connect(ctx context.Context) error {
 	case <-c.waitConnected():
 		c.log(1, "FakeTCP 连接已建立: %s (重试 %d 次)",
 			c.serverAddr, atomic.LoadInt32(&c.synRetries))
-		return nil
 	}
+
+	// 步骤 10: 如果启用 TLS，进行 TLS 握手
+	if c.tlsConfig != nil && c.tlsConfig.Enabled {
+		if err := c.upgradeTLS(ctx); err != nil {
+			c.Close()
+			return fmt.Errorf("TLS 握手失败: %w", err)
+		}
+		c.log(1, "TLS 连接已建立: SNI=%s, Fingerprint=%s",
+			c.tlsConfig.GetEffectiveSNI(), c.tlsConfig.Fingerprint)
+	}
+
+	return nil
+}
+
+// upgradeTLS 升级为 TLS 连接
+func (c *FakeTCPClient) upgradeTLS(ctx context.Context) error {
+	if c.utlsClient == nil {
+		return fmt.Errorf("uTLS 客户端未初始化")
+	}
+
+	// 创建 FakeTCP 适配器
+	adapter := NewFakeConnAdapter(c)
+
+	// 使用 uTLS 包装连接
+	tlsConn, err := c.utlsClient.WrapConn(adapter, c.tlsConfig.GetEffectiveSNI())
+	if err != nil {
+		return err
+	}
+
+	c.tlsConn = tlsConn
+	return nil
 }
 
 // createRawSocket 创建原始套接字
@@ -404,6 +477,18 @@ func (c *FakeTCPClient) sendPacket(pkt *FakeTCPPacket) error {
 
 // Send 发送数据
 func (c *FakeTCPClient) Send(data []byte) error {
+	// 如果启用 TLS，通过 TLS 连接发送
+	if c.tlsConn != nil {
+		_, err := c.tlsConn.Write(data)
+		return err
+	}
+
+	// 原始 FakeTCP 发送
+	return c.sendRaw(data)
+}
+
+// sendRaw 原始发送（不经过 TLS）
+func (c *FakeTCPClient) sendRaw(data []byte) error {
 	if atomic.LoadInt32(&c.connected) == 0 {
 		return fmt.Errorf("未连接")
 	}
@@ -444,6 +529,17 @@ func (c *FakeTCPClient) Send(data []byte) error {
 
 // Recv 接收数据
 func (c *FakeTCPClient) Recv(ctx context.Context) ([]byte, error) {
+	// 如果启用 TLS，从 TLS 连接读取
+	if c.tlsConn != nil {
+		buf := make([]byte, 32*1024)
+		n, err := c.tlsConn.Read(buf)
+		if err != nil {
+			return nil, err
+		}
+		return buf[:n], nil
+	}
+
+	// 原始 FakeTCP 接收
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -468,6 +564,12 @@ func (c *FakeTCPClient) RecvNonblock() ([]byte, bool) {
 func (c *FakeTCPClient) Close() error {
 	atomic.StoreInt32(&c.running, 0)
 	atomic.StoreInt32(&c.connected, 0)
+
+	// 关闭 TLS 连接
+	if c.tlsConn != nil {
+		c.tlsConn.Close()
+		c.tlsConn = nil
+	}
 
 	// 发送 FIN
 	if c.session != nil && c.session.State == TCPStateEstablished {
@@ -497,6 +599,11 @@ func (c *FakeTCPClient) Close() error {
 // IsConnected 是否已连接
 func (c *FakeTCPClient) IsConnected() bool {
 	return atomic.LoadInt32(&c.connected) == 1
+}
+
+// IsTLSEnabled 是否启用 TLS
+func (c *FakeTCPClient) IsTLSEnabled() bool {
+	return c.tlsConn != nil
 }
 
 // GetNATMode 获取当前 NAT 模式
