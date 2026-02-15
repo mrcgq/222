@@ -1,8 +1,12 @@
+
+
+
 //go:build linux
 
 // =============================================================================
 // 文件: internal/transport/ebpf.go
 // 描述: eBPF 加速 - 主加速器 (修复 SendTo 实现)
+//       修复：移除自动 fallback 用户态监听，避免端口冲突
 // =============================================================================
 package transport
 
@@ -27,12 +31,12 @@ type EBPFAccelerator struct {
 	// eBPF 加载器
 	loader *EBPFLoader
 
-	// 用户态 UDP 回退
-	fallbackUDP *UDPServer
-	useFallback bool
-
-	// 用户态发送 socket
+	// 用户态发送 socket (不监听，仅发送)
 	sendConn *net.UDPConn
+
+	// 接收连接 (仅在独占模式下使用)
+	recvConn     *net.UDPConn
+	disableListen bool // 是否禁用用户态监听
 
 	// 统计
 	stats            EBPFAcceleratorStats
@@ -102,24 +106,30 @@ func NewEBPFAccelerator(
 }
 
 // Start 启动加速器
-func (e *EBPFAccelerator) Start(ctx context.Context, listenAddr string) error {
+// disableFallback: 是否禁用用户态监听回退 (避免与 UDP 服务器端口冲突)
+func (e *EBPFAccelerator) Start(ctx context.Context, listenAddr string, disableFallback bool) error {
+	e.disableListen = disableFallback
+
 	// 检查 eBPF 支持
 	if !e.checkEBPFSupport() {
-		e.log(1, "eBPF 不可用，回退到用户态 UDP")
-		return e.startFallback(ctx, listenAddr)
+		e.log(1, "eBPF 不可用")
+		if disableFallback {
+			return fmt.Errorf("eBPF 不可用且禁止回退")
+		}
+		return fmt.Errorf("eBPF 不可用")
 	}
 
 	// 加载 eBPF 程序
 	if err := e.loader.Load(); err != nil {
-		e.log(1, "加载 eBPF 程序失败: %v，回退到用户态 UDP", err)
-		return e.startFallback(ctx, listenAddr)
+		e.log(1, "加载 eBPF 程序失败: %v", err)
+		return fmt.Errorf("加载 eBPF 程序失败: %w", err)
 	}
 
 	// 附加到网卡
 	if err := e.loader.Attach(); err != nil {
-		e.log(1, "附加 eBPF 程序失败: %v，回退到用户态 UDP", err)
+		e.log(1, "附加 eBPF 程序失败: %v", err)
 		e.loader.Close()
-		return e.startFallback(ctx, listenAddr)
+		return fmt.Errorf("附加 eBPF 程序失败: %w", err)
 	}
 
 	// 配置端口
@@ -127,8 +137,8 @@ func (e *EBPFAccelerator) Start(ctx context.Context, listenAddr string) error {
 		e.log(1, "配置端口失败: %v", err)
 	}
 
-	// 创建用户态发送 socket
-	if err := e.createSendSocket(listenAddr); err != nil {
+	// 创建用户态发送 socket (使用任意端口，仅用于发送)
+	if err := e.createSendSocket(); err != nil {
 		e.log(1, "创建发送 socket 失败: %v", err)
 	}
 
@@ -150,34 +160,28 @@ func (e *EBPFAccelerator) Start(ctx context.Context, listenAddr string) error {
 	e.wg.Add(1)
 	go e.cleanupLoop()
 
-	// 启动用户态 UDP 处理 (处理需要应用层逻辑的包)
-	e.wg.Add(1)
-	go e.userSpaceLoop(listenAddr)
+	// 仅在非禁用监听模式下启动用户态接收
+	if !e.disableListen {
+		e.wg.Add(1)
+		go e.userSpaceLoop(listenAddr)
+	}
 
 	e.stats.Active = true
 	e.stats.XDPMode = e.loader.GetXDPMode()
 	e.stats.Interface = e.loader.GetInterface()
 	e.stats.ProgramLoaded = true
 
-	e.log(1, "eBPF 加速器已启动: %s (mode: %s)", e.config.Interface, e.loader.GetXDPMode())
+	e.log(1, "eBPF 加速器已启动: %s (mode: %s, listen: %v)",
+		e.config.Interface, e.loader.GetXDPMode(), !e.disableListen)
 	return nil
 }
 
-// createSendSocket 创建用户态发送 socket
-func (e *EBPFAccelerator) createSendSocket(listenAddr string) error {
-	addr, err := net.ResolveUDPAddr("udp", listenAddr)
+// createSendSocket 创建用户态发送 socket (不绑定特定端口)
+func (e *EBPFAccelerator) createSendSocket() error {
+	// 使用任意端口创建 UDP socket，仅用于发送
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return err
-	}
-
-	// 创建一个绑定到本地地址的 UDP socket 用于发送
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		// 如果绑定失败，尝试使用任意端口
-		conn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-		if err != nil {
-			return err
-		}
 	}
 
 	e.sendConn = conn
@@ -265,13 +269,6 @@ func (e *EBPFAccelerator) configureListenPort(listenAddr string) error {
 
 	e.log(2, "eBPF 配置端口: %d", port)
 	return nil
-}
-
-// startFallback 启动用户态回退
-func (e *EBPFAccelerator) startFallback(ctx context.Context, listenAddr string) error {
-	e.useFallback = true
-	e.fallbackUDP = NewUDPServer(listenAddr, e.handler, e.logLevelString())
-	return e.fallbackUDP.Start(ctx)
 }
 
 // eventLoop 事件处理循环
@@ -366,10 +363,6 @@ func (e *EBPFAccelerator) cleanupLoop() {
 
 // cleanupSessions 清理过期会话
 func (e *EBPFAccelerator) cleanupSessions() {
-	if e.useFallback {
-		return
-	}
-
 	now := uint64(time.Now().UnixNano())
 	timeout := uint64(e.config.CleanupInterval.Nanoseconds()) * 10 // 10 倍清理间隔
 
@@ -402,7 +395,7 @@ func (e *EBPFAccelerator) cleanupSessions() {
 	}
 }
 
-// userSpaceLoop 用户态处理循环
+// userSpaceLoop 用户态处理循环 (仅在非禁用监听模式下运行)
 func (e *EBPFAccelerator) userSpaceLoop(listenAddr string) {
 	defer e.wg.Done()
 
@@ -419,11 +412,9 @@ func (e *EBPFAccelerator) userSpaceLoop(listenAddr string) {
 	}
 	defer conn.Close()
 
-	// 保存连接用于发送
+	// 保存连接用于接收
 	e.mu.Lock()
-	if e.sendConn == nil {
-		e.sendConn = conn
-	}
+	e.recvConn = conn
 	e.mu.Unlock()
 
 	// 设置缓冲区
@@ -461,14 +452,8 @@ func (e *EBPFAccelerator) userSpaceLoop(listenAddr string) {
 	}
 }
 
-// SendTo 发送数据 (修复: 实现完整的发送逻辑)
+// SendTo 发送数据
 func (e *EBPFAccelerator) SendTo(data []byte, addr *net.UDPAddr) error {
-	// 如果使用回退模式
-	if e.useFallback && e.fallbackUDP != nil {
-		return e.fallbackUDP.SendTo(data, addr)
-	}
-
-	// 使用用户态 socket 发送
 	e.mu.RLock()
 	conn := e.sendConn
 	e.mu.RUnlock()
@@ -490,13 +475,6 @@ func (e *EBPFAccelerator) SendTo(data []byte, addr *net.UDPAddr) error {
 
 // GetStats 获取统计信息
 func (e *EBPFAccelerator) GetStats() EBPFStats {
-	if e.useFallback {
-		return EBPFStats{
-			PacketsRX: atomic.LoadUint64(&e.packetsProcessed),
-			BytesRX:   atomic.LoadUint64(&e.bytesProcessed),
-		}
-	}
-
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.stats.EBPFStats
@@ -514,7 +492,7 @@ func (e *EBPFAccelerator) GetAcceleratorStats() *EBPFAcceleratorStats {
 
 // IsActive 是否活跃
 func (e *EBPFAccelerator) IsActive() bool {
-	return !e.useFallback && e.loader != nil && e.loader.IsAttached()
+	return e.loader != nil && e.loader.IsAttached()
 }
 
 // Stop 停止加速器
@@ -529,27 +507,16 @@ func (e *EBPFAccelerator) Stop() {
 		e.loader.Close()
 	}
 
-	if e.fallbackUDP != nil {
-		e.fallbackUDP.Stop()
-	}
-
 	if e.sendConn != nil {
 		e.sendConn.Close()
 	}
 
+	if e.recvConn != nil {
+		e.recvConn.Close()
+	}
+
 	e.wg.Wait()
 	e.log(1, "eBPF 加速器已停止")
-}
-
-func (e *EBPFAccelerator) logLevelString() string {
-	switch e.logLevel {
-	case 0:
-		return "error"
-	case 2:
-		return "debug"
-	default:
-		return "info"
-	}
 }
 
 func (e *EBPFAccelerator) log(level int, format string, args ...interface{}) {
@@ -559,3 +526,25 @@ func (e *EBPFAccelerator) log(level int, format string, args ...interface{}) {
 	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
 	fmt.Printf("%s %s [eBPF] %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
