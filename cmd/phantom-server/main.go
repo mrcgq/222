@@ -1,6 +1,6 @@
 // =============================================================================
 // 文件: cmd/phantom-server/main.go
-// 描述: 主程序入口 - 集成 Prometheus 指标和 Cloudflare 隧道
+// 描述: 主程序入口 - 集成 Prometheus 指标、Cloudflare 隧道和 DDNS
 // =============================================================================
 package main
 
@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,11 +34,12 @@ func main() {
 	configPath := flag.String("c", "config.yaml", "配置文件路径")
 	showVersion := flag.Bool("v", false, "显示版本")
 	genPSK := flag.Bool("gen-psk", false, "生成新的 PSK")
+	genConfig := flag.Bool("gen-config", false, "生成示例配置文件")
 	mode := flag.String("mode", "auto", "运行模式: auto/udp/faketcp/websocket/ebpf")
 
 	// 隧道相关参数
 	tunnelMode := flag.String("tunnel", "", "隧道模式: temp/fixed/direct/off")
-	tunnelDomain := flag.String("domain", "", "域名模式: auto/sslip/nip/duckdns/custom")
+	tunnelDomain := flag.String("domain", "", "域名模式: auto/sslip/nip/duckdns/freedns/custom")
 	tunnelCert := flag.String("cert", "", "证书模式: auto/selfsigned/acme/letsencrypt")
 	quickTunnel := flag.Bool("quick", false, "快速启动临时隧道")
 
@@ -46,6 +48,12 @@ func main() {
 	acmeDomains := flag.String("acme-domains", "", "ACME 域名 (逗号分隔)")
 	acmeProvider := flag.String("acme-provider", "letsencrypt", "ACME 提供商: letsencrypt/letsencrypt-staging/zerossl")
 	acmeUseTunnel := flag.Bool("acme-use-tunnel", true, "使用隧道进行 ACME 验证")
+
+	// DDNS 相关参数
+	ddnsProvider := flag.String("ddns", "", "DDNS 提供商: duckdns/freedns/noip/off")
+	ddnsToken := flag.String("ddns-token", "", "DDNS Token")
+	ddnsDomains := flag.String("ddns-domains", "", "DDNS 域名 (逗号分隔)")
+	ddnsInterval := flag.String("ddns-interval", "5m", "DDNS 更新间隔")
 
 	flag.Parse()
 
@@ -57,6 +65,15 @@ func main() {
 	if *genPSK {
 		psk, _ := crypto.GeneratePSK()
 		fmt.Println(psk)
+		return
+	}
+
+	if *genConfig {
+		if err := config.WriteExampleConfig("config.example.yaml"); err != nil {
+			fmt.Fprintf(os.Stderr, "生成配置失败: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("已生成示例配置文件: config.example.yaml")
 		return
 	}
 
@@ -106,12 +123,53 @@ func main() {
 		cfg.Tunnel.ACMEEmail = *acmeEmail
 	}
 	if *acmeDomains != "" {
-		cfg.Tunnel.ACMEDomains = splitDomains(*acmeDomains)
+		cfg.Tunnel.ACMEDomains = splitCommaSeparated(*acmeDomains)
 	}
 	if *acmeProvider != "" {
 		cfg.Tunnel.ACMEProvider = *acmeProvider
 	}
 	cfg.Tunnel.ACMEUseTunnel = *acmeUseTunnel
+
+	// 覆盖 DDNS 配置
+	if *ddnsProvider != "" {
+		if *ddnsProvider == "off" {
+			// 禁用 DDNS
+			cfg.Tunnel.DDNS = nil
+		} else {
+			if cfg.Tunnel.DDNS == nil {
+				cfg.Tunnel.DDNS = &config.DDNSConfig{}
+			}
+			cfg.Tunnel.DDNS.Enabled = true
+			cfg.Tunnel.DDNS.Provider = *ddnsProvider
+
+			if *ddnsToken != "" {
+				cfg.Tunnel.DDNS.Token = *ddnsToken
+				// 同时设置特定提供商的 token
+				switch *ddnsProvider {
+				case "duckdns":
+					cfg.Tunnel.DDNS.DuckDNS.Token = *ddnsToken
+				case "freedns":
+					cfg.Tunnel.DDNS.FreeDNS.Token = *ddnsToken
+				}
+			}
+			if *ddnsDomains != "" {
+				domains := splitCommaSeparated(*ddnsDomains)
+				cfg.Tunnel.DDNS.Domains = domains
+				// 同时设置特定提供商的域名
+				switch *ddnsProvider {
+				case "duckdns":
+					cfg.Tunnel.DDNS.DuckDNS.Domains = domains
+				case "freedns":
+					if len(domains) > 0 {
+						cfg.Tunnel.DDNS.FreeDNS.Domain = domains[0]
+					}
+				}
+			}
+			if *ddnsInterval != "" {
+				cfg.Tunnel.DDNS.UpdateInterval = *ddnsInterval
+			}
+		}
+	}
 
 	// 创建加密器
 	cry, err := crypto.New(cfg.PSK, cfg.TimeWindow)
@@ -208,17 +266,17 @@ func main() {
 	sw.Stop()
 }
 
-// splitDomains 分割域名字符串
-func splitDomains(s string) []string {
+// splitCommaSeparated 分割逗号分隔的字符串
+func splitCommaSeparated(s string) []string {
 	if s == "" {
 		return nil
 	}
-	var domains []string
+	var result []string
 	current := ""
 	for _, c := range s {
 		if c == ',' || c == ' ' {
 			if current != "" {
-				domains = append(domains, current)
+				result = append(result, strings.TrimSpace(current))
 				current = ""
 			}
 		} else {
@@ -226,9 +284,9 @@ func splitDomains(s string) []string {
 		}
 	}
 	if current != "" {
-		domains = append(domains, current)
+		result = append(result, strings.TrimSpace(current))
 	}
-	return domains
+	return result
 }
 
 // =============================================================================
@@ -449,14 +507,36 @@ func printVersion() {
 	fmt.Println("  - fixed     : Cloudflare 固定隧道 (需要 token)")
 	fmt.Println("  - direct    : 直接 TCP 隧道")
 	fmt.Println()
+	fmt.Println("域名模式:")
+	fmt.Println("  - auto      : Cloudflare 自动域名")
+	fmt.Println("  - sslip     : sslip.io 域名")
+	fmt.Println("  - nip       : nip.io 域名")
+	fmt.Println("  - duckdns   : DuckDNS 动态域名 (推荐)")
+	fmt.Println("  - freedns   : FreeDNS 动态域名")
+	fmt.Println("  - custom    : 自定义域名")
+	fmt.Println()
 	fmt.Println("证书模式:")
 	fmt.Println("  - auto        : Cloudflare 自动 TLS")
 	fmt.Println("  - selfsigned  : 自签名证书")
 	fmt.Println("  - acme        : ACME 自动证书 (Let's Encrypt)")
 	fmt.Println("  - letsencrypt : Let's Encrypt (acme 别名)")
 	fmt.Println()
-	fmt.Println("ACME 示例:")
-	fmt.Println("  --cert acme --acme-email you@example.com --acme-domains example.com")
+	fmt.Println("DDNS 提供商:")
+	fmt.Println("  - duckdns   : DuckDNS (免费, 推荐)")
+	fmt.Println("  - freedns   : FreeDNS afraid.org")
+	fmt.Println("  - noip      : No-IP Dynamic DNS")
+	fmt.Println()
+	fmt.Println("使用示例:")
+	fmt.Println("  # 快速启动临时隧道")
+	fmt.Println("  phantom-server -c config.yaml --quick")
+	fmt.Println()
+	fmt.Println("  # 使用 DuckDNS")
+	fmt.Println("  phantom-server -c config.yaml --domain duckdns \\")
+	fmt.Println("    --ddns duckdns --ddns-token YOUR_TOKEN --ddns-domains myserver")
+	fmt.Println()
+	fmt.Println("  # 使用 ACME 证书")
+	fmt.Println("  phantom-server -c config.yaml --cert acme \\")
+	fmt.Println("    --acme-email you@example.com --acme-domains example.com")
 	fmt.Println()
 	fmt.Println("监控:")
 	fmt.Println("  - /metrics  : Prometheus 格式指标")
@@ -467,12 +547,13 @@ func printBanner(cfg *config.Config, sw *switcher.Switcher, tm *tunnel.TunnelMan
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║         Phantom Server v4.0 - Ultimate Edition                   ║")
-	fmt.Println("║         eBPF + Hysteria2 + FakeTCP + WebSocket/CDN               ║")
+	fmt.Println("║         eBPF + Hysteria2 + FakeTCP + WebSocket/CDN + DDNS        ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════════════╣")
 	fmt.Printf("║  主模式: %-55s ║\n", sw.CurrentMode())
 	fmt.Printf("║  监听端口: %-53s ║\n", formatListenPorts(cfg))
 	fmt.Printf("║  时间窗口: %-53s ║\n", fmt.Sprintf("%d 秒", cfg.TimeWindow))
 
+	// 显示隧道信息
 	if tm != nil && tm.IsRunning() {
 		fmt.Println("╠══════════════════════════════════════════════════════════════════╣")
 		fmt.Println("║  Cloudflare 隧道:                                                ║")
@@ -499,6 +580,27 @@ func printBanner(cfg *config.Config, sw *switcher.Switcher, tm *tunnel.TunnelMan
 		}
 	}
 
+	// 显示 DDNS 信息
+	if tm != nil && tm.GetDDNSManager() != nil && tm.GetDDNSManager().IsRunning() {
+		ddnsMgr := tm.GetDDNSManager()
+		stats := ddnsMgr.GetStats()
+		fmt.Println("╠══════════════════════════════════════════════════════════════════╣")
+		fmt.Println("║  DDNS 动态域名:                                                  ║")
+		if provider, ok := stats["provider"].(string); ok {
+			fmt.Printf("║    提供商: %-55s ║\n", provider)
+		}
+		if ip, ok := stats["current_ip"].(string); ok && ip != "" {
+			fmt.Printf("║    当前 IP: %-54s ║\n", ip)
+		}
+		if lastUpdate, ok := stats["last_update_ago"].(string); ok {
+			fmt.Printf("║    上次更新: %-53s ║\n", lastUpdate)
+		}
+		if updateCount, ok := stats["update_count"].(uint64); ok {
+			fmt.Printf("║    更新次数: %-53d ║\n", updateCount)
+		}
+	}
+
+	// 显示 Metrics 信息
 	if ms != nil {
 		fmt.Println("╠══════════════════════════════════════════════════════════════════╣")
 		fmt.Printf("║  Prometheus: http://localhost%s%-35s ║\n", cfg.Metrics.Listen, cfg.Metrics.Path)
@@ -526,6 +628,9 @@ func printBanner(cfg *config.Config, sw *switcher.Switcher, tm *tunnel.TunnelMan
 		fmt.Println("║    ✓ Cloudflare 隧道 (全球加速)                                  ║")
 		if tm.GetCertManager() != nil {
 			fmt.Println("║    ✓ ACME 自动证书管理                                           ║")
+		}
+		if tm.GetDDNSManager() != nil && tm.GetDDNSManager().IsRunning() {
+			fmt.Println("║    ✓ DDNS 动态域名 (IP 自动更新)                                 ║")
 		}
 	}
 	fmt.Println("║    ✓ TSKD 0-RTT 认证                                             ║")
