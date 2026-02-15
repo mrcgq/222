@@ -31,8 +31,8 @@ func NewEBPFAccelerator(
 }
 
 // Start 总是返回错误，因为非 Linux 不支持 eBPF
-func (e *EBPFAccelerator) Start(ctx context.Context, listenAddr string, disableFallback bool) error {
-    return fmt.Errorf("eBPF not supported on this platform")
+func (e *EBPFAccelerator) Start(ctx context.Context, listenAddr string) error {
+	return fmt.Errorf("eBPF not supported on this platform")
 }
 
 // Stop 空操作
