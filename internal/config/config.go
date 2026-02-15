@@ -2,6 +2,7 @@
 // 文件: internal/config/config.go
 // 描述: 配置管理 - 修复配置隐性关联、端口冲突检测、ARQ 优先级验证
 //       增加 ACME 自动证书配置支持、DDNS 动态域名支持和 TLS 指纹伪装配置
+//       新增：eBPF/UDP 互斥标记
 // =============================================================================
 package config
 
@@ -11,7 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"  
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -133,14 +134,15 @@ type WebSocketConfig struct {
 
 // EBPFConfig eBPF 配置
 type EBPFConfig struct {
-	Enabled     bool   `yaml:"enabled"`
-	Interface   string `yaml:"interface"`
-	XDPMode     string `yaml:"xdp_mode"`
-	ProgramPath string `yaml:"program_path"`
-	MapSize     int    `yaml:"map_size"`
-	EnableStats bool   `yaml:"enable_stats"`
-	EnableTC    bool   `yaml:"enable_tc"`
-	TCFakeTCP   bool   `yaml:"tc_faketcp"`
+	Enabled       bool   `yaml:"enabled"`
+	Interface     string `yaml:"interface"`
+	XDPMode       string `yaml:"xdp_mode"`
+	ProgramPath   string `yaml:"program_path"`
+	MapSize       int    `yaml:"map_size"`
+	EnableStats   bool   `yaml:"enable_stats"`
+	EnableTC      bool   `yaml:"enable_tc"`
+	TCFakeTCP     bool   `yaml:"tc_faketcp"`
+	DisableListen bool   `yaml:"disable_listen"` // 新增：禁用用户态监听（eBPF 独占模式）
 }
 
 // SwitcherConfig 链路切换配置
@@ -326,11 +328,12 @@ func DefaultConfig() *Config {
 		},
 
 		EBPF: EBPFConfig{
-			Enabled:   false,
-			XDPMode:   "generic",
-			MapSize:   65536,
-			EnableTC:  false,
-			TCFakeTCP: false,
+			Enabled:       false,
+			XDPMode:       "generic",
+			MapSize:       65536,
+			EnableTC:      false,
+			TCFakeTCP:     false,
+			DisableListen: false, // 默认不禁用
 		},
 
 		Switcher: SwitcherConfig{
@@ -535,7 +538,7 @@ func (c *Config) validateTLSConfig() error {
 	validFingerprints := map[string]bool{
 		"chrome": true, "firefox": true, "safari": true, "ios": true,
 		"android": true, "edge": true, "qq": true, "360": true,
-		"random": true, "custom": true, "":true,
+		"random": true, "custom": true, "": true,
 	}
 	if !validFingerprints[strings.ToLower(c.TLS.Fingerprint)] {
 		return fmt.Errorf("tls.fingerprint 无效: %s (支持: chrome, firefox, safari, ios, android, edge, qq, 360, random)", c.TLS.Fingerprint)
@@ -1262,6 +1265,7 @@ ebpf:
   map_size: 65536                   # eBPF Map 大小
   enable_tc: false                  # 启用 TC
   tc_faketcp: false                 # TC FakeTCP 模式
+  disable_listen: false             # 禁用用户态监听 (eBPF 独占模式)
 
 # 链路切换器
 switcher:
