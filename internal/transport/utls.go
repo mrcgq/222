@@ -228,10 +228,11 @@ func (c *UTLSClient) DialWithConn(ctx context.Context, conn net.Conn, network, a
 	}
 
 	// 如果启用 ECH 且有配置
-	if c.config.EnableECH && len(c.config.ECHConfigs) > 0 {
-		tlsConfig.EncryptedClientHelloConfigList = c.config.ECHConfigs
-		atomic.AddUint64(&c.stats.ECHUsed, 1)
-	}
+    if c.config.EnableECH && len(c.config.ECHConfigs) > 0 {
+    // uTLS 中对应的字段名称是 ECHConfigs
+    tlsConfig.ECHConfigs = c.config.ECHConfigs
+    atomic.AddUint64(&c.stats.ECHUsed, 1)
+    }
 
 	// 创建 uTLS 连接
 	clientHelloID := c.getClientHelloID()
