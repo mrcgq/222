@@ -1,6 +1,6 @@
 // =============================================================================
 // 文件: internal/tunnel/tunnel.go
-// 描述: 隧道管理器 - 整合 Cloudflare 隧道和证书管理
+// 描述: 隧道管理器 - 整合 Cloudflare 隧道、证书管理和 DDNS
 // =============================================================================
 package tunnel
 
@@ -57,6 +57,21 @@ type TunnelConfig struct {
 	DuckDNSToken  string `yaml:"duckdns_token"`
 	DuckDNSDomain string `yaml:"duckdns_domain"`
 
+	// DuckDNS 结构体配置
+	DuckDNS struct {
+		Token   string `yaml:"token"`
+		Domains string `yaml:"domains"`
+	} `yaml:"duckdns"`
+
+	// FreeDNS 配置
+	FreeDNS struct {
+		Token  string `yaml:"token"`
+		Domain string `yaml:"domain"`
+	} `yaml:"freedns"`
+
+	// DDNS 完整配置
+	DDNS *DDNSConfig `yaml:"ddns"`
+
 	// 日志级别
 	LogLevel string `yaml:"log_level"`
 }
@@ -94,6 +109,19 @@ func FromConfigTunnelConfig(cfg *config.TunnelConfig) *TunnelConfig {
 		DuckDNSToken:  cfg.GetDuckDNSToken(),
 		DuckDNSDomain: cfg.GetDuckDNSDomain(),
 		LogLevel:      cfg.LogLevel,
+	}
+
+	// 复制 DuckDNS 结构体配置
+	tc.DuckDNS.Token = cfg.DuckDNS.Token
+	tc.DuckDNS.Domains = cfg.DuckDNS.Domains
+
+	// 复制 FreeDNS 配置
+	tc.FreeDNS.Token = cfg.FreeDNS.Token
+	tc.FreeDNS.Domain = cfg.FreeDNS.Domain
+
+	// 转换 DDNS 配置
+	if cfg.DDNS != nil && cfg.DDNS.Enabled {
+		tc.DDNS = convertDDNSConfig(cfg.DDNS)
 	}
 
 	// 转换证书配置
@@ -144,6 +172,54 @@ func FromConfigTunnelConfig(cfg *config.TunnelConfig) *TunnelConfig {
 	return tc
 }
 
+// convertDDNSConfig 转换 DDNS 配置
+func convertDDNSConfig(cfg *config.DDNSConfig) *DDNSConfig {
+	if cfg == nil {
+		return nil
+	}
+
+	ddns := &DDNSConfig{
+		Enabled:        cfg.Enabled,
+		Provider:       DDNSProvider(cfg.Provider),
+		UpdateInterval: parseDuration(cfg.UpdateInterval, 5*time.Minute),
+		Token:          cfg.Token,
+		Domains:        cfg.Domains,
+	}
+
+	// DuckDNS
+	ddns.DuckDNS = DuckDNSConfig{
+		Token:   cfg.DuckDNS.Token,
+		Domains: cfg.DuckDNS.Domains,
+	}
+
+	// FreeDNS
+	ddns.FreeDNS = FreeDNSConfig{
+		Token:  cfg.FreeDNS.Token,
+		Domain: cfg.FreeDNS.Domain,
+	}
+
+	// No-IP
+	ddns.NoIP = NoIPConfig{
+		Username: cfg.NoIP.Username,
+		Password: cfg.NoIP.Password,
+		Hostname: cfg.NoIP.Hostname,
+	}
+
+	return ddns
+}
+
+// parseDuration 解析时间间隔
+func parseDuration(s string, defaultVal time.Duration) time.Duration {
+	if s == "" {
+		return defaultVal
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return defaultVal
+	}
+	return d
+}
+
 // =============================================================================
 // 隧道管理器
 // =============================================================================
@@ -157,6 +233,7 @@ type TunnelManager struct {
 	privManager *PrivilegeManager
 	runner      *CloudflaredRunner
 	certManager *CertManager
+	ddnsManager *DDNSManager // DDNS 管理器
 
 	// 验证隧道（用于 ACME）
 	validationRunner    *CloudflaredRunner
@@ -208,6 +285,12 @@ func (tm *TunnelManager) Start(ctx context.Context) error {
 	tm.ctx, tm.cancel = context.WithCancel(ctx)
 	tm.startTime = time.Now()
 
+	// 0. 启动 DDNS（如果配置了）
+	if err := tm.startDDNS(); err != nil {
+		tm.log(0, "DDNS 启动失败: %v (继续运行)", err)
+		// 不阻止启动
+	}
+
 	// 1. 设置域名
 	if err := tm.setupDomain(); err != nil {
 		return fmt.Errorf("设置域名失败: %w", err)
@@ -240,6 +323,11 @@ func (tm *TunnelManager) Stop() {
 		tm.cancel()
 	}
 
+	// 停止 DDNS 管理器
+	if tm.ddnsManager != nil {
+		tm.ddnsManager.Stop()
+	}
+
 	// 停止主隧道
 	if tm.runner != nil {
 		if err := tm.runner.Stop(); err != nil {
@@ -263,6 +351,105 @@ func (tm *TunnelManager) Stop() {
 	tm.tunnelURL = ""
 	tm.domain = ""
 	tm.validationTunnelURL = ""
+}
+
+// =============================================================================
+// DDNS 启动
+// =============================================================================
+
+// startDDNS 启动 DDNS 管理器
+func (tm *TunnelManager) startDDNS() error {
+	// 检查是否需要 DDNS
+	needsDDNS := tm.config.DomainMode == DomainDuckDNS ||
+		tm.config.DomainMode == DomainFreeDNS ||
+		(tm.config.DDNS != nil && tm.config.DDNS.Enabled)
+
+	if !needsDDNS {
+		return nil
+	}
+
+	// 构建 DDNS 配置
+	var ddnsCfg *DDNSConfig
+
+	if tm.config.DDNS != nil && tm.config.DDNS.Enabled {
+		// 使用完整 DDNS 配置
+		ddnsCfg = tm.config.DDNS
+	} else {
+		// 根据域名模式构建 DDNS 配置
+		ddnsCfg = &DDNSConfig{
+			Enabled:        true,
+			UpdateInterval: 5 * time.Minute,
+			LogLevel:       tm.logLevel,
+		}
+
+		switch tm.config.DomainMode {
+		case DomainDuckDNS:
+			ddnsCfg.Provider = DDNSProviderDuckDNS
+			// 优先使用简化配置
+			token := tm.config.DuckDNSToken
+			if token == "" {
+				token = tm.config.DuckDNS.Token
+			}
+			domains := tm.config.DuckDNSDomain
+			if domains == "" {
+				domains = tm.config.DuckDNS.Domains
+			}
+			ddnsCfg.DuckDNS = DuckDNSConfig{
+				Token:   token,
+				Domains: splitDomains(domains),
+			}
+
+		case DomainFreeDNS:
+			ddnsCfg.Provider = DDNSProviderFreeDNS
+			ddnsCfg.FreeDNS = FreeDNSConfig{
+				Token:  tm.config.FreeDNS.Token,
+				Domain: tm.config.FreeDNS.Domain,
+			}
+		}
+	}
+
+	// 验证配置
+	if ddnsCfg.Provider == "" {
+		return fmt.Errorf("DDNS 提供商未配置")
+	}
+
+	// 创建 DDNS 管理器
+	tm.ddnsManager = NewDDNSManager(ddnsCfg)
+
+	// 设置回调
+	tm.ddnsManager.onIPChanged = func(oldIP, newIP string) {
+		tm.log(1, "公网 IP 已变更: %s -> %s", oldIP, newIP)
+	}
+	tm.ddnsManager.onUpdateError = func(err error) {
+		tm.log(0, "DDNS 更新错误: %v", err)
+	}
+
+	// 启动 DDNS 管理器
+	tm.log(1, "启动 DDNS 管理器 (提供商: %s)", ddnsCfg.Provider)
+	return tm.ddnsManager.Start(tm.ctx)
+}
+
+// splitDomains 分割域名字符串
+func splitDomains(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var domains []string
+	current := ""
+	for _, c := range s {
+		if c == ',' || c == ' ' {
+			if current != "" {
+				domains = append(domains, current)
+				current = ""
+			}
+		} else {
+			current += string(c)
+		}
+	}
+	if current != "" {
+		domains = append(domains, current)
+	}
+	return domains
 }
 
 // =============================================================================
@@ -299,14 +486,50 @@ func (tm *TunnelManager) setupDomain() error {
 
 	case DomainDuckDNS:
 		// 使用 DuckDNS
-		if tm.config.DuckDNSToken == "" || tm.config.DuckDNSDomain == "" {
+		token := tm.config.DuckDNSToken
+		if token == "" {
+			token = tm.config.DuckDNS.Token
+		}
+		domain := tm.config.DuckDNSDomain
+		if domain == "" {
+			domain = tm.config.DuckDNS.Domains
+		}
+
+		if token == "" || domain == "" {
 			return fmt.Errorf("DuckDNS 需要配置 token 和 domain")
 		}
-		if err := tm.updateDuckDNS(); err != nil {
-			return fmt.Errorf("更新 DuckDNS 失败: %w", err)
-		}
-		tm.domain = tm.config.DuckDNSDomain + ".duckdns.org"
+
+		// 设置域名（DDNS 管理器会自动更新 IP）
+		tm.domain = GetDuckDNSDomain(domain)
 		tm.log(1, "使用 DuckDNS 域名: %s", tm.domain)
+
+		// 如果 DDNS 管理器还没有更新过，等待首次更新
+		if tm.ddnsManager != nil && tm.ddnsManager.GetCurrentIP() == "" {
+			tm.log(1, "等待 DDNS 首次更新...")
+			if err := tm.ddnsManager.ForceUpdate(); err != nil {
+				tm.log(0, "DuckDNS 首次更新失败: %v (继续运行)", err)
+			}
+		}
+		return nil
+
+	case DomainFreeDNS:
+		// 使用 FreeDNS
+		if tm.config.FreeDNS.Token == "" {
+			return fmt.Errorf("FreeDNS 需要配置 token")
+		}
+
+		tm.domain = tm.config.FreeDNS.Domain
+		if tm.domain == "" {
+			return fmt.Errorf("FreeDNS 需要配置 domain")
+		}
+		tm.log(1, "使用 FreeDNS 域名: %s", tm.domain)
+
+		// 触发 DDNS 更新
+		if tm.ddnsManager != nil && tm.ddnsManager.GetCurrentIP() == "" {
+			if err := tm.ddnsManager.ForceUpdate(); err != nil {
+				tm.log(0, "FreeDNS 首次更新失败: %v (继续运行)", err)
+			}
+		}
 		return nil
 
 	case DomainCustom:
@@ -642,39 +865,15 @@ func (tm *TunnelManager) ensureCloudflared() (string, error) {
 
 // getPublicIP 获取公网 IP
 func (tm *TunnelManager) getPublicIP() (string, error) {
-	// 使用多个服务尝试获取 IP
-	services := []string{
-		"https://api.ipify.org",
-		"https://ifconfig.me/ip",
-		"https://icanhazip.com",
-	}
-
-	for _, svc := range services {
-		ip, err := fetchURL(svc, 5*time.Second)
-		if err == nil && ip != "" {
-			return trimSpace(ip), nil
+	// 如果 DDNS 管理器有缓存的 IP，优先使用
+	if tm.ddnsManager != nil {
+		if ip := tm.ddnsManager.GetCurrentIP(); ip != "" {
+			return ip, nil
 		}
 	}
 
-	return "", fmt.Errorf("无法获取公网 IP")
-}
-
-// updateDuckDNS 更新 DuckDNS
-func (tm *TunnelManager) updateDuckDNS() error {
-	reqURL := fmt.Sprintf("https://www.duckdns.org/update?domains=%s&token=%s",
-		tm.config.DuckDNSDomain, tm.config.DuckDNSToken)
-
-	resp, err := fetchURL(reqURL, 10*time.Second)
-	if err != nil {
-		return err
-	}
-
-	resp = trimSpace(resp)
-	if resp != "OK" {
-		return fmt.Errorf("DuckDNS 更新失败: %s", resp)
-	}
-
-	return nil
+	// 否则重新获取
+	return GetPublicIP(nil)
 }
 
 // ipToDomain 将 IP 转换为域名格式（用于 sslip.io, nip.io）
@@ -786,6 +985,11 @@ func (tm *TunnelManager) GetCertManager() *CertManager {
 	return tm.certManager
 }
 
+// GetDDNSManager 获取 DDNS 管理器
+func (tm *TunnelManager) GetDDNSManager() *DDNSManager {
+	return tm.ddnsManager
+}
+
 // GetStatus 获取状态
 func (tm *TunnelManager) GetStatus() map[string]interface{} {
 	tm.mu.RLock()
@@ -815,6 +1019,11 @@ func (tm *TunnelManager) GetStatus() map[string]interface{} {
 
 	if tm.certManager != nil {
 		status["cert"] = tm.certManager.GetCertInfo()
+	}
+
+	// DDNS 状态
+	if tm.ddnsManager != nil && tm.ddnsManager.IsRunning() {
+		status["ddns"] = tm.ddnsManager.GetStats()
 	}
 
 	return status
