@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Phantom Server 一键安装脚本 v5.0
-# 设计理念：新手友好，一路回车就能用
+# Phantom Server 一键安装脚本 v5.1
+# 修复：PSK 长度改为 32 字节
 # =============================================================================
 
-# 确保交互可用
 [[ ! -t 0 ]] && exec 0</dev/tty
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -15,14 +14,12 @@ CONFIG_DIR="/etc/phantom"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 SERVICE_FILE="/etc/systemd/system/phantom.service"
 
-# 下载源（多个备用）
 DOWNLOAD_URLS=(
     "https://github.com/mrcgq/222/releases/latest/download"
     "https://ghproxy.com/https://github.com/mrcgq/222/releases/latest/download"
     "https://mirror.ghproxy.com/https://github.com/mrcgq/222/releases/latest/download"
 )
 
-# 颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -39,7 +36,7 @@ print_logo() {
     echo -e "${CYAN}"
     echo '  ____  _                 _                  '
     echo ' |  _ \| |__   __ _ _ __ | |_ ___  _ __ ___  '
-    echo ' | |_) | '"'"'_ \ / _` | '"'"'_ \| __/ _ \| '"'"'_ ` _ \ '
+    echo ' | |_) |  _ \ / _` |  _ \| __/ _ \|  _ ` _ \ '
     echo ' |  __/| | | | (_| | | | | || (_) | | | | | |'
     echo ' |_|   |_| |_|\__,_|_| |_|\__\___/|_| |_| |_|'
     echo -e "${NC}"
@@ -50,7 +47,6 @@ info()    { echo -e "${GREEN}[✓]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
 error()   { echo -e "${RED}[✗]${NC} $1"; }
 step()    { echo -e "${BLUE}${BOLD}==>${NC} $1"; }
-ask()     { echo -e "${CYAN}[?]${NC} $1"; }
 
 press_enter() {
     echo ""
@@ -60,7 +56,6 @@ press_enter() {
 confirm() {
     local prompt="$1"
     local default="${2:-y}"
-    
     if [[ "$default" == "y" ]]; then
         read -rp "$prompt [Y/n]: " choice
         [[ -z "$choice" || "$choice" =~ ^[Yy]$ ]]
@@ -70,7 +65,6 @@ confirm() {
     fi
 }
 
-# 检测系统
 get_arch() {
     case "$(uname -m)" in
         x86_64)  echo "amd64" ;;
@@ -86,34 +80,40 @@ get_iface() {
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error "请使用 root 权限运行此脚本"
-        echo "  sudo bash $0"
+        error "请使用 root 权限运行"
         exit 1
     fi
 }
 
-check_system() {
-    if [[ ! -f /etc/os-release ]]; then
-        error "不支持的操作系统"
-        exit 1
+# 【修复】生成 32 字节 PSK
+generate_psk() {
+    # 方法1: 使用 openssl 生成 32 字节并 base64 编码
+    # 32 字节 = 256 位，base64 后约 44 字符，取前 32 个可打印字符
+    local psk=""
+    
+    if command -v openssl &>/dev/null; then
+        # 生成 32 字节随机数，转为 hex（64字符），取前32字符
+        psk=$(openssl rand -hex 16)
+    else
+        # 备用方案
+        psk=$(head -c 32 /dev/urandom | xxd -p | head -c 32)
     fi
     
-    # 检查必要工具
-    for cmd in curl systemctl; do
-        if ! command -v $cmd &>/dev/null; then
-            error "缺少必要工具: $cmd"
-            exit 1
-        fi
-    done
+    # 确保长度正好 32
+    if [[ ${#psk} -lt 32 ]]; then
+        psk="${psk}$(printf '%0*d' $((32 - ${#psk})) 0)"
+    fi
+    psk="${psk:0:32}"
+    
+    echo "$psk"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 下载函数（多源备用）
+# 下载函数
 # ─────────────────────────────────────────────────────────────────────────────
 download_file() {
     local filename="$1"
     local output="$2"
-    local success=false
     
     for base_url in "${DOWNLOAD_URLS[@]}"; do
         local url="${base_url}/${filename}"
@@ -122,14 +122,12 @@ download_file() {
         if curl -fsSL --connect-timeout 10 -o "$output" "$url" 2>/dev/null; then
             if [[ -s "$output" ]]; then
                 echo -e "${GREEN}成功${NC}"
-                success=true
-                break
+                return 0
             fi
         fi
         echo -e "${RED}失败${NC}"
     done
-    
-    $success
+    return 1
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,7 +154,7 @@ yaml_set_section() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 核心安装流程（引导式）
+# 引导式安装
 # ─────────────────────────────────────────────────────────────────────────────
 guided_install() {
     print_logo
@@ -181,14 +179,14 @@ guided_install() {
     
     # 端口
     local default_port=54321
-    ask "监听端口"
+    echo -e "${CYAN}[?]${NC} 监听端口"
     read -rp "  直接回车使用 ${default_port}: " input_port
     local PORT=${input_port:-$default_port}
     info "端口: ${PORT}"
     
-    # PSK
-    local PSK=$(openssl rand -base64 16 2>/dev/null | tr -d '=+/' | head -c 16)
-    info "PSK 密钥已自动生成: ${CYAN}${PSK}${NC}"
+    # 【修复】PSK - 生成 32 字节
+    local PSK=$(generate_psk)
+    info "PSK 密钥已自动生成 (32字节): ${CYAN}${PSK}${NC}"
     echo "  (请保存此密钥，客户端连接时需要)"
     
     # ─────────────────────────────────────────────────────────────────────────
@@ -201,18 +199,18 @@ guided_install() {
     echo ""
     echo "你希望如何访问服务器？"
     echo ""
-    echo "  ${CYAN}1${NC}. 使用服务器 IP 直连 ${GREEN}(最简单)${NC}"
-    echo "  ${CYAN}2${NC}. 使用 Cloudflare 隧道 ${GREEN}(推荐，免费隐藏IP)${NC}"
-    echo "  ${CYAN}3${NC}. 使用自己的域名"
+    echo -e "  ${CYAN}1${NC}. 使用服务器 IP 直连 ${GREEN}(最简单)${NC}"
+    echo -e "  ${CYAN}2${NC}. 使用 Cloudflare 隧道 ${GREEN}(推荐，免费隐藏IP)${NC}"
+    echo -e "  ${CYAN}3${NC}. 使用自己的域名"
     echo ""
     read -rp "请选择 [1-3，默认 1]: " conn_choice
     conn_choice=${conn_choice:-1}
     
     local USE_TUNNEL=false
-    local USE_DOMAIN=false
-    local DOMAIN=""
+    local TUNNEL_MODE="temp"
     local CF_TOKEN=""
-    local TUNNEL_MODE=""
+    local DOMAIN=""
+    local CERT_MODE="none"
     
     case $conn_choice in
         2)
@@ -220,11 +218,10 @@ guided_install() {
             echo ""
             echo "Cloudflare 隧道有两种模式："
             echo ""
-            echo "  ${CYAN}a${NC}. 临时隧道 - 无需配置，但域名每次重启会变"
-            echo "  ${CYAN}b${NC}. 固定隧道 - 需要 CF 账号，域名永久固定"
+            echo -e "  ${CYAN}a${NC}. 临时隧道 - 无需配置，但域名每次重启会变"
+            echo -e "  ${CYAN}b${NC}. 固定隧道 - 需要 CF 账号，域名永久固定"
             echo ""
             read -rp "选择模式 [a/b，默认 a]: " tunnel_choice
-            tunnel_choice=${tunnel_choice:-a}
             
             if [[ "$tunnel_choice" == "b" ]]; then
                 TUNNEL_MODE="fixed"
@@ -239,35 +236,32 @@ guided_install() {
                     warn "未输入 Token，将使用临时隧道"
                     TUNNEL_MODE="temp"
                 fi
-            else
-                TUNNEL_MODE="temp"
             fi
             info "隧道模式: ${TUNNEL_MODE}"
             ;;
         3)
-            USE_DOMAIN=true
             echo ""
             read -rp "请输入你的域名 (如 vpn.example.com): " DOMAIN
-            if [[ -z "$DOMAIN" ]]; then
-                warn "未输入域名，将使用 IP 直连"
-                USE_DOMAIN=false
-            else
+            if [[ -n "$DOMAIN" ]]; then
                 info "域名: ${DOMAIN}"
-                
                 echo ""
                 echo "是否需要自动申请 SSL 证书？"
-                echo "  ${CYAN}1${NC}. 是，使用 Let's Encrypt 免费证书 ${GREEN}(推荐)${NC}"
-                echo "  ${CYAN}2${NC}. 否，我有自己的证书"
-                echo "  ${CYAN}3${NC}. 否，不使用 HTTPS"
+                echo -e "  ${CYAN}1${NC}. 是，使用 Let's Encrypt ${GREEN}(推荐)${NC}"
+                echo -e "  ${CYAN}2${NC}. 否，我有自己的证书"
+                echo -e "  ${CYAN}3${NC}. 否，不使用 HTTPS"
                 echo ""
                 read -rp "选择 [1-3，默认 1]: " cert_choice
-                cert_choice=${cert_choice:-1}
+                case ${cert_choice:-1} in
+                    1) CERT_MODE="acme" ;;
+                    2) CERT_MODE="manual" ;;
+                    *) CERT_MODE="none" ;;
+                esac
             fi
             ;;
     esac
     
     # ─────────────────────────────────────────────────────────────────────────
-    # 第三步：下载安装
+    # 第三步：下载程序
     # ─────────────────────────────────────────────────────────────────────────
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -278,19 +272,16 @@ guided_install() {
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
     
     local arch=$(get_arch)
-    local binary_name="phantom-server-linux-${arch}"
-    
     info "检测系统: linux/${arch}"
     echo ""
-    echo "正在下载程序..."
     
-    # 检查本地文件
+    # 检查本地/已安装文件
     if [[ -f "./phantom-server" ]]; then
         info "发现本地文件，使用本地版本"
         cp "./phantom-server" "$INSTALL_DIR/phantom-server"
         chmod +x "$INSTALL_DIR/phantom-server"
-    elif [[ -f "$INSTALL_DIR/phantom-server" ]]; then
-        if confirm "  发现已安装版本，是否重新下载？" "n"; then
+    elif [[ -x "$INSTALL_DIR/phantom-server" ]]; then
+        if confirm "发现已安装版本，是否重新下载？" "n"; then
             rm -f "$INSTALL_DIR/phantom-server"
         else
             info "使用现有版本"
@@ -299,26 +290,27 @@ guided_install() {
     
     # 需要下载
     if [[ ! -x "$INSTALL_DIR/phantom-server" ]]; then
+        echo "正在下载程序..."
+        local binary_name="phantom-server-linux-${arch}"
+        
         if ! download_file "$binary_name" "$INSTALL_DIR/phantom-server"; then
-            # 尝试不带架构的文件名
             if ! download_file "phantom-server" "$INSTALL_DIR/phantom-server"; then
                 echo ""
                 error "自动下载失败"
                 echo ""
-                echo "请手动下载并安装："
+                echo "请手动下载："
                 echo "  1. 访问 https://github.com/mrcgq/222/releases"
-                echo "  2. 下载对应系统的文件"
-                echo "  3. 上传到服务器 /opt/phantom/phantom-server"
-                echo "  4. 执行: chmod +x /opt/phantom/phantom-server"
+                echo "  2. 下载 phantom-server-linux-${arch}"
+                echo "  3. 上传到 /opt/phantom/phantom-server"
+                echo "  4. chmod +x /opt/phantom/phantom-server"
                 echo "  5. 重新运行此脚本"
-                echo ""
                 exit 1
             fi
         fi
         chmod +x "$INSTALL_DIR/phantom-server"
     fi
     
-    info "程序下载完成"
+    info "程序准备完成"
     
     # ─────────────────────────────────────────────────────────────────────────
     # 第四步：生成配置
@@ -340,19 +332,16 @@ psk: "${PSK}"
 mode: "auto"
 log_level: "info"
 
-# 隧道配置
 tunnel:
   enabled: ${USE_TUNNEL}
-  mode: "${TUNNEL_MODE:-temp}"
+  mode: "${TUNNEL_MODE}"
   token: "${CF_TOKEN}"
   local_port: ${PORT}
 
-# 域名配置
 domain:
   name: "${DOMAIN}"
-  cert_mode: "${cert_choice:-none}"
+  cert_mode: "${CERT_MODE}"
 
-# 传输协议
 faketcp:
   enabled: true
   listen: ":$((PORT+1))"
@@ -363,7 +352,6 @@ websocket:
   listen: ":$((PORT+2))"
   path: "/ws"
 
-# 性能优化
 hysteria2:
   enabled: true
   up_mbps: 100
@@ -372,14 +360,31 @@ hysteria2:
 arq:
   enabled: true
   window_size: 256
+  rto_min_ms: 100
+  rto_max_ms: 3000
 
-# eBPF 加速
+switcher:
+  enabled: true
+  check_interval_ms: 1000
+  rtt_threshold_ms: 300
+  loss_threshold: 0.3
+  priority:
+    - "ebpf"
+    - "faketcp"
+    - "udp"
+    - "websocket"
+
 ebpf:
   enabled: true
   interface: "${iface}"
   xdp_mode: "generic"
+  enable_tc: true
 
-# 监控
+tls:
+  enabled: false
+  server_name: "${DOMAIN:-www.microsoft.com}"
+  fingerprint: "chrome"
+
 metrics:
   enabled: true
   listen: ":9100"
@@ -388,7 +393,7 @@ EOF
     info "配置文件已生成"
     
     # ─────────────────────────────────────────────────────────────────────────
-    # 第五步：配置系统服务
+    # 第五步：系统服务
     # ─────────────────────────────────────────────────────────────────────────
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -421,7 +426,7 @@ EOF
     info "系统服务已配置"
     
     # ─────────────────────────────────────────────────────────────────────────
-    # 第六步：启动服务
+    # 第六步：启动
     # ─────────────────────────────────────────────────────────────────────────
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -429,7 +434,11 @@ EOF
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
-    systemctl restart phantom
+    # 先停止可能正在运行的错误实例
+    systemctl stop phantom 2>/dev/null
+    sleep 1
+    
+    systemctl start phantom
     sleep 3
     
     if systemctl is-active --quiet phantom; then
@@ -439,14 +448,15 @@ EOF
         local TUNNEL_URL=""
         if [[ "$USE_TUNNEL" == "true" ]]; then
             echo ""
-            echo "正在获取隧道地址..."
+            echo "正在获取隧道地址（可能需要几秒钟）..."
             sleep 5
             TUNNEL_URL=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
         fi
         
-        # ─────────────────────────────────────────────────────────────────────
-        # 安装完成，显示信息
-        # ─────────────────────────────────────────────────────────────────────
+        # 获取服务器 IP
+        local SERVER_IP=$(curl -s4 --connect-timeout 5 ip.sb 2>/dev/null || curl -s4 --connect-timeout 5 ifconfig.me 2>/dev/null || echo "你的服务器IP")
+        
+        # 显示结果
         echo ""
         echo ""
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -456,36 +466,28 @@ EOF
         echo -e "${BOLD}【连接信息】${NC}"
         echo ""
         
-        # 获取服务器 IP
-        local SERVER_IP=$(curl -s4 ip.sb 2>/dev/null || curl -s4 ifconfig.me 2>/dev/null || echo "你的服务器IP")
-        
         if [[ -n "$TUNNEL_URL" ]]; then
-            echo -e "  隧道地址: ${CYAN}${BOLD}${TUNNEL_URL}${NC}"
-            echo ""
+            echo -e "  🌐 隧道地址: ${CYAN}${BOLD}${TUNNEL_URL}${NC}"
         fi
         
-        if [[ "$USE_TUNNEL" != "true" ]]; then
-            echo -e "  服务器:   ${CYAN}${SERVER_IP}${NC}"
-        fi
-        
-        echo -e "  端口:     ${CYAN}${PORT}${NC}"
-        echo -e "  PSK密钥:  ${CYAN}${BOLD}${PSK}${NC}"
+        echo -e "  📍 服务器IP: ${CYAN}${SERVER_IP}${NC}"
+        echo -e "  🔌 端口:     ${CYAN}${PORT}${NC}"
+        echo -e "  🔑 PSK密钥:  ${CYAN}${BOLD}${PSK}${NC}"
         
         if [[ -n "$DOMAIN" ]]; then
-            echo -e "  域名:     ${CYAN}${DOMAIN}${NC}"
+            echo -e "  🌍 域名:     ${CYAN}${DOMAIN}${NC}"
         fi
         
         echo ""
         echo -e "${BOLD}【客户端配置】${NC}"
         echo ""
-        
         if [[ -n "$TUNNEL_URL" ]]; then
-            echo "  地址: ${TUNNEL_URL}"
+            echo "  服务器: ${TUNNEL_URL} (或 ${SERVER_IP})"
         else
-            echo "  地址: ${SERVER_IP}"
+            echo "  服务器: ${SERVER_IP}"
         fi
-        echo "  端口: ${PORT}"
-        echo "  密钥: ${PSK}"
+        echo "  端口:   ${PORT}"
+        echo "  密钥:   ${PSK}"
         
         echo ""
         echo -e "${BOLD}【常用命令】${NC}"
@@ -493,33 +495,34 @@ EOF
         echo "  查看状态: systemctl status phantom"
         echo "  查看日志: journalctl -u phantom -f"
         echo "  重启服务: systemctl restart phantom"
-        echo "  管理面板: bash $0"
+        echo "  管理面板: 再次运行此脚本"
         
         echo ""
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         
-        if [[ "$TUNNEL_MODE" == "temp" ]]; then
+        if [[ "$TUNNEL_MODE" == "temp" && "$USE_TUNNEL" == "true" ]]; then
             echo ""
-            warn "注意: 临时隧道地址会在服务重启后改变"
-            echo "  如需固定地址，请使用 Cloudflare 固定隧道"
+            warn "注意: 临时隧道地址在服务重启后会改变"
         fi
         
     else
         error "服务启动失败"
         echo ""
-        echo "请检查日志: journalctl -u phantom -n 50"
+        echo "错误日志："
+        journalctl -u phantom -n 10 --no-pager 2>/dev/null
+        echo ""
+        echo "请检查完整日志: journalctl -u phantom -n 50"
         exit 1
     fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 管理菜单（安装后使用）
+# 管理菜单
 # ─────────────────────────────────────────────────────────────────────────────
 show_menu() {
     while true; do
         print_logo
         
-        # 状态
         local status=$(systemctl is-active phantom 2>/dev/null || echo "未安装")
         case "$status" in
             active)   echo -e "状态: ${GREEN}● 运行中${NC}" ;;
@@ -527,14 +530,12 @@ show_menu() {
             *)        echo -e "状态: ${RED}✗ 未安装${NC}" ;;
         esac
         
-        # 显示当前配置
         if [[ -f "$CONFIG_FILE" ]]; then
             local port=$(grep "^listen:" "$CONFIG_FILE" 2>/dev/null | grep -oP '\d+')
             local psk=$(grep "^psk:" "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"')
             echo ""
             echo -e "端口: ${CYAN}${port}${NC}  PSK: ${CYAN}${psk}${NC}"
             
-            # 隧道地址
             local tunnel_on=$(grep -A1 "^tunnel:" "$CONFIG_FILE" | grep "enabled:" | awk '{print $2}')
             if [[ "$tunnel_on" == "true" ]]; then
                 local url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
@@ -548,13 +549,11 @@ show_menu() {
         echo "  1. 重新安装/升级"
         echo "  2. 卸载"
         echo ""
-        echo "  3. 启动服务"
-        echo "  4. 停止服务"
-        echo "  5. 重启服务"
+        echo "  3. 启动    4. 停止    5. 重启"
         echo "  6. 查看日志"
         echo ""
         echo "  7. 修改端口"
-        echo "  8. 重置密钥"
+        echo "  8. 重置密钥 (32字节)"
         echo "  9. 隧道设置"
         echo ""
         echo "  10. 查看配置"
@@ -562,11 +561,11 @@ show_menu() {
         echo ""
         echo "  0. 退出"
         echo ""
-        read -rp "请选择: " choice
+        read -rp "选择: " choice
         
         case $choice in
-            1) guided_install ;;
-            2) 
+            1) guided_install; press_enter ;;
+            2)
                 echo ""
                 if confirm "确定要卸载吗？" "n"; then
                     systemctl stop phantom 2>/dev/null
@@ -577,46 +576,28 @@ show_menu() {
                 fi
                 press_enter
                 ;;
-            3) 
-                echo ""
-                systemctl start phantom && info "已启动" || error "启动失败"
-                press_enter
-                ;;
-            4)
-                echo ""
-                systemctl stop phantom && info "已停止" || error "停止失败"
-                press_enter
-                ;;
-            5)
-                echo ""
-                systemctl restart phantom && info "已重启" || error "重启失败"
-                press_enter
-                ;;
-            6)
-                echo ""
-                echo "按 Ctrl+C 退出日志查看"
-                sleep 1
-                journalctl -u phantom -f -n 50
-                ;;
+            3) systemctl start phantom && info "已启动" || error "失败"; press_enter ;;
+            4) systemctl stop phantom && info "已停止" || error "失败"; press_enter ;;
+            5) systemctl restart phantom && info "已重启" || error "失败"; press_enter ;;
+            6) echo "按 Ctrl+C 退出"; sleep 1; journalctl -u phantom -f -n 50 ;;
             7)
-                echo ""
-                read -rp "新端口: " new_port
-                if [[ "$new_port" =~ ^[0-9]+$ ]]; then
-                    yaml_set "listen" "\":${new_port}\""
-                    yaml_set_section "tunnel" "local_port" "$new_port"
-                    yaml_set_section "faketcp" "listen" "\":$((new_port+1))\""
-                    yaml_set_section "websocket" "listen" "\":$((new_port+2))\""
+                read -rp "新端口: " p
+                if [[ "$p" =~ ^[0-9]+$ ]]; then
+                    yaml_set "listen" "\":${p}\""
+                    yaml_set_section "tunnel" "local_port" "$p"
+                    yaml_set_section "faketcp" "listen" "\":$((p+1))\""
+                    yaml_set_section "websocket" "listen" "\":$((p+2))\""
                     systemctl restart phantom
-                    info "端口已修改"
+                    info "端口已修改为 ${p}"
                 fi
                 press_enter
                 ;;
             8)
-                echo ""
-                local new_psk=$(openssl rand -base64 16 | tr -d '=+/' | head -c 16)
+                # 【修复】重置密钥也使用 32 字节
+                local new_psk=$(generate_psk)
                 yaml_set "psk" "\"${new_psk}\""
                 systemctl restart phantom
-                info "新密钥: ${CYAN}${new_psk}${NC}"
+                info "新密钥 (32字节): ${CYAN}${new_psk}${NC}"
                 press_enter
                 ;;
             9)
@@ -633,8 +614,8 @@ show_menu() {
                         yaml_set_section "tunnel" "mode" "\"temp\""
                         systemctl restart phantom
                         sleep 5
-                        local url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
-                        [[ -n "$url" ]] && info "隧道地址: ${url}" || warn "等待隧道建立..."
+                        url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
+                        [[ -n "$url" ]] && info "隧道: ${url}" || warn "等待隧道..."
                         ;;
                     2)
                         read -rp "CF Token: " token
@@ -652,153 +633,125 @@ show_menu() {
                         info "隧道已禁用"
                         ;;
                     4)
-                        local url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
-                        [[ -n "$url" ]] && info "隧道地址: ${url}" || warn "未找到隧道地址"
+                        url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
+                        [[ -n "$url" ]] && info "隧道: ${url}" || warn "未找到"
                         ;;
                 esac
                 press_enter
                 ;;
             10)
                 echo ""
-                cat "$CONFIG_FILE" 2>/dev/null || echo "配置文件不存在"
+                cat "$CONFIG_FILE" 2>/dev/null
                 press_enter
                 ;;
-            11)
-                advanced_menu
-                ;;
-            0)
-                echo ""
-                echo "再见！"
-                exit 0
-                ;;
+            11) advanced_menu ;;
+            0) echo "再见！"; exit 0 ;;
         esac
     done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 高级设置菜单
+# 高级菜单
 # ─────────────────────────────────────────────────────────────────────────────
 advanced_menu() {
     while true; do
         clear
         echo -e "${BOLD}高级设置${NC}"
         echo ""
-        echo "  1. 智能寻路设置"
-        echo "  2. TLS/伪装设置"
+        echo "  1. 智能寻路"
+        echo "  2. TLS/伪装"
         echo "  3. 性能调优"
         echo "  4. 协议开关"
         echo "  5. 网卡/eBPF"
-        echo "  6. 编辑配置文件"
+        echo "  6. 编辑配置"
         echo ""
-        echo "  0. 返回主菜单"
+        echo "  0. 返回"
         echo ""
         read -rp "选择: " choice
         
         case $choice in
             1)
                 echo ""
-                echo "智能寻路配置:"
-                read -rp "  RTT阈值(ms) [300]: " rtt
-                read -rp "  丢包阈值 [0.3]: " loss
+                read -rp "RTT阈值(ms) [300]: " rtt
+                read -rp "丢包阈值 [0.3]: " loss
                 [[ -n "$rtt" ]] && yaml_set_section "switcher" "rtt_threshold_ms" "$rtt"
                 [[ -n "$loss" ]] && yaml_set_section "switcher" "loss_threshold" "$loss"
-                systemctl restart phantom
-                info "已更新"
+                systemctl restart phantom && info "已更新"
                 press_enter
                 ;;
             2)
                 echo ""
-                echo "TLS 设置:"
                 echo "  1. 启用 TLS"
                 echo "  2. 禁用 TLS"
                 echo "  3. 修改 SNI"
-                echo "  4. 修改指纹"
                 read -rp "选择: " t
                 case $t in
                     1) yaml_set_section "tls" "enabled" "true" ;;
                     2) yaml_set_section "tls" "enabled" "false" ;;
                     3) read -rp "SNI: " s; yaml_set_section "tls" "server_name" "\"${s}\"" ;;
-                    4) echo "1.chrome 2.firefox 3.safari"; read -rp ": " f
-                       case $f in 1)fp="chrome";;2)fp="firefox";;3)fp="safari";;esac
-                       yaml_set_section "tls" "fingerprint" "\"${fp}\"" ;;
                 esac
-                systemctl restart phantom
-                info "已更新"
+                systemctl restart phantom && info "已更新"
                 press_enter
                 ;;
             3)
                 echo ""
-                echo "性能调优:"
-                read -rp "  上行带宽(Mbps) [100]: " up
-                read -rp "  下行带宽(Mbps) [100]: " down
+                read -rp "上行带宽(Mbps): " up
+                read -rp "下行带宽(Mbps): " down
                 [[ -n "$up" ]] && yaml_set_section "hysteria2" "up_mbps" "$up"
                 [[ -n "$down" ]] && yaml_set_section "hysteria2" "down_mbps" "$down"
-                systemctl restart phantom
-                info "已更新"
+                systemctl restart phantom && info "已更新"
                 press_enter
                 ;;
             4)
                 echo ""
-                echo "协议开关:"
-                echo "  1. FakeTCP"
-                echo "  2. WebSocket"
-                echo "  3. eBPF"
-                read -rp "切换哪个: " p
+                echo "  1. FakeTCP   2. WebSocket   3. eBPF"
+                read -rp "切换: " p
                 case $p in
-                    1) local v=$(grep -A1 "^faketcp:" "$CONFIG_FILE" | grep enabled | awk '{print $2}')
-                       [[ "$v" == "true" ]] && yaml_set_section "faketcp" "enabled" "false" || yaml_set_section "faketcp" "enabled" "true" ;;
-                    2) local v=$(grep -A1 "^websocket:" "$CONFIG_FILE" | grep enabled | awk '{print $2}')
-                       [[ "$v" == "true" ]] && yaml_set_section "websocket" "enabled" "false" || yaml_set_section "websocket" "enabled" "true" ;;
-                    3) local v=$(grep -A1 "^ebpf:" "$CONFIG_FILE" | grep enabled | awk '{print $2}')
-                       [[ "$v" == "true" ]] && yaml_set_section "ebpf" "enabled" "false" || yaml_set_section "ebpf" "enabled" "true" ;;
+                    1) toggle_section "faketcp" ;;
+                    2) toggle_section "websocket" ;;
+                    3) toggle_section "ebpf" ;;
                 esac
-                systemctl restart phantom
-                info "已切换"
+                systemctl restart phantom && info "已切换"
                 press_enter
                 ;;
             5)
-                echo ""
-                local iface=$(ip route | grep default | awk '{print $5}' | head -1)
-                echo "检测到网卡: $iface"
-                read -rp "使用此网卡? [Y/n]: " use
-                if [[ -z "$use" || "$use" =~ ^[Yy]$ ]]; then
+                local iface=$(get_iface)
+                echo "检测到: $iface"
+                if confirm "使用此网卡？"; then
                     yaml_set_section "ebpf" "interface" "\"${iface}\""
                     yaml_set_section "faketcp" "interface" "\"${iface}\""
-                    systemctl restart phantom
-                    info "已更新"
+                    systemctl restart phantom && info "已更新"
                 fi
                 press_enter
                 ;;
             6)
-                if command -v nano &>/dev/null; then
-                    nano "$CONFIG_FILE"
-                elif command -v vim &>/dev/null; then
-                    vim "$CONFIG_FILE"
-                else
-                    cat "$CONFIG_FILE"
-                fi
+                nano "$CONFIG_FILE" 2>/dev/null || vim "$CONFIG_FILE" 2>/dev/null || cat "$CONFIG_FILE"
                 systemctl restart phantom
                 ;;
-            0)
-                return
-                ;;
+            0) return ;;
         esac
     done
 }
 
+toggle_section() {
+    local sec="$1"
+    local current=$(grep -A1 "^${sec}:" "$CONFIG_FILE" | grep "enabled:" | awk '{print $2}')
+    if [[ "$current" == "true" ]]; then
+        yaml_set_section "$sec" "enabled" "false"
+    else
+        yaml_set_section "$sec" "enabled" "true"
+    fi
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 主入口
+# 入口
 # ─────────────────────────────────────────────────────────────────────────────
 main() {
     check_root
-    check_system
     
-    # 判断是否已安装
-    if [[ -f "$CONFIG_FILE" ]] && systemctl is-enabled phantom &>/dev/null; then
-        # 已安装，显示管理菜单
+    if [[ -f "$CONFIG_FILE" ]] && systemctl is-enabled phantom &>/dev/null 2>&1; then
         show_menu
     else
-        # 未安装，进入引导安装
         guided_install
         echo ""
         press_enter
