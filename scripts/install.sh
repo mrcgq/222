@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phantom Server v5.2 - 修复 PSK 问题
+# Phantom Server v5.3 - 修复 Base64 PSK
 
 [[ ! -t 0 ]] && exec 0</dev/tty
 
@@ -47,10 +47,26 @@ get_iface() {
     ip route 2>/dev/null | grep default | awk '{print $5}' | head -1 || echo "eth0"
 }
 
-# 【核心修复】生成正确的 32 字节 PSK
+# 【核心修复】生成正确的 Base64 PSK
+# 32 字节随机数 -> Base64 编码 -> 约 44 字符
+# 解码后正好 32 字节
 generate_psk() {
-    # openssl rand -hex 16 生成 32 个十六进制字符
-    openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p
+    openssl rand -base64 32 2>/dev/null | tr -d '\n' || {
+        # 备用方案
+        head -c 32 /dev/urandom | base64 | tr -d '\n'
+    }
+}
+
+# 验证 PSK（模拟程序的验证逻辑）
+validate_psk() {
+    local psk="$1"
+    # 尝试 Base64 解码并检查长度
+    local decoded_len=$(echo -n "$psk" | base64 -d 2>/dev/null | wc -c)
+    if [[ "$decoded_len" -eq 32 ]]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 download_file() {
@@ -108,16 +124,17 @@ guided_install() {
     local PORT=${input_port:-54321}
     info "端口: ${PORT}"
     
-    # 【关键】生成 32 字节 PSK
+    # 【修复】生成正确的 Base64 PSK
     local PSK=$(generate_psk)
-    info "PSK 密钥已自动生成 (32字节): ${CYAN}${PSK}${NC}"
-    echo "  (请保存此密钥，客户端连接时需要)"
     
-    # 验证 PSK 长度
-    if [[ ${#PSK} -ne 32 ]]; then
-        error "PSK 生成异常，长度为 ${#PSK}，需要 32"
-        PSK=$(printf '%032d' 0 | head -c 32)
-        warn "使用备用 PSK: ${PSK}"
+    # 验证 PSK
+    if validate_psk "$PSK"; then
+        local decoded_len=$(echo -n "$PSK" | base64 -d 2>/dev/null | wc -c)
+        info "PSK 密钥已生成: ${CYAN}${PSK}${NC}"
+        echo "  (Base64 编码，解码后 ${decoded_len} 字节，请保存此密钥)"
+    else
+        error "PSK 生成失败，使用备用方案"
+        PSK="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     fi
     
     # ═══════════════════════════════════════════════════════════════════════
@@ -208,7 +225,7 @@ guided_install() {
     info "程序准备完成"
     
     # ═══════════════════════════════════════════════════════════════════════
-    # 第 4 步：生成配置（每次都重新生成，确保 PSK 正确）
+    # 第 4 步：生成配置
     # ═══════════════════════════════════════════════════════════════════════
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -218,11 +235,10 @@ guided_install() {
     
     local iface=$(get_iface)
     
-    # 【关键】始终重新生成配置文件，确保新 PSK 生效
     cat > "$CONFIG_FILE" << EOF
 # Phantom Server 配置
 # 生成: $(date '+%Y-%m-%d %H:%M:%S')
-# PSK: 32 字节十六进制字符串
+# PSK: Base64 编码，解码后 32 字节
 
 listen: ":${PORT}"
 psk: "${PSK}"
@@ -284,12 +300,13 @@ metrics:
   listen: ":9100"
 EOF
     
-    info "配置文件已生成 (PSK: ${#PSK} 字节)"
-    
-    # 验证配置文件中的 PSK
+    # 验证写入的 PSK
     local saved_psk=$(grep "^psk:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-    if [[ ${#saved_psk} -ne 32 ]]; then
-        error "配置文件中 PSK 长度异常: ${#saved_psk}"
+    if validate_psk "$saved_psk"; then
+        local decoded_len=$(echo -n "$saved_psk" | base64 -d 2>/dev/null | wc -c)
+        info "配置文件已生成 (PSK 解码后 ${decoded_len} 字节)"
+    else
+        error "配置文件 PSK 验证失败"
         exit 1
     fi
     
@@ -375,13 +392,12 @@ EOF
         echo "错误日志："
         journalctl -u phantom -n 10 --no-pager
         echo ""
-        
-        # 调试信息
-        echo "调试: 检查 PSK 长度..."
+        echo "调试信息："
         local cfg_psk=$(grep "^psk:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-        echo "  配置文件中 PSK: ${cfg_psk}"
-        echo "  长度: ${#cfg_psk} 字节"
-        
+        echo "  配置 PSK: ${cfg_psk}"
+        echo "  字符长度: ${#cfg_psk}"
+        local decoded_len=$(echo -n "$cfg_psk" | base64 -d 2>/dev/null | wc -c)
+        echo "  解码后字节数: ${decoded_len}"
         exit 1
     fi
 }
@@ -403,7 +419,9 @@ show_menu() {
         if [[ -f "$CONFIG_FILE" ]]; then
             local port=$(grep "^listen:" "$CONFIG_FILE" | grep -oP '\d+')
             local psk=$(grep "^psk:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-            echo -e "端口: ${CYAN}${port}${NC}  PSK: ${CYAN}${psk}${NC} (${#psk}字节)"
+            # 显示 PSK 前 20 个字符
+            local psk_display="${psk:0:20}..."
+            echo -e "端口: ${CYAN}${port}${NC}  PSK: ${CYAN}${psk_display}${NC}"
             
             if grep -q "enabled: true" <(grep -A1 "^tunnel:" "$CONFIG_FILE"); then
                 local url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1)
@@ -424,6 +442,7 @@ show_menu() {
         echo "  8. 重置PSK"
         echo "  9. 隧道设置"
         echo "  10. 查看配置"
+        echo "  11. 显示完整PSK"
         echo ""
         echo "  0. 退出"
         echo ""
@@ -457,10 +476,15 @@ show_menu() {
                 read -rp "Enter..." _
                 ;;
             8)
+                # 【修复】重置 PSK 也使用 Base64
                 local new_psk=$(generate_psk)
-                yaml_set "psk" "\"${new_psk}\""
-                systemctl restart phantom
-                info "新PSK: ${CYAN}${new_psk}${NC} (${#new_psk}字节)"
+                if validate_psk "$new_psk"; then
+                    yaml_set "psk" "\"${new_psk}\""
+                    systemctl restart phantom
+                    info "新PSK: ${CYAN}${new_psk}${NC}"
+                else
+                    error "PSK 生成失败"
+                fi
                 read -rp "Enter..." _
                 ;;
             9)
@@ -481,6 +505,15 @@ show_menu() {
                 read -rp "Enter..." _
                 ;;
             10) cat "$CONFIG_FILE" 2>/dev/null; read -rp "Enter..." _ ;;
+            11)
+                local psk=$(grep "^psk:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
+                echo ""
+                echo -e "完整 PSK: ${CYAN}${psk}${NC}"
+                echo ""
+                local decoded_len=$(echo -n "$psk" | base64 -d 2>/dev/null | wc -c)
+                echo "字符长度: ${#psk}, 解码后: ${decoded_len} 字节"
+                read -rp "Enter..." _
+                ;;
             0) exit 0 ;;
         esac
     done
