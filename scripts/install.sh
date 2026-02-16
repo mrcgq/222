@@ -17,6 +17,7 @@
 # =============================================================================
 
 set -e
+trap 'error "脚本执行出错，行号: $LINENO"; exit 1' ERR
 [[ ! -t 0 ]] && exec 0</dev/tty
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1811,101 +1812,94 @@ show_help() {
 # ─────────────────────────────────────────────────────────────────────────────
 # 入口
 # ─────────────────────────────────────────────────────────────────────────────
-check_root
-
-# 处理命令行参数
-case "${1:-}" in
-    install)
-        guided_install
-        ;;
-    start)
-        pre_start_cleanup
-        systemctl start phantom
-        sleep 2
-        systemctl status phantom --no-pager
-        show_connection_info
-        ;;
-    stop)
-        safe_stop_service
-        cleanup_ebpf_hooks
-        info "服务已停止"
-        ;;
-    restart)
-        pre_start_cleanup
-        systemctl start phantom
-        sleep 2
-        systemctl status phantom --no-pager
-        show_connection_info
-        ;;
-    status)
-        systemctl status phantom --no-pager 2>/dev/null || echo "服务未安装"
-        show_connection_info
-        ;;
-    logs)
-        journalctl -u phantom -f -n 100
-        ;;
-    fix)
-        # 执行一键修复
-        step "执行快速修复..."
-        safe_stop_service
-        cleanup_ebpf_hooks
-        setup_bpf_filesystem
-        fix_cloudflared_permissions
-        chmod +x "$INSTALL_DIR/phantom-server" 2>/dev/null
-        systemctl daemon-reload
-        systemctl start phantom
-        sleep 5
-        systemctl status phantom --no-pager
-        show_connection_info
-        ;;
-    fix-perm)
-        fix_cloudflared_permissions
-        chmod +x "$INSTALL_DIR/phantom-server" 2>/dev/null
-        info "权限修复完成"
-        echo ""
-        echo "cloudflared 文件:"
-        ls -la /opt/phantom/bin/cloudflared* 2>/dev/null
-        ls -la /root/.phantom/bin/cloudflared* 2>/dev/null
-        ls -la /usr/local/bin/cloudflared* 2>/dev/null
-        ;;
-    info)
-        show_connection_info
-        ;;
-    uninstall)
-        read -rp "确认卸载？输入 YES 确认: " confirm
-        if [[ "$confirm" == "YES" ]]; then
+main() {
+    check_root
+    
+    # 挂载 BPF 文件系统（忽略错误）
+    mountpoint -q /sys/fs/bpf 2>/dev/null || mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+    
+    # 确保目录存在
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" 2>/dev/null || true
+    
+    # 处理命令行参数
+    case "${1:-}" in
+        install)
+            guided_install
+            ;;
+        start)
+            pre_start_cleanup
+            systemctl start phantom
+            sleep 2
+            systemctl status phantom --no-pager
+            show_connection_info
+            ;;
+        stop)
             safe_stop_service
             cleanup_ebpf_hooks
-            rm -rf "$INSTALL_DIR" "$CONFIG_DIR" "$SERVICE_FILE"
-            rm -rf /root/.phantom 2>/dev/null
+            info "服务已停止"
+            ;;
+        restart)
+            pre_start_cleanup
+            systemctl start phantom
+            sleep 2
+            systemctl status phantom --no-pager
+            show_connection_info
+            ;;
+        status)
+            systemctl status phantom --no-pager 2>/dev/null || echo "服务未安装"
+            show_connection_info
+            ;;
+        logs)
+            journalctl -u phantom -f -n 100
+            ;;
+        fix)
+            step "执行快速修复..."
+            safe_stop_service
+            cleanup_ebpf_hooks
+            setup_bpf_filesystem
+            fix_cloudflared_permissions
+            chmod +x "$INSTALL_DIR/phantom-server" 2>/dev/null || true
             systemctl daemon-reload
-            info "已卸载"
-        fi
-        ;;
-    -h|--help|help)
-        show_help
-        ;;
-    "")
-        # 无参数，进入交互式菜单
-        
-        # 挂载 BPF 文件系统
-        mountpoint -q /sys/fs/bpf 2>/dev/null || mount -t bpf bpf /sys/fs/bpf 2>/dev/null
-        
-        # 确保目录存在
-        mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$CLOUDFLARED_DIR" 2>/dev/null
-        
-        if [[ -f "$CONFIG_FILE" ]]; then
-            show_menu
-        else
-            guided_install
-            echo ""
-            read -rp "按 Enter 进入管理菜单..."
-            show_menu
-        fi
-        ;;
-    *)
-        error "未知命令: $1"
-        show_help
-        exit 1
-        ;;
-esac
+            systemctl start phantom
+            sleep 5
+            systemctl status phantom --no-pager
+            show_connection_info
+            ;;
+        fix-perm)
+            fix_cloudflared_permissions
+            chmod +x "$INSTALL_DIR/phantom-server" 2>/dev/null || true
+            info "权限修复完成"
+            ;;
+        info)
+            show_connection_info
+            ;;
+        uninstall)
+            read -rp "确认卸载？输入 YES 确认: " confirm
+            if [[ "$confirm" == "YES" ]]; then
+                safe_stop_service
+                cleanup_ebpf_hooks
+                rm -rf "$INSTALL_DIR" "$CONFIG_DIR" "$SERVICE_FILE"
+                rm -rf /root/.phantom 2>/dev/null
+                systemctl daemon-reload
+                info "已卸载"
+            fi
+            ;;
+        -h|--help|help)
+            show_help
+            ;;
+        *)
+            # 默认：进入交互式菜单
+            if [[ -f "$CONFIG_FILE" ]]; then
+                show_menu
+            else
+                guided_install
+                echo ""
+                read -rp "按 Enter 进入管理菜单..."
+                show_menu
+            fi
+            ;;
+    esac
+}
+
+# 执行主函数
+main "$@"
