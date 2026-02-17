@@ -1,27 +1,23 @@
 
 
-
-
-
-
-
 #!/usr/bin/env bash
 # =============================================================================
-# Phantom Server 一键安装脚本 v6.1-fix
+# Phantom Server 一键安装脚本 v6.1 (稳定修复版)
 # 功能完善版：eBPF + 隧道 + 证书 + DDNS + TLS伪装 + 智能切换
 # =============================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 关键修复：不使用 set -e，修复 stdin 问题
+# 关键修复：不使用 set -e，改用手动错误处理
 # ─────────────────────────────────────────────────────────────────────────────
 
-# 修复 stdin 问题（必须在最开始）
+# 修复 stdin 问题（必须在最开始，且不能因错误退出）
 if [[ ! -t 0 ]]; then
     if [[ -e /dev/tty ]]; then
         exec 0</dev/tty
     else
         echo "错误：无法获取终端输入，请下载脚本后运行：" >&2
-        echo "  curl -fsSL URL -o install.sh && chmod +x install.sh && ./install.sh" >&2
+        echo "  curl -fsSL https://raw.githubusercontent.com/mrcgq/222/refs/heads/main/scripts/install.sh -o install.sh" >&2
+        echo "  chmod +x install.sh && ./install.sh" >&2
         exit 1
     fi
 fi
@@ -34,8 +30,7 @@ EBPF_DIR="/opt/phantom/ebpf"
 CONFIG_DIR="/etc/phantom"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 SERVICE_FILE="/etc/systemd/system/phantom.service"
-CLOUDFLARED_DIR="/opt/phantom/bin"
-CLOUDFLARED_PATH="${CLOUDFLARED_DIR}/cloudflared"
+CLOUDFLARED_DIR="/root/.phantom/bin"
 
 DOWNLOAD_URLS=(
     "https://github.com/mrcgq/222/releases/latest/download"
@@ -56,6 +51,7 @@ error()   { echo -e "${RED}[✗]${NC} $1"; }
 step()    { echo -e "${BLUE}${BOLD}==>${NC} $1"; }
 success() { echo -e "${GREEN}${BOLD}[OK]${NC} $1"; }
 
+# 安全退出函数
 die() {
     error "$1"
     exit "${2:-1}"
@@ -118,11 +114,13 @@ get_service_status() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YAML 操作函数
+# YAML 操作函数 (安全版本)
 # ─────────────────────────────────────────────────────────────────────────────
 yaml_set_top() {
     local key="$1" value="$2" file="${3:-$CONFIG_FILE}"
+    
     [[ ! -f "$file" ]] && return 1
+    
     if grep -q "^${key}:" "$file" 2>/dev/null; then
         sed -i "s|^${key}:.*|${key}: ${value}|" "$file"
     else
@@ -132,7 +130,9 @@ yaml_set_top() {
 
 yaml_set_section() {
     local section="$1" key="$2" value="$3" file="${4:-$CONFIG_FILE}"
+    
     [[ ! -f "$file" ]] && return 1
+    
     awk -v sec="$section" -v k="$key" -v v="$value" '
     BEGIN { in_section=0; found=0 }
     {
@@ -148,7 +148,9 @@ yaml_set_section() {
 
 yaml_get() {
     local section="$1" key="$2" file="${3:-$CONFIG_FILE}"
+    
     [[ ! -f "$file" ]] && echo "" && return
+    
     awk -v sec="$section" -v k="$key" '
     BEGIN { in_section=0 }
     {
@@ -165,9 +167,12 @@ yaml_get() {
 
 yaml_set_array() {
     local section="$1" key="$2" values="$3" file="${4:-$CONFIG_FILE}"
+    
     [[ ! -f "$file" ]] && return 1
+    
     local tmpfile
     tmpfile=$(mktemp)
+    
     awk -v sec="$section" -v k="$key" -v vals="$values" '
     BEGIN { in_section=0; in_array=0; split(vals, arr, ",") }
     {
@@ -216,6 +221,7 @@ is_valid_executable() {
 install_dependencies() {
     echo -n "  检查系统依赖... "
     local need_install=()
+    
     command -v bpftool &>/dev/null || need_install+=("bpftool")
     command -v curl &>/dev/null || need_install+=("curl")
     
@@ -261,6 +267,7 @@ install_dependencies() {
 check_ebpf_support() {
     local supported="full"
     local kv_major kv_minor
+    
     kv_major=$(uname -r | cut -d. -f1)
     kv_minor=$(uname -r | cut -d. -f2 | cut -d- -f1)
     
@@ -270,9 +277,14 @@ check_ebpf_support() {
     
     local virt
     virt=$(systemd-detect-virt 2>/dev/null) || virt="none"
+    
     case "$virt" in
-        openvz|lxc) supported="none" ;;
-        docker|podman) [[ "$supported" == "full" ]] && supported="partial" ;;
+        openvz|lxc)
+            supported="none"
+            ;;
+        docker|podman)
+            [[ "$supported" == "full" ]] && supported="partial"
+            ;;
     esac
     
     [[ ! -f "/sys/kernel/btf/vmlinux" ]] && [[ "$supported" == "full" ]] && supported="partial"
@@ -298,6 +310,7 @@ cleanup_ebpf_hooks() {
     ip link set dev "$iface" xdp off 2>/dev/null || true
     ip link set dev "$iface" xdpgeneric off 2>/dev/null || true
     ip link set dev "$iface" xdpdrv off 2>/dev/null || true
+    
     tc qdisc del dev "$iface" clsact 2>/dev/null || true
     rm -rf /sys/fs/bpf/phantom 2>/dev/null || true
     
@@ -308,16 +321,6 @@ cleanup_ebpf_hooks() {
             done
     fi
     
-    echo -e "${GREEN}完成${NC}"
-}
-
-setup_bpf_filesystem() {
-    echo -n "  配置 BPF 文件系统... "
-    if ! mountpoint -q /sys/fs/bpf 2>/dev/null; then
-        mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
-    fi
-    mkdir -p /sys/fs/bpf/phantom 2>/dev/null || true
-    chmod 755 /sys/fs/bpf/phantom 2>/dev/null || true
     echo -e "${GREEN}完成${NC}"
 }
 
@@ -398,56 +401,22 @@ download_ebpf_programs() {
 # Cloudflared 管理
 # ─────────────────────────────────────────────────────────────────────────────
 fix_cloudflared_permissions() {
-    echo -n "  修复 cloudflared 权限... "
-    local dirs=("$CLOUDFLARED_DIR" "/root/.phantom/bin" "/usr/local/bin" "/opt/phantom/bin")
-    
-    for dir in "${dirs[@]}"; do
+    for dir in "$CLOUDFLARED_DIR" "/usr/local/bin" "/opt/phantom/bin"; do
         if [[ -d "$dir" ]]; then
             find "$dir" -type f -name "cloudflared*" -exec chmod +x {} \; 2>/dev/null || true
         fi
     done
-    
-    # 创建软链接
-    local found_cf=""
-    for dir in "${dirs[@]}"; do
-        for cf in "$dir"/cloudflared* ; do
-            if [[ -f "$cf" ]] && is_valid_executable "$cf"; then
-                found_cf="$cf"
-                break 2
-            fi
-        done
-    done
-    
-    if [[ -n "$found_cf" ]]; then
-        ln -sf "$found_cf" /usr/local/bin/cloudflared 2>/dev/null || true
-        ln -sf "$found_cf" "${CLOUDFLARED_DIR}/cloudflared" 2>/dev/null || true
-    fi
-    
-    echo -e "${GREEN}完成${NC}"
 }
 
 download_cloudflared() {
     mkdir -p "$CLOUDFLARED_DIR"
-    mkdir -p "/root/.phantom/bin"
-    
     local arch
     arch=$(get_arch)
     local cf_file="cloudflared-linux-${arch}"
+    local cf_path="${CLOUDFLARED_DIR}/cloudflared"
     
-    # 检查已存在
-    local existing_cf=""
-    for path in "$CLOUDFLARED_PATH" "/usr/local/bin/cloudflared" "/root/.phantom/bin/cloudflared"*; do
-        if [[ -f "$path" ]] && [[ -x "$path" ]]; then
-            existing_cf="$path"
-            break
-        fi
-    done
-    
-    if [[ -n "$existing_cf" ]]; then
-        info "cloudflared 已存在: $existing_cf"
-        chmod +x "$existing_cf"
-        ln -sf "$existing_cf" "$CLOUDFLARED_PATH" 2>/dev/null || true
-        ln -sf "$existing_cf" /usr/local/bin/cloudflared 2>/dev/null || true
+    if [[ -x "$cf_path" ]]; then
+        info "cloudflared 已存在"
         return 0
     fi
     
@@ -459,11 +428,9 @@ download_cloudflared() {
     
     for url in "${cf_urls[@]}"; do
         echo -n "    尝试 $(echo "$url" | cut -d'/' -f3)... "
-        if curl -fsSL --connect-timeout 15 -o "$CLOUDFLARED_PATH" "$url" 2>/dev/null; then
-            if [[ -s "$CLOUDFLARED_PATH" ]]; then
-                chmod +x "$CLOUDFLARED_PATH"
-                ln -sf "$CLOUDFLARED_PATH" /usr/local/bin/cloudflared 2>/dev/null || true
-                ln -sf "$CLOUDFLARED_PATH" /root/.phantom/bin/cloudflared 2>/dev/null || true
+        if curl -fsSL --connect-timeout 15 -o "$cf_path" "$url" 2>/dev/null; then
+            chmod +x "$cf_path"
+            if [[ -x "$cf_path" ]]; then
                 echo -e "${GREEN}成功${NC}"
                 info "cloudflared 已安装"
                 return 0
@@ -477,43 +444,11 @@ download_cloudflared() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 创建权限修复脚本
-# ─────────────────────────────────────────────────────────────────────────────
-create_fix_permissions_script() {
-    cat > /opt/phantom/fix-permissions.sh << 'FIXSCRIPT'
-#!/bin/bash
-# 修复 cloudflared 权限
-for dir in /opt/phantom/bin /root/.phantom/bin /usr/local/bin; do
-    [[ -d "$dir" ]] && find "$dir" -type f -name "cloudflared*" -exec chmod +x {} \; 2>/dev/null
-done
-
-# 创建软链接
-for cf in /root/.phantom/bin/cloudflared* /opt/phantom/bin/cloudflared*; do
-    if [[ -f "$cf" && -x "$cf" ]]; then
-        ln -sf "$cf" /usr/local/bin/cloudflared 2>/dev/null
-        ln -sf "$cf" /opt/phantom/bin/cloudflared 2>/dev/null
-        break
-    fi
-done
-
-# 修复主程序
-chmod +x /opt/phantom/phantom-server 2>/dev/null
-
-# BPF 文件系统
-mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf 2>/dev/null
-mkdir -p /sys/fs/bpf/phantom 2>/dev/null
-chmod 755 /sys/fs/bpf/phantom 2>/dev/null
-
-exit 0
-FIXSCRIPT
-    chmod +x /opt/phantom/fix-permissions.sh
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
 # 服务管理
 # ─────────────────────────────────────────────────────────────────────────────
 safe_stop_service() {
     echo -n "  停止服务... "
+    
     systemctl stop phantom 2>/dev/null || true
     
     local max_wait=10 waited=0
@@ -521,6 +456,7 @@ safe_stop_service() {
         sleep 1
         ((waited++))
     done
+    
     pkill -9 -f "phantom-server" 2>/dev/null || true
     echo -e "${GREEN}完成${NC}"
 }
@@ -529,19 +465,18 @@ pre_start_cleanup() {
     step "执行启动前清理"
     safe_stop_service
     cleanup_ebpf_hooks
-    setup_bpf_filesystem
     fix_cloudflared_permissions
     sleep 2
 }
 
 apply_config() {
-    fix_cloudflared_permissions
     systemctl daemon-reload 2>/dev/null || true
     systemctl restart phantom 2>/dev/null || true
     sleep 3
     
     local status
     status=$(get_service_status)
+    
     if [[ "$status" == "active" ]]; then
         success "服务已启动"
         return 0
@@ -563,22 +498,41 @@ print_logo() {
     echo ' |  __/| | | | (_| | | | | || (_) | | | | | |'
     echo ' |_|   |_| |_|\__,_|_| |_|\__\___/|_| |_| |_|'
     echo -e "${NC}"
-    echo -e "                                    ${BOLD}v6.1-fix${NC}"
+    echo -e "                                    ${BOLD}v6.1${NC}"
     echo ""
 }
 
 show_status() {
     local status
     status=$(get_service_status)
+    
     local color="$RED" status_text="✗ 未安装"
     
     case "$status" in
-        active)        color="$GREEN";  status_text="● 运行中" ;;
-        inactive)      color="$YELLOW"; status_text="○ 已停止" ;;
-        failed)        color="$RED";    status_text="✗ 启动失败" ;;
-        not-installed) color="$RED";    status_text="✗ 未安装" ;;
-        no-systemd)    color="$YELLOW"; status_text="? 无 systemd" ;;
-        *)             color="$YELLOW"; status_text="? 未知状态" ;;
+        active)
+            color="$GREEN"
+            status_text="● 运行中"
+            ;;
+        inactive)
+            color="$YELLOW"
+            status_text="○ 已停止"
+            ;;
+        failed)
+            color="$RED"
+            status_text="✗ 启动失败"
+            ;;
+        not-installed)
+            color="$RED"
+            status_text="✗ 未安装"
+            ;;
+        no-systemd)
+            color="$YELLOW"
+            status_text="? 无 systemd"
+            ;;
+        *)
+            color="$YELLOW"
+            status_text="? 未知状态"
+            ;;
     esac
     
     echo -e "状态: ${color}${BOLD}${status_text}${NC}"
@@ -647,10 +601,12 @@ guided_install() {
     read -rp "开始安装 [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
         echo "已取消安装"
-        return 0
+        exit 0
     fi
     
+    # ═══════════════════════════════════════════════════════════════════════
     # 第 1 步：基础配置
+    # ═══════════════════════════════════════════════════════════════════════
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     step "第 1 步：基础配置"
@@ -665,7 +621,9 @@ guided_install() {
     PSK=$(generate_psk)
     info "PSK 已生成: ${CYAN}${PSK}${NC}"
     
+    # ═══════════════════════════════════════════════════════════════════════
     # 第 2 步：环境检测
+    # ═══════════════════════════════════════════════════════════════════════
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     step "第 2 步：环境检测"
@@ -673,7 +631,6 @@ guided_install() {
     echo ""
     
     install_dependencies
-    setup_bpf_filesystem
     
     local ebpf_support ebpf_enabled xdp_mode
     ebpf_support=$(check_ebpf_support)
@@ -694,7 +651,9 @@ guided_install() {
             ;;
     esac
     
+    # ═══════════════════════════════════════════════════════════════════════
     # 第 3 步：选择连接方式
+    # ═══════════════════════════════════════════════════════════════════════
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     step "第 3 步：选择连接方式"
@@ -732,6 +691,8 @@ guided_install() {
                 fi
             fi
             info "隧道模式: ${TUNNEL_MODE}"
+            
+            # 下载 cloudflared
             download_cloudflared
             ;;
         3)
@@ -740,18 +701,21 @@ guided_install() {
             ;;
     esac
     
+    # ═══════════════════════════════════════════════════════════════════════
     # 第 4 步：下载程序
+    # ═══════════════════════════════════════════════════════════════════════
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     step "第 4 步：下载程序"
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
-    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$EBPF_DIR" "$CLOUDFLARED_DIR"
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$EBPF_DIR"
     local arch
     arch=$(get_arch)
     info "系统: linux/${arch}"
     
+    # 下载主程序
     echo "  下载主程序..."
     if [[ -f "./phantom-server" ]]; then
         cp "./phantom-server" "$INSTALL_DIR/phantom-server"
@@ -768,19 +732,21 @@ guided_install() {
         chmod +x "$INSTALL_DIR/phantom-server"
     fi
     
+    # 验证主程序
     if ! is_valid_executable "$INSTALL_DIR/phantom-server"; then
         die "程序文件无效" 1
     fi
     
+    # 下载 eBPF 程序
     if [[ "$ebpf_support" != "none" ]]; then
         if download_ebpf_programs; then
             ebpf_enabled="true"
         fi
     fi
     
-    create_fix_permissions_script
-    
+    # ═══════════════════════════════════════════════════════════════════════
     # 第 5 步：生成配置
+    # ═══════════════════════════════════════════════════════════════════════
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     step "第 5 步：生成配置"
@@ -791,15 +757,21 @@ guided_install() {
     iface=$(get_iface)
     
     cat > "$CONFIG_FILE" << EOF
-# Phantom Server v6.1-fix 配置文件
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phantom Server v6.1 配置文件
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+# ═══════════════════════════════════════════════════════════════════════════════
 
+# 基础配置
 listen: ":${PORT}"
 psk: "${PSK}"
 time_window: 30
 log_level: "info"
 mode: "auto"
 
+# ───────────────────────────────────────────────────────────────────────────────
+# Cloudflare 隧道
+# ───────────────────────────────────────────────────────────────────────────────
 tunnel:
   enabled: ${USE_TUNNEL}
   mode: "${TUNNEL_MODE}"
@@ -807,8 +779,11 @@ tunnel:
   local_addr: "127.0.0.1"
   local_port: ${PORT}
   protocol: "http"
-  cloudflared_path: "/usr/local/bin/cloudflared"
+  cloudflared_path: "${CLOUDFLARED_DIR}/cloudflared"
 
+# ───────────────────────────────────────────────────────────────────────────────
+# DDNS 动态域名
+# ───────────────────────────────────────────────────────────────────────────────
 ddns:
   enabled: false
   provider: "none"
@@ -823,6 +798,9 @@ ddns:
     zone_id: ""
     record_name: ""
 
+# ───────────────────────────────────────────────────────────────────────────────
+# 证书配置
+# ───────────────────────────────────────────────────────────────────────────────
 cert:
   mode: "auto"
   domain: "${DOMAIN}"
@@ -832,6 +810,9 @@ cert:
   acme_provider: "letsencrypt"
   acme_use_tunnel: true
 
+# ───────────────────────────────────────────────────────────────────────────────
+# TLS 深度伪装
+# ───────────────────────────────────────────────────────────────────────────────
 tls:
   enabled: false
   server_name: "${DOMAIN:-www.microsoft.com}"
@@ -854,6 +835,9 @@ tls:
     addr: "127.0.0.1:80"
     timeout_ms: 5000
 
+# ───────────────────────────────────────────────────────────────────────────────
+# eBPF 内核加速
+# ───────────────────────────────────────────────────────────────────────────────
 ebpf:
   enabled: ${ebpf_enabled}
   interface: "${iface}"
@@ -863,6 +847,9 @@ ebpf:
   enable_stats: true
   enable_tc: true
 
+# ───────────────────────────────────────────────────────────────────────────────
+# FakeTCP 伪装
+# ───────────────────────────────────────────────────────────────────────────────
 faketcp:
   enabled: true
   listen: ":$((PORT+1))"
@@ -870,6 +857,9 @@ faketcp:
   use_ebpf: false
   mtu: 1400
 
+# ───────────────────────────────────────────────────────────────────────────────
+# WebSocket 传输
+# ───────────────────────────────────────────────────────────────────────────────
 websocket:
   enabled: true
   listen: ":$((PORT+2))"
@@ -878,12 +868,18 @@ websocket:
   tls: false
   compression: false
 
+# ───────────────────────────────────────────────────────────────────────────────
+# Hysteria2 拥塞控制
+# ───────────────────────────────────────────────────────────────────────────────
 hysteria2:
   enabled: true
   up_mbps: 100
   down_mbps: 100
   loss_threshold: 0.1
 
+# ───────────────────────────────────────────────────────────────────────────────
+# ARQ 可靠传输
+# ───────────────────────────────────────────────────────────────────────────────
 arq:
   enabled: true
   window_size: 256
@@ -892,6 +888,9 @@ arq:
   rto_max_ms: 10000
   enable_sack: true
 
+# ───────────────────────────────────────────────────────────────────────────────
+# 智能切换器
+# ───────────────────────────────────────────────────────────────────────────────
 switcher:
   enabled: true
   check_interval_ms: 1000
@@ -905,6 +904,9 @@ switcher:
     - "udp"
     - "websocket"
 
+# ───────────────────────────────────────────────────────────────────────────────
+# 监控指标
+# ───────────────────────────────────────────────────────────────────────────────
 metrics:
   enabled: true
   listen: ":9100"
@@ -915,13 +917,15 @@ EOF
     
     info "配置已生成"
     
+    # ═══════════════════════════════════════════════════════════════════════
     # 第 6 步：配置服务
+    # ═══════════════════════════════════════════════════════════════════════
     echo ""
     step "第 6 步：配置服务"
     
     cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=Phantom Server v6.1-fix
+Description=Phantom Server v6.1
 Documentation=https://github.com/mrcgq/222
 After=network-online.target
 Wants=network-online.target
@@ -930,11 +934,8 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=${INSTALL_DIR}
-ExecStartPre=/opt/phantom/fix-permissions.sh
 ExecStartPre=-/sbin/ip link set dev ${iface} xdp off
 ExecStartPre=-/bin/rm -rf /sys/fs/bpf/phantom
-ExecStartPre=-/bin/mkdir -p /sys/fs/bpf/phantom
-ExecStartPre=-/bin/chmod 755 /sys/fs/bpf/phantom
 ExecStart=${INSTALL_DIR}/phantom-server -c ${CONFIG_FILE}
 ExecStopPost=-/sbin/ip link set dev ${iface} xdp off
 ExecStopPost=-/bin/rm -rf /sys/fs/bpf/phantom
@@ -954,7 +955,9 @@ EOF
     systemctl enable phantom 2>/dev/null || true
     info "服务已配置"
     
+    # ═══════════════════════════════════════════════════════════════════════
     # 第 7 步：启动服务
+    # ═══════════════════════════════════════════════════════════════════════
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     step "第 7 步：启动服务"
@@ -973,27 +976,25 @@ EOF
     if [[ "$status" == "active" ]]; then
         echo -e "${GREEN}成功${NC}"
         
+        # 等待隧道URL
         if [[ "$USE_TUNNEL" == "true" ]]; then
             echo -n "  等待隧道URL... "
-            local max_wait=15 waited=0 tunnel_url=""
-            while [[ $waited -lt $max_wait ]]; do
-                sleep 2
-                ((waited+=2))
-                tunnel_url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | \
-                            grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1) || tunnel_url=""
-                if [[ -n "$tunnel_url" ]]; then
-                    echo -e "${GREEN}成功${NC}"
-                    echo -e "  隧道地址: ${CYAN}${tunnel_url}${NC}"
-                    break
-                fi
-            done
-            [[ -z "$tunnel_url" ]] && echo -e "${YELLOW}等待中${NC}"
+            sleep 5
+            local tunnel_url
+            tunnel_url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | \
+                        grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1) || tunnel_url=""
+            if [[ -n "$tunnel_url" ]]; then
+                echo -e "${GREEN}成功${NC}"
+            else
+                echo -e "${YELLOW}等待中${NC}"
+            fi
         fi
         
         echo ""
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${GREEN}${BOLD}           🎉 安装完成！${NC}"
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        
         show_connection_info
     else
         echo -e "${RED}失败${NC}"
@@ -1019,6 +1020,7 @@ manage_tunnel() {
     echo -e "当前状态: ${CYAN}${tunnel_st:-false}${NC}"
     echo -e "模式: ${CYAN}${tunnel_mode:-temp}${NC}"
     
+    # 显示当前隧道URL
     if [[ "$tunnel_st" == "true" ]]; then
         local tunnel_url
         tunnel_url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | \
@@ -1032,7 +1034,6 @@ manage_tunnel() {
     echo "2. 启用固定隧道"
     echo "3. 禁用隧道"
     echo "4. 查看隧道日志"
-    echo "5. 修复 cloudflared 权限"
     echo "0. 返回"
     echo "─────────────────────────────────────"
     
@@ -1042,7 +1043,6 @@ manage_tunnel() {
     case $opt in
         1)
             download_cloudflared
-            fix_cloudflared_permissions
             yaml_set_section "tunnel" "enabled" "true"
             yaml_set_section "tunnel" "mode" "\"temp\""
             info "临时隧道已启用"
@@ -1057,7 +1057,6 @@ manage_tunnel() {
             read -rp "Cloudflare Tunnel Token: " cf_token
             if [[ -n "$cf_token" ]]; then
                 download_cloudflared
-                fix_cloudflared_permissions
                 yaml_set_section "tunnel" "enabled" "true"
                 yaml_set_section "tunnel" "mode" "\"fixed\""
                 yaml_set_section "tunnel" "cf_token" "\"${cf_token}\""
@@ -1074,15 +1073,7 @@ manage_tunnel() {
             ;;
         4)
             echo ""
-            journalctl -u phantom -n 50 --no-pager 2>/dev/null | grep -E "隧道|tunnel|Tunnel|cloudflare|permission" || echo "无相关日志"
-            ;;
-        5)
-            fix_cloudflared_permissions
-            echo ""
-            echo "cloudflared 文件状态:"
-            ls -la /opt/phantom/bin/cloudflared* 2>/dev/null || echo "  /opt/phantom/bin/ 无文件"
-            ls -la /root/.phantom/bin/cloudflared* 2>/dev/null || echo "  /root/.phantom/bin/ 无文件"
-            ls -la /usr/local/bin/cloudflared* 2>/dev/null || echo "  /usr/local/bin/ 无文件"
+            journalctl -u phantom -n 50 --no-pager 2>/dev/null | grep -E "隧道|tunnel|Tunnel|cloudflare" || echo "无相关日志"
             ;;
     esac
 }
@@ -1201,6 +1192,8 @@ manage_cert() {
                 yaml_set_section "cert" "email" "\"${email}\""
                 yaml_set_section "tls" "server_name" "\"${new_domain}\""
                 info "ACME 配置完成"
+                echo ""
+                echo "证书将在首次连接时自动申请"
                 apply_config
             fi
             ;;
@@ -1243,7 +1236,7 @@ manage_tls() {
     echo ""
     echo "─────────────────────────────────────"
     echo "1. 启用/禁用 TLS 伪装"
-    echo "2. 修改 SNI"
+    echo "2. 修改 SNI (伪装域名)"
     echo "3. 修改指纹类型"
     echo "4. 修改分片设置"
     echo "5. 配置回落"
@@ -1265,26 +1258,38 @@ manage_tls() {
             apply_config
             ;;
         2)
+            echo ""
+            echo "常用伪装域名:"
+            echo "  www.microsoft.com"
+            echo "  www.apple.com"
+            echo "  www.cloudflare.com"
             local new_sni
             read -rp "SNI 域名: " new_sni
             [[ -n "$new_sni" ]] && yaml_set_section "tls" "server_name" "\"${new_sni}\""
             apply_config
             ;;
         3)
+            echo ""
+            echo "可用指纹: chrome, firefox, safari, edge, ios, android, random"
             local new_fp
-            read -rp "指纹 (chrome/firefox/safari): " new_fp
+            read -rp "指纹: " new_fp
             [[ -n "$new_fp" ]] && yaml_set_section "tls" "fingerprint" "\"${new_fp}\""
             apply_config
             ;;
         4)
+            echo ""
+            echo "分片可绕过 SNI 嗅探"
             local frag_size frag_sleep
             read -rp "分片大小 [40]: " frag_size
             read -rp "分片间隔 ms [10]: " frag_sleep
+            
             [[ -n "$frag_size" ]] && sed -i "/fragment:/,/fallback:/ s/size:.*/size: ${frag_size}/" "$CONFIG_FILE"
             [[ -n "$frag_sleep" ]] && sed -i "/fragment:/,/fallback:/ s/sleep_ms:.*/sleep_ms: ${frag_sleep}/" "$CONFIG_FILE"
             apply_config
             ;;
         5)
+            echo ""
+            echo "回落: 非法连接将转发到伪装站点"
             local fb_addr
             read -rp "回落地址 [127.0.0.1:80]: " fb_addr
             fb_addr=${fb_addr:-127.0.0.1:80}
@@ -1322,6 +1327,8 @@ manage_switcher() {
     
     case $opt in
         1)
+            echo ""
+            echo "可用: ebpf, faketcp, udp, tcp, websocket"
             local priority
             read -rp "优先级 (逗号分隔): " priority
             [[ -n "$priority" ]] && yaml_set_array "switcher" "priority" "$priority"
@@ -1346,8 +1353,9 @@ manage_switcher() {
             apply_config
             ;;
         5)
+            echo "可选: auto, ebpf, faketcp, udp, websocket"
             local lock_mode
-            read -rp "锁定模式 (auto/ebpf/faketcp/udp/websocket): " lock_mode
+            read -rp "锁定模式: " lock_mode
             yaml_set_top "mode" "\"${lock_mode}\""
             apply_config
             ;;
@@ -1399,8 +1407,9 @@ manage_basic() {
             apply_config
             ;;
         3)
+            echo "可选: debug, info, warn, error"
             local level
-            read -rp "日志级别 (debug/info/warn/error): " level
+            read -rp "日志级别: " level
             yaml_set_top "log_level" "\"${level}\""
             apply_config
             ;;
@@ -1551,13 +1560,27 @@ view_config() {
     case $opt in
         1)
             echo ""
-            [[ -f "$CONFIG_FILE" ]] && cat "$CONFIG_FILE" || echo "配置文件不存在"
+            if [[ -f "$CONFIG_FILE" ]]; then
+                cat "$CONFIG_FILE"
+            else
+                echo "配置文件不存在"
+            fi
             ;;
         2)
-            command -v nano &>/dev/null && { nano "$CONFIG_FILE"; apply_config; } || error "nano 未安装"
+            if command -v nano &>/dev/null; then
+                nano "$CONFIG_FILE"
+                apply_config
+            else
+                error "nano 未安装"
+            fi
             ;;
         3)
-            command -v vim &>/dev/null && { vim "$CONFIG_FILE"; apply_config; } || error "vim 未安装"
+            if command -v vim &>/dev/null; then
+                vim "$CONFIG_FILE"
+                apply_config
+            else
+                error "vim 未安装"
+            fi
             ;;
         4)
             local backup="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
@@ -1576,158 +1599,27 @@ status_check() {
     systemctl status phantom --no-pager 2>/dev/null || echo "服务未安装"
     
     echo ""
-    echo "═══════════════ cloudflared 状态 ═══════════════"
-    for path in /opt/phantom/bin/cloudflared* /root/.phantom/bin/cloudflared* /usr/local/bin/cloudflared*; do
-        [[ -f "$path" ]] && echo "  $path -> $(ls -la "$path" 2>/dev/null | awk '{print $1}')"
-    done
-    
-    echo ""
     echo "═══════════════ eBPF 状态 ═══════════════"
     if command -v bpftool &>/dev/null; then
-        bpftool prog list 2>/dev/null | head -10 || echo "  无 BPF 程序"
+        echo "BPF 程序:"
+        bpftool prog list 2>/dev/null | head -10 || echo "  无"
     else
         echo "bpftool 未安装"
     fi
+    
+    echo ""
+    echo "═══════════════ 网卡 XDP ═══════════════"
+    local iface
+    iface=$(get_iface)
+    ip link show "$iface" 2>/dev/null | grep -E "xdp|prog" || echo "  无 XDP 程序"
     
     echo ""
     echo "═══════════════ 端口监听 ═══════════════"
     ss -tulnp 2>/dev/null | grep -E "phantom|54321|54322|54323|9100" || echo "  无"
     
     echo ""
-    echo "═══════════════ 最近错误 ═══════════════"
-    journalctl -u phantom -n 20 --no-pager 2>/dev/null | grep -iE "error|failed|permission|denied" || echo "  无错误"
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 快速修复
-# ─────────────────────────────────────────────────────────────────────────────
-quick_fix() {
-    print_logo
-    step "快速修复工具"
-    echo ""
-    
-    echo "─────────────────────────────────────"
-    echo "1. 修复所有权限问题"
-    echo "2. 重新下载 cloudflared"
-    echo "3. 重置 BPF 文件系统"
-    echo "4. 完全重置服务"
-    echo "5. 一键全部修复"
-    echo "0. 返回"
-    echo "─────────────────────────────────────"
-    
-    local opt
-    read -rp "选择: " opt
-    
-    case $opt in
-        1)
-            step "修复权限..."
-            fix_cloudflared_permissions
-            chmod +x "$INSTALL_DIR/phantom-server" 2>/dev/null || true
-            chmod +x /opt/phantom/fix-permissions.sh 2>/dev/null || true
-            info "权限修复完成"
-            ;;
-        2)
-            step "重新下载 cloudflared..."
-            rm -f "$CLOUDFLARED_PATH" /usr/local/bin/cloudflared /root/.phantom/bin/cloudflared* 2>/dev/null
-            download_cloudflared
-            fix_cloudflared_permissions
-            info "cloudflared 重新下载完成"
-            ;;
-        3)
-            step "重置 BPF 文件系统..."
-            cleanup_ebpf_hooks
-            setup_bpf_filesystem
-            info "BPF 文件系统已重置"
-            ;;
-        4)
-            step "完全重置服务..."
-            safe_stop_service
-            cleanup_ebpf_hooks
-            systemctl daemon-reload 2>/dev/null || true
-            sleep 2
-            systemctl start phantom 2>/dev/null || true
-            sleep 3
-            systemctl status phantom --no-pager 2>/dev/null || echo "启动状态未知"
-            ;;
-        5)
-            step "执行一键全部修复..."
-            echo ""
-            
-            echo "  [1/5] 停止服务..."
-            safe_stop_service
-            
-            echo "  [2/5] 清理 eBPF..."
-            cleanup_ebpf_hooks
-            
-            echo "  [3/5] 设置 BPF 文件系统..."
-            setup_bpf_filesystem
-            
-            echo "  [4/5] 修复 cloudflared..."
-            local cf_exists=false
-            for cf in /opt/phantom/bin/cloudflared* /root/.phantom/bin/cloudflared*; do
-                if [[ -f "$cf" ]]; then
-                    cf_exists=true
-                    break
-                fi
-            done
-            
-            if ! $cf_exists; then
-                download_cloudflared
-            fi
-            fix_cloudflared_permissions
-            
-            echo "  [5/5] 修复主程序权限..."
-            chmod +x "$INSTALL_DIR/phantom-server" 2>/dev/null || true
-            chmod +x /opt/phantom/fix-permissions.sh 2>/dev/null || true
-            
-            echo ""
-            step "重新启动服务..."
-            systemctl daemon-reload 2>/dev/null || true
-            systemctl start phantom 2>/dev/null || true
-            sleep 5
-            
-            local status
-            status=$(get_service_status)
-            
-            if [[ "$status" == "active" ]]; then
-                success "服务已成功启动！"
-                echo ""
-                
-                local tunnel_enabled
-                tunnel_enabled=$(yaml_get "tunnel" "enabled")
-                if [[ "$tunnel_enabled" == "true" ]]; then
-                    echo "等待隧道 URL..."
-                    sleep 5
-                    local tunnel_url
-                    tunnel_url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | \
-                                grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1) || tunnel_url=""
-                    if [[ -n "$tunnel_url" ]]; then
-                        echo -e "隧道地址: ${CYAN}${tunnel_url}${NC}"
-                    else
-                        local perm_err
-                        perm_err=$(journalctl -u phantom -n 50 --no-pager 2>/dev/null | grep -i "permission denied") || perm_err=""
-                        if [[ -n "$perm_err" ]]; then
-                            warn "仍有权限问题，尝试额外修复..."
-                            chmod 755 /root/.phantom/bin/cloudflared* 2>/dev/null || true
-                            ln -sf /root/.phantom/bin/cloudflared* /usr/local/bin/cloudflared 2>/dev/null || true
-                            systemctl restart phantom 2>/dev/null || true
-                            sleep 5
-                            tunnel_url=$(journalctl -u phantom -n 100 --no-pager 2>/dev/null | \
-                                        grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1) || tunnel_url=""
-                            [[ -n "$tunnel_url" ]] && echo -e "隧道地址: ${CYAN}${tunnel_url}${NC}"
-                        fi
-                    fi
-                fi
-                
-                show_connection_info
-            else
-                error "服务启动失败"
-                echo ""
-                echo "最近日志:"
-                journalctl -u phantom -n 30 --no-pager 2>/dev/null || echo "无法获取日志"
-            fi
-            ;;
-    esac
+    echo "═══════════════ eBPF 文件 ═══════════════"
+    ls -la "${EBPF_DIR}/" 2>/dev/null || echo "  目录不存在"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1753,13 +1645,13 @@ show_menu() {
         echo ""
         echo -e "${BOLD}═══════════════════ 运维工具 ═══════════════════${NC}"
         echo " 14. 查看日志   15. 查看配置   16. 状态检查"
-        echo " 17. 连接信息   ${RED}18. 快速修复${NC}"
+        echo " 17. 连接信息"
         echo ""
         echo "  0. 退出"
         echo ""
         
         local opt
-        read -rp "选择 [0-18]: " opt
+        read -rp "选择 [0-17]: " opt
         
         case $opt in
             1)
@@ -1772,7 +1664,6 @@ show_menu() {
                 if [[ "$confirm" == "YES" ]]; then
                     pre_start_cleanup
                     rm -rf "$INSTALL_DIR" "$CONFIG_DIR" "$SERVICE_FILE" 2>/dev/null || true
-                    rm -rf /root/.phantom 2>/dev/null || true
                     systemctl daemon-reload 2>/dev/null || true
                     info "已卸载"
                 fi
@@ -1832,9 +1723,6 @@ show_menu() {
             17)
                 show_connection_info
                 ;;
-            18)
-                quick_fix
-                ;;
             0)
                 echo ""
                 info "再见！"
@@ -1851,30 +1739,7 @@ show_menu() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 命令行参数支持
-# ─────────────────────────────────────────────────────────────────────────────
-show_help() {
-    echo "Phantom Server 管理脚本 v6.1-fix"
-    echo ""
-    echo "用法: $0 [命令]"
-    echo ""
-    echo "命令:"
-    echo "  install     安装向导"
-    echo "  start       启动服务"
-    echo "  stop        停止服务"
-    echo "  restart     重启服务"
-    echo "  status      查看状态"
-    echo "  logs        查看日志"
-    echo "  fix         快速修复"
-    echo "  fix-perm    修复权限"
-    echo "  info        显示连接信息"
-    echo "  uninstall   卸载"
-    echo ""
-    echo "无参数时进入交互式菜单"
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 主入口函数
+# 入口点
 # ─────────────────────────────────────────────────────────────────────────────
 main() {
     # 检查 root 权限
@@ -1886,95 +1751,18 @@ main() {
     fi
     
     # 确保目录存在
-    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$CLOUDFLARED_DIR" 2>/dev/null || true
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" 2>/dev/null || true
     
-    # 处理命令行参数
-    case "${1:-}" in
-        install)
-            guided_install
-            ;;
-        start)
-            pre_start_cleanup
-            systemctl start phantom 2>/dev/null || true
-            sleep 2
-            systemctl status phantom --no-pager 2>/dev/null || echo "启动失败"
-            show_connection_info
-            ;;
-        stop)
-            safe_stop_service
-            cleanup_ebpf_hooks
-            info "服务已停止"
-            ;;
-        restart)
-            pre_start_cleanup
-            systemctl start phantom 2>/dev/null || true
-            sleep 2
-            systemctl status phantom --no-pager 2>/dev/null || echo "启动失败"
-            show_connection_info
-            ;;
-        status)
-            systemctl status phantom --no-pager 2>/dev/null || echo "服务未安装"
-            show_connection_info
-            ;;
-        logs)
-            journalctl -u phantom -f -n 100 2>/dev/null || echo "无法获取日志"
-            ;;
-        fix)
-            step "执行快速修复..."
-            safe_stop_service
-            cleanup_ebpf_hooks
-            setup_bpf_filesystem
-            fix_cloudflared_permissions
-            chmod +x "$INSTALL_DIR/phantom-server" 2>/dev/null || true
-            systemctl daemon-reload 2>/dev/null || true
-            systemctl start phantom 2>/dev/null || true
-            sleep 5
-            systemctl status phantom --no-pager 2>/dev/null || echo "启动失败"
-            show_connection_info
-            ;;
-        fix-perm)
-            fix_cloudflared_permissions
-            chmod +x "$INSTALL_DIR/phantom-server" 2>/dev/null || true
-            info "权限修复完成"
-            echo ""
-            echo "cloudflared 文件:"
-            ls -la /opt/phantom/bin/cloudflared* 2>/dev/null || echo "  无"
-            ls -la /root/.phantom/bin/cloudflared* 2>/dev/null || echo "  无"
-            ls -la /usr/local/bin/cloudflared* 2>/dev/null || echo "  无"
-            ;;
-        info)
-            show_connection_info
-            ;;
-        uninstall)
-            local confirm
-            read -rp "确认卸载？输入 YES 确认: " confirm
-            if [[ "$confirm" == "YES" ]]; then
-                safe_stop_service
-                cleanup_ebpf_hooks
-                rm -rf "$INSTALL_DIR" "$CONFIG_DIR" "$SERVICE_FILE" 2>/dev/null || true
-                rm -rf /root/.phantom 2>/dev/null || true
-                systemctl daemon-reload 2>/dev/null || true
-                info "已卸载"
-            fi
-            ;;
-        -h|--help|help)
-            show_help
-            ;;
-        *)
-            # 默认：进入交互式菜单
-            if [[ -f "$CONFIG_FILE" ]]; then
-                show_menu
-            else
-                guided_install
-                echo ""
-                read -rp "按 Enter 进入管理菜单..."
-                show_menu
-            fi
-            ;;
-    esac
+    # 根据配置文件是否存在决定流程
+    if [[ -f "$CONFIG_FILE" ]]; then
+        show_menu
+    else
+        guided_install
+        echo ""
+        read -rp "按 Enter 进入管理菜单..."
+        show_menu
+    fi
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 运行主函数
-# ─────────────────────────────────────────────────────────────────────────────
 main "$@"
