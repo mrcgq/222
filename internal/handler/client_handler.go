@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/mrcgq/211/internal/congestion"
 	"github.com/mrcgq/211/internal/crypto"
 	"github.com/mrcgq/211/internal/protocol"
@@ -87,7 +88,56 @@ type PhantomClientHandler struct {
 	}
 }
 
-// fakeTCPAdapter 包装 FakeTCPClient 实现 Transport 接口
+// ============================================
+// WebSocket 适配器 — 把 WebSocket 包装为流式 Transport
+// ============================================
+
+type wsStreamAdapter struct {
+	conn    *websocket.Conn
+	readBuf []byte // 缓存未读完的消息片段
+	mu      sync.Mutex
+}
+
+func (w *wsStreamAdapter) Read(b []byte) (int, error) {
+	// 先消费缓冲区残留
+	if len(w.readBuf) > 0 {
+		n := copy(b, w.readBuf)
+		w.readBuf = w.readBuf[n:]
+		return n, nil
+	}
+
+	// 从 WebSocket 读取一条完整消息
+	_, msg, err := w.conn.ReadMessage()
+	if err != nil {
+		return 0, err
+	}
+
+	n := copy(b, msg)
+	if n < len(msg) {
+		// 调用方 buffer 太小，剩余部分暂存
+		w.readBuf = msg[n:]
+	}
+	return n, nil
+}
+
+func (w *wsStreamAdapter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	err := w.conn.WriteMessage(websocket.BinaryMessage, b)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (w *wsStreamAdapter) Close() error {
+	return w.conn.Close()
+}
+
+// ============================================
+// FakeTCP 适配器 — Linux 专用
+// ============================================
+
 type fakeTCPAdapter struct {
 	client  any
 	readBuf []byte
@@ -127,6 +177,10 @@ func (a *fakeTCPAdapter) Close() error {
 	return nil
 }
 
+// ============================================
+// 核心构造函数 — 根据 TransportMode 选择通道
+// ============================================
+
 func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	timeWindowSec := int(cfg.TimeWindow.Seconds())
 	cry, err := crypto.New(cfg.PSK, timeWindowSec)
@@ -139,23 +193,55 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	var trans Transport
 	serverEndpoint := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.ServerPort)
 
-	if cfg.TransportMode == "faketcp" && runtime.GOOS == "linux" {
+	switch {
+	// ========== WSS / WS 模式（Windows/macOS/Linux 全平台可用）==========
+	case cfg.TransportMode == "wss" || cfg.TransportMode == "ws":
+		scheme := "ws"
+		if cfg.TransportMode == "wss" {
+			scheme = "wss"
+		}
+		// Path 必须与服务端 config.yaml 中的 path 一致
+		url := fmt.Sprintf("%s://%s/ws", scheme, serverEndpoint)
+
+		wsDialer := &websocket.Dialer{
+			HandshakeTimeout: ConnectTimeout,
+			ReadBufferSize:   65535,
+			WriteBufferSize:  65535,
+		}
+
+		wsConn, _, err := wsDialer.Dial(url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("WebSocket 连接失败 (%s): %w", url, err)
+		}
+
+		// 禁用 WebSocket 自带的 close deadline，由我们自己管理超时
+		wsConn.SetReadLimit(0)
+
+		trans = &wsStreamAdapter{conn: wsConn}
+		fmt.Printf("[Client] WebSocket 隧道已建立: %s\n", url)
+
+	// ========== FakeTCP 模式（仅 Linux）==========
+	case cfg.TransportMode == "faketcp" && runtime.GOOS == "linux":
 		ftConfig := transport.DefaultFakeTCPConfig()
 		ftClient, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("FakeTCP 连接失败: %w", err)
 		}
 		trans = &fakeTCPAdapter{client: ftClient}
-	} else {
+		fmt.Printf("[Client] FakeTCP 隧道已建立: %s\n", serverEndpoint)
+
+	// ========== 默认 UDP 模式 ==========
+	default:
 		udpAddr, err := net.ResolveUDPAddr("udp", serverEndpoint)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("解析 UDP 地址失败: %w", err)
 		}
 		conn, err := net.DialUDP("udp", nil, udpAddr)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("UDP 连接失败: %w", err)
 		}
 		trans = conn
+		fmt.Printf("[Client] UDP 隧道已建立: %s\n", serverEndpoint)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -175,6 +261,10 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 
 	return h, nil
 }
+
+// ============================================
+// 加密发送
+// ============================================
 
 func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
 	for !h.controller.CanSend(len(payload)) {
@@ -196,6 +286,10 @@ func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
 	return nil
 }
 
+// ============================================
+// 接收循环
+// ============================================
+
 func (h *PhantomClientHandler) receiveLoop() {
 	defer h.wg.Done()
 	buf := make([]byte, 65535)
@@ -205,10 +299,12 @@ func (h *PhantomClientHandler) receiveLoop() {
 			return
 		default:
 		}
+
 		n, err := h.transport.Read(buf)
 		if err != nil {
 			return
 		}
+
 		decrypted, err := h.crypto.Decrypt(buf[:n])
 		if err != nil {
 			continue
@@ -237,6 +333,10 @@ func (h *PhantomClientHandler) receiveLoop() {
 	}
 }
 
+// ============================================
+// 会话处理入口
+// ============================================
+
 func (h *PhantomClientHandler) Handle(conn net.Conn, targetAddr string, targetPort uint16, initData []byte) error {
 	reqID := atomic.AddUint32(&h.nextReqID, 1)
 	sessionCtx, sessionCancel := context.WithCancel(h.ctx)
@@ -251,13 +351,16 @@ func (h *PhantomClientHandler) Handle(conn net.Conn, targetAddr string, targetPo
 		ctx:        sessionCtx,
 		cancel:     sessionCancel,
 	}
+
 	h.sessionsMu.Lock()
 	h.sessions[reqID] = session
 	h.sessionsMu.Unlock()
 	defer h.unregisterSession(reqID)
 
 	payload, _ := protocol.BuildClientConnectRequest(reqID, protocol.NetworkTCP, targetAddr, targetPort, initData)
-	h.sendEncryptedPacket(payload)
+	if err := h.sendEncryptedPacket(payload); err != nil {
+		return fmt.Errorf("发送连接请求失败: %w", err)
+	}
 
 	if err := h.waitForConnectAck(session); err != nil {
 		return err
@@ -265,6 +368,10 @@ func (h *PhantomClientHandler) Handle(conn net.Conn, targetAddr string, targetPo
 	atomic.StoreInt32(&session.state, StateConnected)
 	return h.runDataRelay(session)
 }
+
+// ============================================
+// 等待连接确认
+// ============================================
 
 func (h *PhantomClientHandler) waitForConnectAck(session *Session) error {
 	timer := time.NewTimer(ConnectTimeout)
@@ -285,6 +392,10 @@ func (h *PhantomClientHandler) waitForConnectAck(session *Session) error {
 		}
 	}
 }
+
+// ============================================
+// 双向数据中继
+// ============================================
 
 func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 	errChan := make(chan error, 2)
@@ -363,6 +474,10 @@ func (h *PhantomClientHandler) relayRemoteToLocal(session *Session) error {
 	}
 }
 
+// ============================================
+// 会话管理
+// ============================================
+
 func (h *PhantomClientHandler) unregisterSession(reqID uint32) {
 	h.sessionsMu.Lock()
 	if s, ok := h.sessions[reqID]; ok {
@@ -372,6 +487,10 @@ func (h *PhantomClientHandler) unregisterSession(reqID uint32) {
 	}
 	h.sessionsMu.Unlock()
 }
+
+// ============================================
+// 心跳与维护
+// ============================================
 
 func (h *PhantomClientHandler) maintenanceLoop() {
 	defer h.wg.Done()
@@ -416,11 +535,19 @@ func (h *PhantomClientHandler) cleanupStaleSessions() {
 	}
 }
 
+// ============================================
+// 关闭
+// ============================================
+
 func (h *PhantomClientHandler) Close() error {
 	h.cancel()
 	h.wg.Wait()
 	return h.transport.Close()
 }
+
+// ============================================
+// 统计
+// ============================================
 
 // Stats 统计信息结构体
 type Stats struct {
