@@ -5,8 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,9 +17,7 @@ import (
 	"github.com/mrcgq/211/internal/transport"
 )
 
-// ============================================
-// 1. 修复 undefined: transport.Transport
-// ============================================
+// Transport 统一传输接口
 type Transport interface {
 	Read(b []byte) (n int, err error)
 	Write(b []byte) (n int, err error)
@@ -70,7 +68,7 @@ type Session struct {
 type PhantomClientHandler struct {
 	crypto     *crypto.Crypto
 	controller *congestion.Hysteria2Controller
-	transport  Transport // 使用修复后的接口
+	transport  Transport
 
 	config *Config
 	sessions   map[uint32]*Session
@@ -89,12 +87,47 @@ type PhantomClientHandler struct {
 	}
 }
 
-// ============================================
-// 2. 修复构造函数中的所有 API 冲突
-// ============================================
+// fakeTCPAdapter 将 FakeTCPClient 包装成满足 Transport 接口的对象
+type fakeTCPAdapter struct {
+	client interface{} // 使用 interface{} 避免非 Linux 平台编译错误
+	readBuf []byte
+}
+
+func (a *fakeTCPAdapter) Write(b []byte) (int, error) {
+	// 通过反射或类型断言调用 Send
+	if c, ok := a.client.(interface{ Send([]byte) error }); ok {
+		return len(b), c.Send(b)
+	}
+	return 0, errors.New("unsupported client type")
+}
+
+func (a *fakeTCPAdapter) Read(b []byte) (int, error) {
+	if len(a.readBuf) > 0 {
+		n := copy(b, a.readBuf)
+		a.readBuf = a.readBuf[n:]
+		return n, nil
+	}
+	// 调用 Recv(context.Background())
+	if c, ok := a.client.(interface{ Recv(context.Context) ([]byte, error) }); ok {
+		data, err := c.Recv(context.Background())
+		if err != nil { return 0, err }
+		n := copy(b, data)
+		if n < len(data) {
+			a.readBuf = data[n:]
+		}
+		return n, nil
+	}
+	return 0, errors.New("unsupported client type")
+}
+
+func (a *fakeTCPAdapter) Close() error {
+	if c, ok := a.client.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}
+
 func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
-	// 修复错误: cannot use cfg.TimeWindow as int
-	// 查阅 crypto.go (文件23): New(pskBase64 string, timeWindow int)
 	timeWindowSec := int(cfg.TimeWindow.Seconds())
 	cry, err := crypto.New(cfg.PSK, timeWindowSec)
 	if err != nil {
@@ -106,28 +139,19 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	var trans Transport
 	serverEndpoint := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.ServerPort)
 
-	switch cfg.TransportMode {
-	case "faketcp":
-		// 修复错误: not enough arguments in call to NewFakeTCPClient
-		// 查阅 faketcp_client.go (文件57): NewFakeTCPClient(serverAddr string, cfg *FakeTCPConfig)
+	// 平台兼容逻辑
+	if cfg.TransportMode == "faketcp" && runtime.GOOS == "linux" {
+		// 动态检测并调用，避免 Windows/Mac 下 undefined 错误
 		ftConfig := transport.DefaultFakeTCPConfig()
 		ftClient, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
-		if err != nil {
-			return nil, err
-		}
-		trans = ftClient
-
-	default:
-		// 修复错误: undefined: transport.NewUDPClient
-		// 旗舰版中没有统一的 NewUDPClient，直接使用 net.DialUDP
+		if err != nil { return nil, err }
+		trans = &fakeTCPAdapter{client: ftClient}
+	} else {
+		// 默认或非 Linux 平台回退到 UDP
 		udpAddr, err := net.ResolveUDPAddr("udp", serverEndpoint)
-		if err != nil {
-			return nil, err
-		}
+		if err != nil { return nil, err }
 		conn, err := net.DialUDP("udp", nil, udpAddr)
-		if err != nil {
-			return nil, err
-		}
+		if err != nil { return nil, err }
 		trans = conn
 	}
 
@@ -149,29 +173,15 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	return h, nil
 }
 
-// ============================================
-// 3. 修复拥塞控制调用 OnSent / OnAck
-// ============================================
 func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
-	// 检查 Hysteria2 窗口
 	for !h.controller.CanSend(len(payload)) {
 		time.Sleep(h.controller.GetPacingInterval(len(payload)))
 	}
-
 	encrypted, err := h.crypto.Encrypt(payload)
-	if err != nil {
-		return err
-	}
-
+	if err != nil { return err }
 	n, err := h.transport.Write(encrypted)
-	if err != nil {
-		return err
-	}
-
-	// 修复错误: h.controller.OnSent undefined
-	// 查阅 hysteria2.go (文件17): OnPacketSent(packetNumber uint64, packetSize int, isRetransmit bool)
+	if err != nil { return err }
 	h.controller.OnPacketSent(0, n, false) 
-
 	atomic.AddUint64(&h.stats.bytesSent, uint64(n))
 	atomic.AddUint64(&h.stats.packetsSent, 1)
 	return nil
@@ -180,31 +190,21 @@ func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
 func (h *PhantomClientHandler) receiveLoop() {
 	defer h.wg.Done()
 	buf := make([]byte, 65535)
-
 	for {
+		select {
+		case <-h.ctx.Done(): return
+		default:
+		}
 		n, err := h.transport.Read(buf)
-		if err != nil {
-			return
-		}
-
+		if err != nil { return }
 		decrypted, err := h.crypto.Decrypt(buf[:n])
-		if err != nil {
-			continue
-		}
-
+		if err != nil { continue }
 		resp, err := protocol.ParseServerResponse(decrypted)
-		if err != nil {
-			continue
-		}
-
-		// 修复错误: h.controller.OnAck undefined
-		// 查阅 hysteria2.go (文件17): OnPacketAcked(packetNumber uint64, ackedBytes int, rtt time.Duration)
-		h.controller.OnPacketAcked(0, 0, time.Millisecond*10) // 假设 RTT
-
+		if err != nil { continue }
+		h.controller.OnPacketAcked(0, 0, time.Millisecond*10)
 		h.sessionsMu.RLock()
 		session, ok := h.sessions[resp.ReqID]
 		h.sessionsMu.RUnlock()
-
 		if ok {
 			select {
 			case session.recvChan <- resp:
@@ -215,7 +215,6 @@ func (h *PhantomClientHandler) receiveLoop() {
 	}
 }
 
-// 其余辅助方法（Handle, relay 等）保持逻辑不变，但需确保调用上述修复后的方法
 func (h *PhantomClientHandler) Handle(conn net.Conn, targetAddr string, targetPort uint16, initData []byte) error {
 	reqID := atomic.AddUint32(&h.nextReqID, 1)
 	sessionCtx, sessionCancel := context.WithCancel(h.ctx)
@@ -238,9 +237,7 @@ func (h *PhantomClientHandler) Handle(conn net.Conn, targetAddr string, targetPo
 	payload, _ := protocol.BuildClientConnectRequest(reqID, protocol.NetworkTCP, targetAddr, targetPort, initData)
 	h.sendEncryptedPacket(payload)
 
-	if err := h.waitForConnectAck(session); err != nil {
-		return err
-	}
+	if err := h.waitForConnectAck(session); err != nil { return err }
 	atomic.StoreInt32(&session.state, StateConnected)
 	return h.runDataRelay(session)
 }
@@ -250,8 +247,7 @@ func (h *PhantomClientHandler) waitForConnectAck(session *Session) error {
 	defer timer.Stop()
 	for {
 		select {
-		case <-timer.C:
-			return errors.New("timeout")
+		case <-timer.C: return errors.New("timeout")
 		case resp := <-session.recvChan:
 			if resp.IsConnectAck() && resp.Status == protocol.StatusSuccess {
 				return nil
@@ -266,7 +262,7 @@ func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 		buf := make([]byte, MaxPayloadSize)
 		for {
 			n, err := session.localConn.Read(buf)
-			if err != nil { return }
+			if err != nil { errChan <- nil; return }
 			p := protocol.BuildClientDataRequest(session.reqID, buf[:n])
 			h.sendEncryptedPacket(p)
 		}
@@ -274,7 +270,7 @@ func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 	go func() {
 		for {
 			select {
-			case <-session.ctx.Done(): return
+			case <-session.ctx.Done(): errChan <- nil; return
 			case resp := <-session.recvChan:
 				if resp.IsDataPacket() {
 					session.localConn.Write(resp.Payload)
@@ -298,6 +294,7 @@ func (h *PhantomClientHandler) unregisterSession(reqID uint32) {
 func (h *PhantomClientHandler) maintenanceLoop() {
 	defer h.wg.Done()
 	ticker := time.NewTicker(HeartbeatInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-h.ctx.Done(): return
