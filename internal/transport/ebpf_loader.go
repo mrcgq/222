@@ -25,15 +25,15 @@ import (
 // =============================================================================
 
 const (
-	DefaultBPFFS    = "/sys/fs/bpf"
-	PinPathPrefix   = "phantom"
+	DefaultBPFFS       = "/sys/fs/bpf"
+	PinPathPrefix      = "phantom"
 	MapNameSessions    = "sessions"
 	MapNameListenPorts = "listen_ports"
 	MapNameConfig      = "config"
 	MapNameStats       = "stats"
 	MapNameEvents      = "events"
 	LinkNameXDP        = "xdp_link"
-	BPFFSMagic uint32  = 0xcafe4a11
+	BPFFSMagic  uint32 = 0xcafe4a11
 )
 
 // PinMode Map Pinning 模式
@@ -899,7 +899,8 @@ func (l *EBPFLoader) ConfigureGlobal(listenPort uint16) error {
 }
 
 // GetStats 获取统计信息
-// 修复：适配 BPF_MAP_TYPE_PERCPU_ARRAY，读取每个 CPU 的值后汇总
+// 修复：适配 Per-CPU Map，同时兼容普通 Map
+// 只引用 EBPFStats 中实际存在的字段
 func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -910,11 +911,12 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 
 	key := uint32(0)
 
-	// 先尝试 Per-CPU 读取（BPF_MAP_TYPE_PERCPU_ARRAY）
+	// 方式1：尝试 Per-CPU 读取（BPF_MAP_TYPE_PERCPU_ARRAY）
 	var statsPerCPU []EBPFStats
 	err := l.statsMap.Lookup(&key, &statsPerCPU)
 	if err == nil && len(statsPerCPU) > 0 {
 		// 汇总所有 CPU 的计数器
+		// 只使用 EBPFStats 结构体中实际定义的字段
 		final := &EBPFStats{}
 		for _, s := range statsPerCPU {
 			final.PacketsRX += s.PacketsRX
@@ -922,24 +924,12 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 			final.BytesRX += s.BytesRX
 			final.BytesTX += s.BytesTX
 			final.PacketsDropped += s.PacketsDropped
-			final.PacketsError += s.PacketsError
 			final.SessionsCreated += s.SessionsCreated
-			final.SessionsClosed += s.SessionsClosed
-			final.SessionsTimeout += s.SessionsTimeout
-			final.CryptoOK += s.CryptoOK
-			final.CryptoFail += s.CryptoFail
-			final.ReplayBlocked += s.ReplayBlocked
-		}
-		// SessionsActive 取最大值而非累加（它是瞬时值，不是计数器）
-		for _, s := range statsPerCPU {
-			if s.SessionsActive > final.SessionsActive {
-				final.SessionsActive = s.SessionsActive
-			}
 		}
 		return final, nil
 	}
 
-	// 回退：尝试普通读取（BPF_MAP_TYPE_ARRAY）
+	// 方式2：回退到普通读取（BPF_MAP_TYPE_ARRAY）
 	var stats EBPFStats
 	if err2 := l.statsMap.Lookup(&key, &stats); err2 != nil {
 		return nil, fmt.Errorf("读取统计失败 (percpu: %v, normal: %v)", err, err2)
