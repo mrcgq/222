@@ -87,7 +87,8 @@ type PhantomClientHandler struct {
 	}
 }
 
-// fakeTCPAdapter 处理 Linux 下 FakeTCPClient 的接口转换
+// fakeTCPAdapter 适配 FakeTCPClient 到 Transport 接口
+// 解决 LocalAddr() 等 net.Conn 缺失方法的问题
 type fakeTCPAdapter struct {
 	conn net.Conn
 }
@@ -97,7 +98,6 @@ func (a *fakeTCPAdapter) Read(b []byte) (int, error)  { return a.conn.Read(b) }
 func (a *fakeTCPAdapter) Close() error                { return a.conn.Close() }
 
 func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
-	// 对齐 96 文件 API: crypto.New 接收 int
 	timeWindowSec := int(cfg.TimeWindow.Seconds())
 	cry, err := crypto.New(cfg.PSK, timeWindowSec)
 	if err != nil {
@@ -109,16 +109,17 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	var trans Transport
 	serverEndpoint := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.ServerPort)
 
-	// 此时无论是 Linux 还是 Windows，NewFakeTCPClient 符号都存在了
 	if cfg.TransportMode == "faketcp" && runtime.GOOS == "linux" {
 		ftConfig := transport.DefaultFakeTCPConfig()
+		// 注意：这里需要确保返回的是 net.Conn
+		// 如果 NewFakeTCPClient 返回的是具体类型，我们需要强制转换或包装
 		ftConn, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
 		if err != nil {
 			return nil, err
 		}
+		// 包装以适配接口
 		trans = &fakeTCPAdapter{conn: ftConn}
 	} else {
-		// 默认或非 Linux 平台强制使用 UDP
 		udpAddr, err := net.ResolveUDPAddr("udp", serverEndpoint)
 		if err != nil {
 			return nil, err
@@ -149,7 +150,6 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 }
 
 func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
-	// 对齐 96 文件 API: Hysteria2 控速
 	for !h.controller.CanSend(len(payload)) {
 		time.Sleep(h.controller.GetPacingInterval(len(payload)))
 	}
@@ -158,7 +158,7 @@ func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
 	n, err := h.transport.Write(encrypted)
 	if err != nil { return err }
 	
-	// 对齐 96 文件 API: OnPacketSent
+	// 对齐 96 文件 API
 	h.controller.OnPacketSent(0, n, false) 
 	
 	atomic.AddUint64(&h.stats.bytesSent, uint64(n))
@@ -182,7 +182,7 @@ func (h *PhantomClientHandler) receiveLoop() {
 		resp, err := protocol.ParseServerResponse(decrypted)
 		if err != nil { continue }
 		
-		// 对齐 96 文件 API: OnPacketAcked
+		// 对齐 96 文件 API
 		h.controller.OnPacketAcked(0, 0, time.Millisecond*10)
 		
 		h.sessionsMu.RLock()
