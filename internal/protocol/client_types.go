@@ -1,7 +1,7 @@
 // internal/protocol/client_types.go
 // 客户端专用协议构建与解析函数
 // 严格匹配服务端 ParseRequest 和 BuildResponse 的字节布局
-// 注意：常量定义在 protocol.go 中，此文件直接复用
+// 注意：TypeConnect / TypeData / TypeClose / AddrXxx / NetworkXxx 定义在 protocol.go 中
 
 package protocol
 
@@ -25,6 +25,40 @@ const (
 	StatusTimeout byte = 0x02
 	StatusRefused byte = 0x03
 )
+
+// ============================================
+// 服务端响应结构
+// ============================================
+
+// ServerResponse 服务端响应结构
+type ServerResponse struct {
+	Type    byte   // 消息类型
+	ReqID   uint32 // 请求ID
+	Status  byte   // 状态码（0x00=成功）
+	Payload []byte // 数据载荷
+}
+
+// IsConnectAck 判断是否为连接确认响应
+// 服务端使用 TypeData + 空 Payload 回复连接结果
+func (r *ServerResponse) IsConnectAck() bool {
+	return r.Type == TypeData && len(r.Payload) == 0
+}
+
+// IsDataPacket 判断是否为数据包
+func (r *ServerResponse) IsDataPacket() bool {
+	return r.Type == TypeData && len(r.Payload) > 0
+}
+
+// IsClosePacket 判断是否为关闭包
+func (r *ServerResponse) IsClosePacket() bool {
+	return r.Type == TypeClose
+}
+
+// IsDisconnect 判断是否为断开连接包（IsClosePacket 的别名）
+// 供 client_handler.go 中 relayRemoteToLocal 调用
+func (r *ServerResponse) IsDisconnect() bool {
+	return r.Type == TypeClose
+}
 
 // ============================================
 // 客户端请求构建函数
@@ -113,14 +147,6 @@ func BuildClientHeartbeat(reqID uint32) []byte {
 // 服务端响应解析函数
 // ============================================
 
-// ServerResponse 服务端响应结构
-type ServerResponse struct {
-	Type    byte   // 消息类型（服务端总是返回 TypeData）
-	ReqID   uint32 // 请求ID
-	Status  byte   // 状态码（0x00=成功）
-	Payload []byte // 数据载荷
-}
-
 // ParseServerResponse 解析服务端 BuildResponse 发回的包
 // 服务端格式: Type(1) + ReqID(4) + Status(1) + [Payload]
 func ParseServerResponse(data []byte) (*ServerResponse, error) {
@@ -142,23 +168,6 @@ func ParseServerResponse(data []byte) (*ServerResponse, error) {
 	}
 
 	return resp, nil
-}
-
-// IsConnectAck 判断是否为连接确认响应
-func (r *ServerResponse) IsConnectAck() bool {
-	// 服务端使用 TypeData 回复连接结果
-	// 区分方式：连接确认时 Payload 为空，Status 表示结果
-	return r.Type == TypeData && len(r.Payload) == 0
-}
-
-// IsDataPacket 判断是否为数据包
-func (r *ServerResponse) IsDataPacket() bool {
-	return r.Type == TypeData && len(r.Payload) > 0
-}
-
-// IsClosePacket 判断是否为关闭包
-func (r *ServerResponse) IsClosePacket() bool {
-	return r.Type == TypeClose
 }
 
 // ============================================
