@@ -87,47 +87,17 @@ type PhantomClientHandler struct {
 	}
 }
 
-// fakeTCPAdapter 将 FakeTCPClient 包装成满足 Transport 接口的对象
+// fakeTCPAdapter 处理 Linux 下 FakeTCPClient 的接口转换
 type fakeTCPAdapter struct {
-	client interface{} // 使用 interface{} 避免非 Linux 平台编译错误
-	readBuf []byte
+	conn net.Conn
 }
 
-func (a *fakeTCPAdapter) Write(b []byte) (int, error) {
-	// 通过反射或类型断言调用 Send
-	if c, ok := a.client.(interface{ Send([]byte) error }); ok {
-		return len(b), c.Send(b)
-	}
-	return 0, errors.New("unsupported client type")
-}
-
-func (a *fakeTCPAdapter) Read(b []byte) (int, error) {
-	if len(a.readBuf) > 0 {
-		n := copy(b, a.readBuf)
-		a.readBuf = a.readBuf[n:]
-		return n, nil
-	}
-	// 调用 Recv(context.Background())
-	if c, ok := a.client.(interface{ Recv(context.Context) ([]byte, error) }); ok {
-		data, err := c.Recv(context.Background())
-		if err != nil { return 0, err }
-		n := copy(b, data)
-		if n < len(data) {
-			a.readBuf = data[n:]
-		}
-		return n, nil
-	}
-	return 0, errors.New("unsupported client type")
-}
-
-func (a *fakeTCPAdapter) Close() error {
-	if c, ok := a.client.(interface{ Close() error }); ok {
-		return c.Close()
-	}
-	return nil
-}
+func (a *fakeTCPAdapter) Write(b []byte) (int, error) { return a.conn.Write(b) }
+func (a *fakeTCPAdapter) Read(b []byte) (int, error)  { return a.conn.Read(b) }
+func (a *fakeTCPAdapter) Close() error                { return a.conn.Close() }
 
 func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
+	// 对齐 96 文件 API: crypto.New 接收 int
 	timeWindowSec := int(cfg.TimeWindow.Seconds())
 	cry, err := crypto.New(cfg.PSK, timeWindowSec)
 	if err != nil {
@@ -139,19 +109,24 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	var trans Transport
 	serverEndpoint := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.ServerPort)
 
-	// 平台兼容逻辑
+	// 此时无论是 Linux 还是 Windows，NewFakeTCPClient 符号都存在了
 	if cfg.TransportMode == "faketcp" && runtime.GOOS == "linux" {
-		// 动态检测并调用，避免 Windows/Mac 下 undefined 错误
 		ftConfig := transport.DefaultFakeTCPConfig()
-		ftClient, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
-		if err != nil { return nil, err }
-		trans = &fakeTCPAdapter{client: ftClient}
+		ftConn, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
+		if err != nil {
+			return nil, err
+		}
+		trans = &fakeTCPAdapter{conn: ftConn}
 	} else {
-		// 默认或非 Linux 平台回退到 UDP
+		// 默认或非 Linux 平台强制使用 UDP
 		udpAddr, err := net.ResolveUDPAddr("udp", serverEndpoint)
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 		conn, err := net.DialUDP("udp", nil, udpAddr)
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 		trans = conn
 	}
 
@@ -174,6 +149,7 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 }
 
 func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
+	// 对齐 96 文件 API: Hysteria2 控速
 	for !h.controller.CanSend(len(payload)) {
 		time.Sleep(h.controller.GetPacingInterval(len(payload)))
 	}
@@ -181,7 +157,10 @@ func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
 	if err != nil { return err }
 	n, err := h.transport.Write(encrypted)
 	if err != nil { return err }
+	
+	// 对齐 96 文件 API: OnPacketSent
 	h.controller.OnPacketSent(0, n, false) 
+	
 	atomic.AddUint64(&h.stats.bytesSent, uint64(n))
 	atomic.AddUint64(&h.stats.packetsSent, 1)
 	return nil
@@ -199,9 +178,13 @@ func (h *PhantomClientHandler) receiveLoop() {
 		if err != nil { return }
 		decrypted, err := h.crypto.Decrypt(buf[:n])
 		if err != nil { continue }
+		
 		resp, err := protocol.ParseServerResponse(decrypted)
 		if err != nil { continue }
+		
+		// 对齐 96 文件 API: OnPacketAcked
 		h.controller.OnPacketAcked(0, 0, time.Millisecond*10)
+		
 		h.sessionsMu.RLock()
 		session, ok := h.sessions[resp.ReqID]
 		h.sessionsMu.RUnlock()
