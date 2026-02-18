@@ -94,7 +94,7 @@ type PhantomClientHandler struct {
 
 type wsStreamAdapter struct {
 	conn    *websocket.Conn
-	readBuf []byte // 缓存未读完的消息片段
+	readBuf []byte
 	mu      sync.Mutex
 }
 
@@ -114,7 +114,6 @@ func (w *wsStreamAdapter) Read(b []byte) (int, error) {
 
 	n := copy(b, msg)
 	if n < len(msg) {
-		// 调用方 buffer 太小，剩余部分暂存
 		w.readBuf = msg[n:]
 	}
 	return n, nil
@@ -194,13 +193,12 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	serverEndpoint := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.ServerPort)
 
 	switch {
-	// ========== WSS / WS 模式（Windows/macOS/Linux 全平台可用）==========
+	// ========== WSS / WS 模式（全平台可用）==========
 	case cfg.TransportMode == "wss" || cfg.TransportMode == "ws":
 		scheme := "ws"
 		if cfg.TransportMode == "wss" {
 			scheme = "wss"
 		}
-		// Path 必须与服务端 config.yaml 中的 path 一致
 		url := fmt.Sprintf("%s://%s/ws", scheme, serverEndpoint)
 
 		wsDialer := &websocket.Dialer{
@@ -214,9 +212,7 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 			return nil, fmt.Errorf("WebSocket 连接失败 (%s): %w", url, err)
 		}
 
-		// 禁用 WebSocket 自带的 close deadline，由我们自己管理超时
 		wsConn.SetReadLimit(0)
-
 		trans = &wsStreamAdapter{conn: wsConn}
 		fmt.Printf("[Client] WebSocket 隧道已建立: %s\n", url)
 
@@ -264,25 +260,34 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 
 // ============================================
 // 加密发送
+// 流程: 调用方构建协议帧 (payload) -> 本函数进行 TSKD 加密 -> 写入传输层
 // ============================================
 
 func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
+	// 1. 拥塞控制：等待发送窗口
 	for !h.controller.CanSend(len(payload)) {
 		time.Sleep(h.controller.GetPacingInterval(len(payload)))
 	}
+
+	// 2. TSKD 加密
+	//    payload 已经是完整的协议帧（由 BuildClientConnectRequest / BuildClientDataRequest 等构建）
+	//    Encrypt 会在前面添加 TSKD 头（时间戳 + 签名 + 密钥派生）
 	encrypted, err := h.crypto.Encrypt(payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("加密失败: %w", err)
 	}
+
+	// 3. 写入传输层（UDP / WebSocket / FakeTCP）
 	n, err := h.transport.Write(encrypted)
 	if err != nil {
-		return err
+		return fmt.Errorf("发送失败: %w", err)
 	}
 
+	// 4. 更新拥塞控制和统计
 	h.controller.OnPacketSent(0, n, false)
-
 	atomic.AddUint64(&h.stats.bytesSent, uint64(n))
 	atomic.AddUint64(&h.stats.packetsSent, 1)
+
 	return nil
 }
 
@@ -305,11 +310,14 @@ func (h *PhantomClientHandler) receiveLoop() {
 			return
 		}
 
+		// TSKD 解密：去掉时间戳签名头，还原出协议帧
 		decrypted, err := h.crypto.Decrypt(buf[:n])
 		if err != nil {
+			// 解密失败：PSK 不匹配 / 时间偏差过大 / 数据被篡改
 			continue
 		}
 
+		// 解析协议帧
 		resp, err := protocol.ParseServerResponse(decrypted)
 		if err != nil {
 			continue
@@ -320,6 +328,7 @@ func (h *PhantomClientHandler) receiveLoop() {
 
 		h.controller.OnPacketAcked(0, 0, time.Millisecond*10)
 
+		// 分发到对应的会话
 		h.sessionsMu.RLock()
 		session, ok := h.sessions[resp.ReqID]
 		h.sessionsMu.RUnlock()
@@ -357,7 +366,11 @@ func (h *PhantomClientHandler) Handle(conn net.Conn, targetAddr string, targetPo
 	h.sessionsMu.Unlock()
 	defer h.unregisterSession(reqID)
 
-	payload, _ := protocol.BuildClientConnectRequest(reqID, protocol.NetworkTCP, targetAddr, targetPort, initData)
+	// 构建连接请求协议帧，然后加密发送
+	payload, err := protocol.BuildClientConnectRequest(reqID, protocol.NetworkTCP, targetAddr, targetPort, initData)
+	if err != nil {
+		return fmt.Errorf("构建连接请求失败: %w", err)
+	}
 	if err := h.sendEncryptedPacket(payload); err != nil {
 		return fmt.Errorf("发送连接请求失败: %w", err)
 	}
@@ -438,6 +451,8 @@ func (h *PhantomClientHandler) relayLocalToRemote(session *Session) error {
 		}
 
 		session.lastActive = time.Now()
+
+		// 构建数据帧，然后加密发送
 		p := protocol.BuildClientDataRequest(session.reqID, buf[:n])
 		if sendErr := h.sendEncryptedPacket(p); sendErr != nil {
 			return sendErr
@@ -506,12 +521,10 @@ func (h *PhantomClientHandler) maintenanceLoop() {
 			return
 
 		case <-ticker.C:
-			// 发送全局心跳
 			p := protocol.BuildClientHeartbeat(0)
 			h.sendEncryptedPacket(p)
 
 		case <-cleanTicker.C:
-			// 清理超时会话
 			h.cleanupStaleSessions()
 		}
 	}
