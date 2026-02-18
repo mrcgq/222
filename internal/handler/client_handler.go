@@ -1,4 +1,4 @@
-// internal/handler/client_handler.go (最终修复版)
+// internal/handler/client_handler.go
 package handler
 
 import (
@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/mrcgq/211/internal/congestion"
 	"github.com/mrcgq/211/internal/crypto"
 	"github.com/mrcgq/211/internal/protocol"
@@ -88,51 +87,14 @@ type PhantomClientHandler struct {
 	}
 }
 
-// wsAdapter：将 WebSocket 包装成标准 Read/Write 接口
-type wsAdapter struct {
-	conn    *websocket.Conn
-	readBuf []byte
-	mu      sync.Mutex
-}
-
-func (a *wsAdapter) Write(b []byte) (int, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	err := a.conn.WriteMessage(websocket.BinaryMessage, b)
-	if err != nil {
-		return 0, err
-	}
-	return len(b), nil
-}
-
-func (a *wsAdapter) Read(b []byte) (int, error) {
-	if len(a.readBuf) > 0 {
-		n := copy(b, a.readBuf)
-		a.readBuf = a.readBuf[n:]
-		return n, nil
-	}
-	_, data, err := a.conn.ReadMessage()
-	if err != nil {
-		return 0, err
-	}
-	n := copy(b, data)
-	if n < len(data) {
-		a.readBuf = data[n:]
-	}
-	return n, nil
-}
-
-func (a *wsAdapter) Close() error {
-	return a.conn.Close()
-}
-
-// fakeTCPAdapter：将 FakeTCP 包装成标准 Read/Write 接口
+// fakeTCPAdapter 关键修复：直接包装具体的方法调用，不再强制要求 net.Conn
 type fakeTCPAdapter struct {
-	client  any
-	readBuf []byte
+	client  any    // 存放 *transport.FakeTCPClient
+	readBuf []byte // 读取缓冲区
 }
 
 func (a *fakeTCPAdapter) Write(b []byte) (int, error) {
+	// 查找 96 文件中的 Send 方法
 	if c, ok := a.client.(interface{ Send([]byte) error }); ok {
 		return len(b), c.Send(b)
 	}
@@ -140,11 +102,13 @@ func (a *fakeTCPAdapter) Write(b []byte) (int, error) {
 }
 
 func (a *fakeTCPAdapter) Read(b []byte) (int, error) {
+	// 如果缓冲区还有数据先读缓冲区
 	if len(a.readBuf) > 0 {
 		n := copy(b, a.readBuf)
 		a.readBuf = a.readBuf[n:]
 		return n, nil
 	}
+	// 查找 96 文件中的 Recv 方法
 	if c, ok := a.client.(interface{ Recv(context.Context) ([]byte, error) }); ok {
 		data, err := c.Recv(context.Background())
 		if err != nil {
@@ -178,45 +142,25 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	var trans Transport
 	serverEndpoint := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.ServerPort)
 
-	// 核心修复逻辑：真正的模式判断
-	switch cfg.TransportMode {
-	case "wss":
-		// WebSocket 模式 (支持 Windows)
-		wsURL := fmt.Sprintf("ws://%s/ws", serverEndpoint)
-		dialer := websocket.DefaultDialer
-		dialer.HandshakeTimeout = 10 * time.Second
-		wsConn, _, err := dialer.Dial(wsURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("WSS dial failed: %w", err)
-		}
-		trans = &wsAdapter{conn: wsConn}
-		fmt.Printf("[INFO] WebSocket 隧道已建立: %s\n", wsURL)
-
-	case "faketcp":
-		// FakeTCP 模式 (仅 Linux)
-		if runtime.GOOS != "linux" {
-			return nil, errors.New("faketcp mode only supported on Linux")
-		}
+	if cfg.TransportMode == "faketcp" && runtime.GOOS == "linux" {
 		ftConfig := transport.DefaultFakeTCPConfig()
+		// 获取 *FakeTCPClient 对象
 		ftClient, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
 		if err != nil {
-			return nil, fmt.Errorf("FakeTCP init failed: %w", err)
+			return nil, err
 		}
+		// 使用我们的通用适配器进行包装
 		trans = &fakeTCPAdapter{client: ftClient}
-		fmt.Printf("[INFO] FakeTCP 隧道已建立: %s\n", serverEndpoint)
-
-	default:
-		// UDP 模式 (默认)
+	} else {
 		udpAddr, err := net.ResolveUDPAddr("udp", serverEndpoint)
 		if err != nil {
-			return nil, fmt.Errorf("resolve UDP addr failed: %w", err)
+			return nil, err
 		}
 		conn, err := net.DialUDP("udp", nil, udpAddr)
 		if err != nil {
-			return nil, fmt.Errorf("UDP dial failed: %w", err)
+			return nil, err
 		}
 		trans = conn
-		fmt.Printf("[INFO] UDP 隧道已建立: %s\n", serverEndpoint)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -318,9 +262,7 @@ func (h *PhantomClientHandler) Handle(conn net.Conn, targetAddr string, targetPo
 	defer h.unregisterSession(reqID)
 
 	payload, _ := protocol.BuildClientConnectRequest(reqID, protocol.NetworkTCP, targetAddr, targetPort, initData)
-	if err := h.sendEncryptedPacket(payload); err != nil {
-		return err
-	}
+	h.sendEncryptedPacket(payload)
 
 	if err := h.waitForConnectAck(session); err != nil {
 		return err
@@ -335,15 +277,10 @@ func (h *PhantomClientHandler) waitForConnectAck(session *Session) error {
 	for {
 		select {
 		case <-timer.C:
-			return errors.New("connect timeout")
-		case <-session.ctx.Done():
-			return errors.New("session cancelled")
+			return errors.New("timeout")
 		case resp := <-session.recvChan:
 			if resp.IsConnectAck() && resp.Status == protocol.StatusSuccess {
 				return nil
-			}
-			if resp.IsConnectAck() && resp.Status != protocol.StatusSuccess {
-				return fmt.Errorf("connect rejected: status %d", resp.Status)
 			}
 		}
 	}
@@ -351,8 +288,6 @@ func (h *PhantomClientHandler) waitForConnectAck(session *Session) error {
 
 func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 	errChan := make(chan error, 2)
-
-	// 上行: 本地 -> 服务器
 	go func() {
 		buf := make([]byte, MaxPayloadSize)
 		for {
@@ -362,14 +297,9 @@ func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 				return
 			}
 			p := protocol.BuildClientDataRequest(session.reqID, buf[:n])
-			if err := h.sendEncryptedPacket(p); err != nil {
-				errChan <- err
-				return
-			}
+			h.sendEncryptedPacket(p)
 		}
 	}()
-
-	// 下行: 服务器 -> 本地
 	go func() {
 		for {
 			select {
@@ -378,19 +308,11 @@ func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 				return
 			case resp := <-session.recvChan:
 				if resp.IsDataPacket() {
-					if _, err := session.localConn.Write(resp.Payload); err != nil {
-						errChan <- nil
-						return
-					}
-				}
-				if resp.IsDisconnect() {
-					errChan <- nil
-					return
+					session.localConn.Write(resp.Payload)
 				}
 			}
 		}
 	}()
-
 	return <-errChan
 }
 
@@ -437,15 +359,10 @@ type Stats struct {
 
 // GetStats 返回统计信息结构体
 func (h *PhantomClientHandler) GetStats() Stats {
-	h.sessionsMu.RLock()
-	activeCount := len(h.sessions)
-	h.sessionsMu.RUnlock()
-
 	return Stats{
-		BytesSent:      atomic.LoadUint64(&h.stats.bytesSent),
-		BytesReceived:  atomic.LoadUint64(&h.stats.bytesReceived),
-		PacketsSent:    atomic.LoadUint64(&h.stats.packetsSent),
-		PacketsRecv:    atomic.LoadUint64(&h.stats.packetsRecv),
-		SessionsActive: int64(activeCount),
+		BytesSent:     atomic.LoadUint64(&h.stats.bytesSent),
+		BytesReceived: atomic.LoadUint64(&h.stats.bytesReceived),
+		PacketsSent:   atomic.LoadUint64(&h.stats.packetsSent),
+		PacketsRecv:   atomic.LoadUint64(&h.stats.packetsRecv),
 	}
 }
