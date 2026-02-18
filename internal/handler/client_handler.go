@@ -48,7 +48,7 @@ type Config struct {
 	TimeWindow     time.Duration
 	UploadMbps     int
 	DownloadMbps   int
-	TransportMode  string 
+	TransportMode  string
 	TLSFingerprint string
 }
 
@@ -70,7 +70,7 @@ type PhantomClientHandler struct {
 	controller *congestion.Hysteria2Controller
 	transport  Transport
 
-	config *Config
+	config     *Config
 	sessions   map[uint32]*Session
 	sessionsMu sync.RWMutex
 	nextReqID  uint32
@@ -80,17 +80,17 @@ type PhantomClientHandler struct {
 	wg     sync.WaitGroup
 
 	stats struct {
-		bytesSent      uint64
-		bytesReceived  uint64
-		packetsSent    uint64
-		packetsRecv    uint64
+		bytesSent     uint64
+		bytesReceived uint64
+		packetsSent   uint64
+		packetsRecv   uint64
 	}
 }
 
 // fakeTCPAdapter 关键修复：直接包装具体的方法调用，不再强制要求 net.Conn
 type fakeTCPAdapter struct {
-	client  any      // 存放 *transport.FakeTCPClient
-	readBuf []byte   // 读取缓冲区
+	client  any    // 存放 *transport.FakeTCPClient
+	readBuf []byte // 读取缓冲区
 }
 
 func (a *fakeTCPAdapter) Write(b []byte) (int, error) {
@@ -186,12 +186,16 @@ func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
 		time.Sleep(h.controller.GetPacingInterval(len(payload)))
 	}
 	encrypted, err := h.crypto.Encrypt(payload)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	n, err := h.transport.Write(encrypted)
-	if err != nil { return err }
-	
-	h.controller.OnPacketSent(0, n, false) 
-	
+	if err != nil {
+		return err
+	}
+
+	h.controller.OnPacketSent(0, n, false)
+
 	atomic.AddUint64(&h.stats.bytesSent, uint64(n))
 	atomic.AddUint64(&h.stats.packetsSent, 1)
 	return nil
@@ -202,19 +206,29 @@ func (h *PhantomClientHandler) receiveLoop() {
 	buf := make([]byte, 65535)
 	for {
 		select {
-		case <-h.ctx.Done(): return
+		case <-h.ctx.Done():
+			return
 		default:
 		}
 		n, err := h.transport.Read(buf)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		decrypted, err := h.crypto.Decrypt(buf[:n])
-		if err != nil { continue }
-		
+		if err != nil {
+			continue
+		}
+
 		resp, err := protocol.ParseServerResponse(decrypted)
-		if err != nil { continue }
-		
+		if err != nil {
+			continue
+		}
+
+		atomic.AddUint64(&h.stats.bytesReceived, uint64(n))
+		atomic.AddUint64(&h.stats.packetsRecv, 1)
+
 		h.controller.OnPacketAcked(0, 0, time.Millisecond*10)
-		
+
 		h.sessionsMu.RLock()
 		session, ok := h.sessions[resp.ReqID]
 		h.sessionsMu.RUnlock()
@@ -250,7 +264,9 @@ func (h *PhantomClientHandler) Handle(conn net.Conn, targetAddr string, targetPo
 	payload, _ := protocol.BuildClientConnectRequest(reqID, protocol.NetworkTCP, targetAddr, targetPort, initData)
 	h.sendEncryptedPacket(payload)
 
-	if err := h.waitForConnectAck(session); err != nil { return err }
+	if err := h.waitForConnectAck(session); err != nil {
+		return err
+	}
 	atomic.StoreInt32(&session.state, StateConnected)
 	return h.runDataRelay(session)
 }
@@ -260,7 +276,8 @@ func (h *PhantomClientHandler) waitForConnectAck(session *Session) error {
 	defer timer.Stop()
 	for {
 		select {
-		case <-timer.C: return errors.New("timeout")
+		case <-timer.C:
+			return errors.New("timeout")
 		case resp := <-session.recvChan:
 			if resp.IsConnectAck() && resp.Status == protocol.StatusSuccess {
 				return nil
@@ -275,7 +292,10 @@ func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 		buf := make([]byte, MaxPayloadSize)
 		for {
 			n, err := session.localConn.Read(buf)
-			if err != nil { errChan <- nil; return }
+			if err != nil {
+				errChan <- nil
+				return
+			}
 			p := protocol.BuildClientDataRequest(session.reqID, buf[:n])
 			h.sendEncryptedPacket(p)
 		}
@@ -283,7 +303,9 @@ func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 	go func() {
 		for {
 			select {
-			case <-session.ctx.Done(): errChan <- nil; return
+			case <-session.ctx.Done():
+				errChan <- nil
+				return
 			case resp := <-session.recvChan:
 				if resp.IsDataPacket() {
 					session.localConn.Write(resp.Payload)
@@ -310,7 +332,8 @@ func (h *PhantomClientHandler) maintenanceLoop() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-h.ctx.Done(): return
+		case <-h.ctx.Done():
+			return
 		case <-ticker.C:
 			p := protocol.BuildClientHeartbeat(0)
 			h.sendEncryptedPacket(p)
@@ -324,9 +347,22 @@ func (h *PhantomClientHandler) Close() error {
 	return h.transport.Close()
 }
 
-func (h *PhantomClientHandler) GetStats() map[string]interface{} {
-	return map[string]interface{}{
-		"total_sent": atomic.LoadUint64(&h.stats.bytesSent),
-		"total_received": atomic.LoadUint64(&h.stats.bytesReceived),
+// Stats 统计信息结构体
+type Stats struct {
+	BytesSent      uint64
+	BytesReceived  uint64
+	PacketsSent    uint64
+	PacketsRecv    uint64
+	SessionsTotal  uint64
+	SessionsActive int64
+}
+
+// GetStats 返回统计信息结构体
+func (h *PhantomClientHandler) GetStats() Stats {
+	return Stats{
+		BytesSent:     atomic.LoadUint64(&h.stats.bytesSent),
+		BytesReceived: atomic.LoadUint64(&h.stats.bytesReceived),
+		PacketsSent:   atomic.LoadUint64(&h.stats.packetsSent),
+		PacketsRecv:   atomic.LoadUint64(&h.stats.packetsRecv),
 	}
 }
