@@ -1,9 +1,7 @@
-
-
-
 // internal/protocol/client_types.go
 // 客户端专用协议构建与解析函数
 // 严格匹配服务端 ParseRequest 和 BuildResponse 的字节布局
+// 注意：常量定义在 protocol.go 中，此文件直接复用
 
 package protocol
 
@@ -14,24 +12,12 @@ import (
 )
 
 // ============================================
-// 协议常量定义（与服务端 protocol.go 完全一致）
+// 扩展常量（protocol.go 中没有的）
 // ============================================
 
 const (
-	// 消息类型 - 必须与服务端定义完全匹配
-	TypeConnect   byte = 0x01 // 连接请求
-	TypeData      byte = 0x02 // 数据传输（服务端回复也用这个！）
-	TypeClose     byte = 0x03 // 关闭连接
-	TypeHeartbeat byte = 0x04 // 心跳保活
-
-	// 网络类型
-	NetworkTCP byte = 0x01
-	NetworkUDP byte = 0x02
-
-	// 地址类型 - 与 SOCKS5 ATYP 一致
-	AddrIPv4   byte = 0x01
-	AddrDomain byte = 0x03
-	AddrIPv6   byte = 0x04
+	// 心跳类型（服务端 protocol.go 未定义，客户端扩展）
+	TypeHeartbeat byte = 0x04
 
 	// 响应状态码
 	StatusSuccess byte = 0x00
@@ -58,7 +44,7 @@ func BuildClientConnectRequest(reqID uint32, network byte, host string, port uin
 	// Type(1) + ReqID(4) + Network(1) + AddrType(1) + Addr + Port(2) + InitData
 	headerLen := 1 + 4 + 1 + 1 + len(addrBytes) + 2
 	totalLen := headerLen + len(initData)
-	
+
 	buf := make([]byte, totalLen)
 	offset := 0
 
@@ -93,11 +79,11 @@ func BuildClientConnectRequest(reqID uint32, network byte, host string, port uin
 // 格式: Type(1) + ReqID(4) + Payload
 func BuildClientDataRequest(reqID uint32, payload []byte) []byte {
 	buf := make([]byte, 1+4+len(payload))
-	
+
 	buf[0] = TypeData
 	binary.BigEndian.PutUint32(buf[1:5], reqID)
 	copy(buf[5:], payload)
-	
+
 	return buf
 }
 
@@ -105,10 +91,10 @@ func BuildClientDataRequest(reqID uint32, payload []byte) []byte {
 // 格式: Type(1) + ReqID(4)
 func BuildClientCloseRequest(reqID uint32) []byte {
 	buf := make([]byte, 5)
-	
+
 	buf[0] = TypeClose
 	binary.BigEndian.PutUint32(buf[1:5], reqID)
-	
+
 	return buf
 }
 
@@ -116,10 +102,10 @@ func BuildClientCloseRequest(reqID uint32) []byte {
 // 格式: Type(1) + ReqID(4)
 func BuildClientHeartbeat(reqID uint32) []byte {
 	buf := make([]byte, 5)
-	
+
 	buf[0] = TypeHeartbeat
 	binary.BigEndian.PutUint32(buf[1:5], reqID)
-	
+
 	return buf
 }
 
@@ -183,7 +169,7 @@ func (r *ServerResponse) IsClosePacket() bool {
 func encodeAddress(host string) (addrType byte, addrBytes []byte, err error) {
 	// 尝试解析为 IP
 	ip := net.ParseIP(host)
-	
+
 	if ip != nil {
 		// IPv4
 		if ip4 := ip.To4(); ip4 != nil {
@@ -238,6 +224,3 @@ func DecodeAddress(addrType byte, data []byte) (host string, bytesRead int, err 
 		return "", 0, errors.New("unknown address type")
 	}
 }
-
-
-
