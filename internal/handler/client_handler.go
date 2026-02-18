@@ -87,15 +87,48 @@ type PhantomClientHandler struct {
 	}
 }
 
-// fakeTCPAdapter 适配 FakeTCPClient 到 Transport 接口
-// 解决 LocalAddr() 等 net.Conn 缺失方法的问题
+// fakeTCPAdapter 关键修复：直接包装具体的方法调用，不再强制要求 net.Conn
 type fakeTCPAdapter struct {
-	conn net.Conn
+	client  any      // 存放 *transport.FakeTCPClient
+	readBuf []byte   // 读取缓冲区
 }
 
-func (a *fakeTCPAdapter) Write(b []byte) (int, error) { return a.conn.Write(b) }
-func (a *fakeTCPAdapter) Read(b []byte) (int, error)  { return a.conn.Read(b) }
-func (a *fakeTCPAdapter) Close() error                { return a.conn.Close() }
+func (a *fakeTCPAdapter) Write(b []byte) (int, error) {
+	// 查找 96 文件中的 Send 方法
+	if c, ok := a.client.(interface{ Send([]byte) error }); ok {
+		return len(b), c.Send(b)
+	}
+	return 0, errors.New("fakeTCP: Send method not found")
+}
+
+func (a *fakeTCPAdapter) Read(b []byte) (int, error) {
+	// 如果缓冲区还有数据先读缓冲区
+	if len(a.readBuf) > 0 {
+		n := copy(b, a.readBuf)
+		a.readBuf = a.readBuf[n:]
+		return n, nil
+	}
+	// 查找 96 文件中的 Recv 方法
+	if c, ok := a.client.(interface{ Recv(context.Context) ([]byte, error) }); ok {
+		data, err := c.Recv(context.Background())
+		if err != nil {
+			return 0, err
+		}
+		n := copy(b, data)
+		if n < len(data) {
+			a.readBuf = data[n:]
+		}
+		return n, nil
+	}
+	return 0, errors.New("fakeTCP: Recv method not found")
+}
+
+func (a *fakeTCPAdapter) Close() error {
+	if c, ok := a.client.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}
 
 func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	timeWindowSec := int(cfg.TimeWindow.Seconds())
@@ -111,14 +144,13 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 
 	if cfg.TransportMode == "faketcp" && runtime.GOOS == "linux" {
 		ftConfig := transport.DefaultFakeTCPConfig()
-		// 注意：这里需要确保返回的是 net.Conn
-		// 如果 NewFakeTCPClient 返回的是具体类型，我们需要强制转换或包装
-		ftConn, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
+		// 获取 *FakeTCPClient 对象
+		ftClient, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
 		if err != nil {
 			return nil, err
 		}
-		// 包装以适配接口
-		trans = &fakeTCPAdapter{conn: ftConn}
+		// 使用我们的通用适配器进行包装
+		trans = &fakeTCPAdapter{client: ftClient}
 	} else {
 		udpAddr, err := net.ResolveUDPAddr("udp", serverEndpoint)
 		if err != nil {
@@ -158,7 +190,6 @@ func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
 	n, err := h.transport.Write(encrypted)
 	if err != nil { return err }
 	
-	// 对齐 96 文件 API
 	h.controller.OnPacketSent(0, n, false) 
 	
 	atomic.AddUint64(&h.stats.bytesSent, uint64(n))
@@ -182,7 +213,6 @@ func (h *PhantomClientHandler) receiveLoop() {
 		resp, err := protocol.ParseServerResponse(decrypted)
 		if err != nil { continue }
 		
-		// 对齐 96 文件 API
 		h.controller.OnPacketAcked(0, 0, time.Millisecond*10)
 		
 		h.sessionsMu.RLock()
