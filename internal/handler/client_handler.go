@@ -87,14 +87,13 @@ type PhantomClientHandler struct {
 	}
 }
 
-// fakeTCPAdapter 关键修复：直接包装具体的方法调用，不再强制要求 net.Conn
+// fakeTCPAdapter 包装 FakeTCPClient 实现 Transport 接口
 type fakeTCPAdapter struct {
-	client  any    // 存放 *transport.FakeTCPClient
-	readBuf []byte // 读取缓冲区
+	client  any
+	readBuf []byte
 }
 
 func (a *fakeTCPAdapter) Write(b []byte) (int, error) {
-	// 查找 96 文件中的 Send 方法
 	if c, ok := a.client.(interface{ Send([]byte) error }); ok {
 		return len(b), c.Send(b)
 	}
@@ -102,13 +101,11 @@ func (a *fakeTCPAdapter) Write(b []byte) (int, error) {
 }
 
 func (a *fakeTCPAdapter) Read(b []byte) (int, error) {
-	// 如果缓冲区还有数据先读缓冲区
 	if len(a.readBuf) > 0 {
 		n := copy(b, a.readBuf)
 		a.readBuf = a.readBuf[n:]
 		return n, nil
 	}
-	// 查找 96 文件中的 Recv 方法
 	if c, ok := a.client.(interface{ Recv(context.Context) ([]byte, error) }); ok {
 		data, err := c.Recv(context.Background())
 		if err != nil {
@@ -144,12 +141,10 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 
 	if cfg.TransportMode == "faketcp" && runtime.GOOS == "linux" {
 		ftConfig := transport.DefaultFakeTCPConfig()
-		// 获取 *FakeTCPClient 对象
 		ftClient, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
 		if err != nil {
 			return nil, err
 		}
-		// 使用我们的通用适配器进行包装
 		trans = &fakeTCPAdapter{client: ftClient}
 	} else {
 		udpAddr, err := net.ResolveUDPAddr("udp", serverEndpoint)
@@ -277,10 +272,15 @@ func (h *PhantomClientHandler) waitForConnectAck(session *Session) error {
 	for {
 		select {
 		case <-timer.C:
-			return errors.New("timeout")
+			return errors.New("connect timeout")
+		case <-session.ctx.Done():
+			return errors.New("session cancelled")
 		case resp := <-session.recvChan:
 			if resp.IsConnectAck() && resp.Status == protocol.StatusSuccess {
 				return nil
+			}
+			if resp.IsConnectAck() && resp.Status != protocol.StatusSuccess {
+				return fmt.Errorf("connect rejected: status=%d", resp.Status)
 			}
 		}
 	}
@@ -288,32 +288,79 @@ func (h *PhantomClientHandler) waitForConnectAck(session *Session) error {
 
 func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 	errChan := make(chan error, 2)
+
+	// 本地 → 远程
 	go func() {
-		buf := make([]byte, MaxPayloadSize)
-		for {
-			n, err := session.localConn.Read(buf)
-			if err != nil {
-				errChan <- nil
-				return
-			}
-			p := protocol.BuildClientDataRequest(session.reqID, buf[:n])
-			h.sendEncryptedPacket(p)
-		}
+		errChan <- h.relayLocalToRemote(session)
 	}()
+
+	// 远程 → 本地
 	go func() {
-		for {
-			select {
-			case <-session.ctx.Done():
-				errChan <- nil
-				return
-			case resp := <-session.recvChan:
-				if resp.IsDataPacket() {
-					session.localConn.Write(resp.Payload)
+		errChan <- h.relayRemoteToLocal(session)
+	}()
+
+	// 任何一个方向结束就退出
+	err := <-errChan
+	session.cancel()
+
+	// 通知服务端关闭
+	closePacket := protocol.BuildClientCloseRequest(session.reqID)
+	h.sendEncryptedPacket(closePacket)
+
+	return err
+}
+
+// relayLocalToRemote 从本地连接读取数据发送到远程服务器
+func (h *PhantomClientHandler) relayLocalToRemote(session *Session) error {
+	buf := make([]byte, MaxPayloadSize)
+	for {
+		select {
+		case <-session.ctx.Done():
+			return nil
+		default:
+		}
+
+		session.localConn.SetReadDeadline(time.Now().Add(ReadTimeout))
+		n, err := session.localConn.Read(buf)
+		if err != nil {
+			return nil
+		}
+
+		session.lastActive = time.Now()
+		p := protocol.BuildClientDataRequest(session.reqID, buf[:n])
+		if sendErr := h.sendEncryptedPacket(p); sendErr != nil {
+			return sendErr
+		}
+	}
+}
+
+// relayRemoteToLocal 从远程服务器接收数据写入本地连接
+func (h *PhantomClientHandler) relayRemoteToLocal(session *Session) error {
+	for {
+		select {
+		case <-session.ctx.Done():
+			return nil
+
+		case resp := <-session.recvChan:
+			if resp.ReqID != session.reqID {
+				continue
+			}
+
+			// 服务端发来断开包，优雅退出
+			if resp.IsDisconnect() {
+				return nil
+			}
+
+			// 正常数据包，写入本地连接
+			if resp.IsDataPacket() && len(resp.Payload) > 0 {
+				session.lastActive = time.Now()
+				session.localConn.SetWriteDeadline(time.Now().Add(WriteTimeout))
+				if _, err := session.localConn.Write(resp.Payload); err != nil {
+					return err
 				}
 			}
 		}
-	}()
-	return <-errChan
+	}
 }
 
 func (h *PhantomClientHandler) unregisterSession(reqID uint32) {
@@ -330,14 +377,42 @@ func (h *PhantomClientHandler) maintenanceLoop() {
 	defer h.wg.Done()
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
+
+	cleanTicker := time.NewTicker(30 * time.Second)
+	defer cleanTicker.Stop()
+
 	for {
 		select {
 		case <-h.ctx.Done():
 			return
+
 		case <-ticker.C:
+			// 发送全局心跳
 			p := protocol.BuildClientHeartbeat(0)
 			h.sendEncryptedPacket(p)
+
+		case <-cleanTicker.C:
+			// 清理超时会话
+			h.cleanupStaleSessions()
 		}
+	}
+}
+
+// cleanupStaleSessions 清理长时间无活动的会话
+func (h *PhantomClientHandler) cleanupStaleSessions() {
+	now := time.Now()
+	var staleIDs []uint32
+
+	h.sessionsMu.RLock()
+	for id, s := range h.sessions {
+		if now.Sub(s.lastActive) > SessionTimeout {
+			staleIDs = append(staleIDs, id)
+		}
+	}
+	h.sessionsMu.RUnlock()
+
+	for _, id := range staleIDs {
+		h.unregisterSession(id)
 	}
 }
 
@@ -359,10 +434,15 @@ type Stats struct {
 
 // GetStats 返回统计信息结构体
 func (h *PhantomClientHandler) GetStats() Stats {
+	h.sessionsMu.RLock()
+	activeCount := len(h.sessions)
+	h.sessionsMu.RUnlock()
+
 	return Stats{
-		BytesSent:     atomic.LoadUint64(&h.stats.bytesSent),
-		BytesReceived: atomic.LoadUint64(&h.stats.bytesReceived),
-		PacketsSent:   atomic.LoadUint64(&h.stats.packetsSent),
-		PacketsRecv:   atomic.LoadUint64(&h.stats.packetsRecv),
+		BytesSent:      atomic.LoadUint64(&h.stats.bytesSent),
+		BytesReceived:  atomic.LoadUint64(&h.stats.bytesReceived),
+		PacketsSent:    atomic.LoadUint64(&h.stats.packetsSent),
+		PacketsRecv:    atomic.LoadUint64(&h.stats.packetsRecv),
+		SessionsActive: int64(activeCount),
 	}
 }
