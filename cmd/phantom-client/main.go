@@ -1,6 +1,3 @@
-
-
-
 // cmd/phantom-client/main.go
 // Phantom v4.0 Windows 客户端入口
 // 系统装配器与环境初始化中心
@@ -264,12 +261,15 @@ func (app *Application) statsLoop() {
 		case <-app.ctx.Done():
 			return
 		case <-ticker.C:
-			stats := app.handler.GetStats()
-			active, total := app.socksServer.Stats()
-			fmt.Printf("[STATS] 连接: %d/%d | 发送: %s | 接收: %s\n",
-				active, total,
-				formatBytes(stats.BytesSent),
-				formatBytes(stats.BytesReceived))
+			// 获取处理器统计
+			hStats := app.handler.GetStats()
+			// 获取 SOCKS5 统计
+			sActive, sTotal := app.socksServer.Stats()
+
+			fmt.Printf("[STATS] 活跃连接: %d/%d | 发送: %s | 接收: %s\n",
+				sActive, sTotal,
+				formatBytes(hStats.BytesSent),
+				formatBytes(hStats.BytesReceived))
 		}
 	}
 }
