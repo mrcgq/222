@@ -10,7 +10,7 @@ jobs:
   build-all:
     name: Cross-Platform Build
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -41,31 +41,47 @@ jobs:
       - name: 整理依赖
         run: go mod tidy
 
-      # 1. 编译 eBPF (Linux 专用)
       - name: 构建 eBPF 内核程序
         run: |
           sed -i 's/CFLAGS :=/CFLAGS := -Wno-address-of-packed-member -Wno-unused-function /' ebpf/Makefile
           make ebpf
 
-      # 2. 构建全平台程序 (修正点)
       - name: 执行全平台构建
         run: |
           mkdir -p dist
-          # 先运行原有的编译逻辑 (生成服务端)
+
+          # 先运行 Makefile 原有逻辑
           make release
-          
-          # 【关键新增】专门为 Windows 编译真正的客户端内核 (认得 -socks 参数)
-          echo "正在构建 Windows 客户端内核..."
-          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/phantom-client-windows-amd64.exe ./cmd/phantom-client
-          
-          # 【可选】如果你也需要 Linux 版的客户端
-          echo "正在构建 Linux 客户端内核..."
-          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/phantom-client-linux-amd64 ./cmd/phantom-client
+
+          # ====== 删除所有压缩包，只保留裸二进制 ======
+          echo "清理所有压缩包..."
+          rm -f dist/*.tar.gz dist/*.zip dist/*.gz dist/*.bz2 dist/*.xz dist/*.tgz dist/*.7z
+
+          # ====== 补充构建客户端 ======
+          echo "构建 Windows 客户端..."
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+            -o dist/phantom-client-windows-amd64.exe ./cmd/phantom-client
+
+          echo "构建 Linux 客户端..."
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+            -o dist/phantom-client-linux-amd64 ./cmd/phantom-client
+
+          echo "构建 macOS (Intel) 客户端..."
+          GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+            -o dist/phantom-client-darwin-amd64 ./cmd/phantom-client
+
+          echo "构建 macOS (Apple Silicon) 客户端..."
+          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
+            -o dist/phantom-client-darwin-arm64 ./cmd/phantom-client
 
       - name: 查看生成的文件
-        run: ls -R dist/
+        run: |
+          echo "===== dist/ 目录 ====="
+          ls -lh dist/
+          echo ""
+          echo "===== ebpf/*.o 文件 ====="
+          ls -lh ebpf/*.o 2>/dev/null || echo "无 .o 文件"
 
-      # 3. 上传所有构建产物
       - name: 上传所有构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -73,3 +89,4 @@ jobs:
           path: |
             dist/*
             ebpf/*.o
+          compression-level: 0
