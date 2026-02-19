@@ -36,7 +36,6 @@ const (
 	BPFFSMagic  uint32 = 0xcafe4a11
 )
 
-// PinMode Map Pinning 模式
 type PinMode int
 
 const (
@@ -50,7 +49,6 @@ const (
 // 配置结构
 // =============================================================================
 
-// EBPFLoaderConfig 加载器配置
 type EBPFLoaderConfig struct {
 	*EBPFConfig
 
@@ -63,7 +61,6 @@ type EBPFLoaderConfig struct {
 	CleanupOrphans  bool
 }
 
-// DefaultEBPFLoaderConfig 默认配置
 func DefaultEBPFLoaderConfig() *EBPFLoaderConfig {
 	return &EBPFLoaderConfig{
 		EBPFConfig:      DefaultEBPFConfig(),
@@ -81,7 +78,6 @@ func DefaultEBPFLoaderConfig() *EBPFLoaderConfig {
 // 加载器结构
 // =============================================================================
 
-// EBPFLoader eBPF 程序加载器
 type EBPFLoader struct {
 	config *EBPFLoaderConfig
 	mu     sync.RWMutex
@@ -111,7 +107,6 @@ type EBPFLoader struct {
 	attachTime time.Time
 }
 
-// NewEBPFLoader 创建加载器
 func NewEBPFLoader(config *EBPFLoaderConfig) *EBPFLoader {
 	if config == nil {
 		config = DefaultEBPFLoaderConfig()
@@ -125,7 +120,6 @@ func NewEBPFLoader(config *EBPFLoaderConfig) *EBPFLoader {
 // 核心加载方法
 // =============================================================================
 
-// Load 加载 eBPF 程序
 func (l *EBPFLoader) Load() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -169,7 +163,6 @@ func (l *EBPFLoader) Load() error {
 	return nil
 }
 
-// loadFull 完整加载程序和 maps
 func (l *EBPFLoader) loadFull() error {
 	xdpPath := filepath.Join(l.config.ProgramPath, "xdp_phantom.o")
 	tcPath := filepath.Join(l.config.ProgramPath, "tc_phantom.o")
@@ -215,7 +208,6 @@ func (l *EBPFLoader) loadFull() error {
 	return nil
 }
 
-// loadProgramsOnly 只加载程序 (复用已有 maps)
 func (l *EBPFLoader) loadProgramsOnly() error {
 	xdpPath := filepath.Join(l.config.ProgramPath, "xdp_phantom.o")
 
@@ -254,7 +246,6 @@ func (l *EBPFLoader) loadProgramsOnly() error {
 	return nil
 }
 
-// loadTCPrograms 加载 TC 程序
 func (l *EBPFLoader) loadTCPrograms(tcPath string) {
 	if _, err := os.Stat(tcPath); err != nil {
 		return
@@ -284,7 +275,6 @@ func (l *EBPFLoader) loadTCPrograms(tcPath string) {
 	l.tcIngressProg = tcColl.Programs["tc_phantom_ingress"]
 }
 
-// adjustMapSpecs 调整 Map 规格
 func (l *EBPFLoader) adjustMapSpecs(spec *ebpf.CollectionSpec) {
 	if mapSpec, ok := spec.Maps[MapNameSessions]; ok {
 		mapSpec.MaxEntries = uint32(l.config.MapSize)
@@ -295,7 +285,6 @@ func (l *EBPFLoader) adjustMapSpecs(spec *ebpf.CollectionSpec) {
 // Map Pinning 方法
 // =============================================================================
 
-// ensureBPFFS 确保 BPF 文件系统可用
 func (l *EBPFLoader) ensureBPFFS() error {
 	if err := checkBPFFS(); err != nil {
 		if err := mountBPFFS(); err != nil {
@@ -310,7 +299,6 @@ func (l *EBPFLoader) ensureBPFFS() error {
 	return nil
 }
 
-// pinMaps 将 maps pin 到文件系统
 func (l *EBPFLoader) pinMaps() error {
 	maps := map[string]*ebpf.Map{
 		MapNameSessions:    l.sessionsMap,
@@ -352,7 +340,6 @@ func (l *EBPFLoader) pinMaps() error {
 	return nil
 }
 
-// tryReusePinnedMaps 尝试复用已 pin 的 maps
 func (l *EBPFLoader) tryReusePinnedMaps() error {
 	meta, err := l.loadPinMetadata()
 	if err != nil {
@@ -405,12 +392,10 @@ func (l *EBPFLoader) tryReusePinnedMaps() error {
 	return nil
 }
 
-// getMapPinPath 获取 map 的 pin 路径
 func (l *EBPFLoader) getMapPinPath(name string) string {
 	return filepath.Join(l.config.PinPath, fmt.Sprintf("map_%s", name))
 }
 
-// getLinkPinPath 获取 link 的 pin 路径
 func (l *EBPFLoader) getLinkPinPath(name string) string {
 	return filepath.Join(l.config.PinPath, fmt.Sprintf("link_%s", name))
 }
@@ -419,7 +404,6 @@ func (l *EBPFLoader) getLinkPinPath(name string) string {
 // Pin 元数据管理
 // =============================================================================
 
-// PinMetadata pin 元数据
 type PinMetadata struct {
 	Version   string    `json:"version"`
 	PinTime   time.Time `json:"pin_time"`
@@ -429,7 +413,6 @@ type PinMetadata struct {
 	PID       int       `json:"pid"`
 }
 
-// savePinMetadata 保存元数据
 func (l *EBPFLoader) savePinMetadata() error {
 	meta := PinMetadata{
 		Version:   "1.0",
@@ -450,7 +433,6 @@ func (l *EBPFLoader) savePinMetadata() error {
 	return os.WriteFile(metaPath, data, 0644)
 }
 
-// loadPinMetadata 加载元数据
 func (l *EBPFLoader) loadPinMetadata() (*PinMetadata, error) {
 	metaPath := filepath.Join(l.config.PinPath, "metadata.json")
 
@@ -471,7 +453,6 @@ func (l *EBPFLoader) loadPinMetadata() (*PinMetadata, error) {
 // 附加和分离
 // =============================================================================
 
-// Attach 附加到网卡
 func (l *EBPFLoader) Attach() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -548,7 +529,6 @@ func (l *EBPFLoader) Attach() error {
 	return nil
 }
 
-// tryReusePinnedLink 尝试复用已 pin 的 link
 func (l *EBPFLoader) tryReusePinnedLink() error {
 	linkPath := l.getLinkPinPath(LinkNameXDP)
 
@@ -569,7 +549,6 @@ func (l *EBPFLoader) tryReusePinnedLink() error {
 	return nil
 }
 
-// pinLink pin link 到文件系统
 func (l *EBPFLoader) pinLink() error {
 	if l.xdpLink == nil {
 		return fmt.Errorf("link 不存在")
@@ -581,7 +560,6 @@ func (l *EBPFLoader) pinLink() error {
 	return l.xdpLink.Pin(linkPath)
 }
 
-// Detach 分离程序
 func (l *EBPFLoader) Detach() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -615,7 +593,6 @@ func (l *EBPFLoader) Detach() error {
 // 清理方法
 // =============================================================================
 
-// Close 关闭加载器
 func (l *EBPFLoader) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -654,7 +631,6 @@ func (l *EBPFLoader) Close() error {
 	return nil
 }
 
-// closeMaps 关闭所有 maps
 func (l *EBPFLoader) closeMaps() {
 	if l.sessionsMap != nil {
 		l.sessionsMap.Close()
@@ -678,7 +654,6 @@ func (l *EBPFLoader) closeMaps() {
 	}
 }
 
-// unpinAll 取消所有 pin
 func (l *EBPFLoader) unpinAll() {
 	mapNames := []string{
 		MapNameSessions,
@@ -704,7 +679,6 @@ func (l *EBPFLoader) unpinAll() {
 	l.pinned = false
 }
 
-// CleanupOrphanedPins 清理孤立的 pinned 资源
 func (l *EBPFLoader) CleanupOrphanedPins() error {
 	if !l.config.EnablePinning {
 		return nil
@@ -729,7 +703,6 @@ func (l *EBPFLoader) CleanupOrphanedPins() error {
 	return nil
 }
 
-// forceCleanup 强制清理
 func (l *EBPFLoader) forceCleanup() error {
 	entries, err := os.ReadDir(l.config.PinPath)
 	if err != nil {
@@ -753,7 +726,6 @@ func (l *EBPFLoader) forceCleanup() error {
 // 平滑重启支持
 // =============================================================================
 
-// PrepareGracefulRestart 准备平滑重启
 func (l *EBPFLoader) PrepareGracefulRestart() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -765,7 +737,6 @@ func (l *EBPFLoader) PrepareGracefulRestart() error {
 	return l.savePinMetadata()
 }
 
-// RecoverFromRestart 从重启中恢复
 func (l *EBPFLoader) RecoverFromRestart() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -803,7 +774,6 @@ func (l *EBPFLoader) RecoverFromRestart() error {
 // 辅助方法
 // =============================================================================
 
-// determineXDPMode 确定最佳 XDP 模式
 func (l *EBPFLoader) determineXDPMode() string {
 	if l.config.XDPMode != XDPModeAuto {
 		return l.config.XDPMode
@@ -811,35 +781,30 @@ func (l *EBPFLoader) determineXDPMode() string {
 	return XDPModeGeneric
 }
 
-// IsReusingMaps 是否复用了已有的 maps
 func (l *EBPFLoader) IsReusingMaps() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.reusingMaps
 }
 
-// IsPinned 是否已 pin
 func (l *EBPFLoader) IsPinned() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.pinned
 }
 
-// GetLoadTime 获取加载时间
 func (l *EBPFLoader) GetLoadTime() time.Time {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.loadTime
 }
 
-// GetAttachTime 获取附加时间
 func (l *EBPFLoader) GetAttachTime() time.Time {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.attachTime
 }
 
-// GetPinPath 获取 pin 路径
 func (l *EBPFLoader) GetPinPath() string {
 	return l.config.PinPath
 }
@@ -848,7 +813,6 @@ func (l *EBPFLoader) GetPinPath() string {
 // 配置和状态方法
 // =============================================================================
 
-// ConfigurePort 配置监听端口
 func (l *EBPFLoader) ConfigurePort(port uint16, enabled bool) error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -874,7 +838,6 @@ func (l *EBPFLoader) ConfigurePort(port uint16, enabled bool) error {
 	return l.listenPortsMap.Put(&key, &config)
 }
 
-// ConfigureGlobal 配置全局参数
 func (l *EBPFLoader) ConfigureGlobal(listenPort uint16) error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -884,7 +847,7 @@ func (l *EBPFLoader) ConfigureGlobal(listenPort uint16) error {
 	}
 
 	config := EBPFGlobalConfig{
-		Magic:           0x5048414E, // "PHAN"
+		Magic:           0x5048414E,
 		ListenPort:      listenPort,
 		Mode:            1,
 		LogLevel:        1,
@@ -899,8 +862,8 @@ func (l *EBPFLoader) ConfigureGlobal(listenPort uint16) error {
 }
 
 // GetStats 获取统计信息
-// 修复：适配 Per-CPU Map，同时兼容普通 Map
-// 只引用 EBPFStats 中实际存在的字段
+// 核心修复：Per-CPU Map 必须传入 *[]EBPFStats（切片指针），不能传 *EBPFStats
+// 然后汇总所有 CPU 核心的数据
 func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -911,12 +874,11 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 
 	key := uint32(0)
 
-	// 方式1：尝试 Per-CPU 读取（BPF_MAP_TYPE_PERCPU_ARRAY）
+	// 方式1：Per-CPU 读取 (BPF_MAP_TYPE_PERCPU_ARRAY)
+	// cilium/ebpf 库要求传入 *[]T 才能自动按 CPU 数分配
 	var statsPerCPU []EBPFStats
 	err := l.statsMap.Lookup(&key, &statsPerCPU)
 	if err == nil && len(statsPerCPU) > 0 {
-		// 汇总所有 CPU 的计数器
-		// 只使用 EBPFStats 结构体中实际定义的字段
 		final := &EBPFStats{}
 		for _, s := range statsPerCPU {
 			final.PacketsRX += s.PacketsRX
@@ -929,7 +891,7 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 		return final, nil
 	}
 
-	// 方式2：回退到普通读取（BPF_MAP_TYPE_ARRAY）
+	// 方式2：回退到普通读取 (BPF_MAP_TYPE_ARRAY)
 	var stats EBPFStats
 	if err2 := l.statsMap.Lookup(&key, &stats); err2 != nil {
 		return nil, fmt.Errorf("读取统计失败 (percpu: %v, normal: %v)", err, err2)
@@ -938,7 +900,6 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 	return &stats, nil
 }
 
-// GetSession 获取会话
 func (l *EBPFLoader) GetSession(key *EBPFSessionKey) (*EBPFSessionValue, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -955,7 +916,6 @@ func (l *EBPFLoader) GetSession(key *EBPFSessionKey) (*EBPFSessionValue, error) 
 	return &value, nil
 }
 
-// DeleteSession 删除会话
 func (l *EBPFLoader) DeleteSession(key *EBPFSessionKey) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -967,7 +927,6 @@ func (l *EBPFLoader) DeleteSession(key *EBPFSessionKey) error {
 	return l.sessionsMap.Delete(key)
 }
 
-// IterateSessions 遍历会话
 func (l *EBPFLoader) IterateSessions(callback func(*EBPFSessionKey, *EBPFSessionValue) bool) error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -989,33 +948,28 @@ func (l *EBPFLoader) IterateSessions(callback func(*EBPFSessionKey, *EBPFSession
 	return iter.Err()
 }
 
-// IsLoaded 是否已加载
 func (l *EBPFLoader) IsLoaded() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.loaded
 }
 
-// IsAttached 是否已附加
 func (l *EBPFLoader) IsAttached() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.attached
 }
 
-// GetXDPMode 获取 XDP 模式
 func (l *EBPFLoader) GetXDPMode() string {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.xdpMode
 }
 
-// GetInterface 获取网卡名
 func (l *EBPFLoader) GetInterface() string {
 	return l.config.Interface
 }
 
-// GetMaps 获取 Maps
 func (l *EBPFLoader) GetMaps() map[string]*ebpf.Map {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -1033,7 +987,6 @@ func (l *EBPFLoader) GetMaps() map[string]*ebpf.Map {
 // BPF 文件系统辅助函数
 // =============================================================================
 
-// checkBPFFS 检查 BPF 文件系统是否已挂载
 func checkBPFFS() error {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(DefaultBPFFS, &stat); err != nil {
@@ -1047,7 +1000,6 @@ func checkBPFFS() error {
 	return nil
 }
 
-// mountBPFFS 挂载 BPF 文件系统
 func mountBPFFS() error {
 	if err := os.MkdirAll(DefaultBPFFS, 0755); err != nil {
 		return err
@@ -1056,7 +1008,6 @@ func mountBPFFS() error {
 	return syscall.Mount("bpf", DefaultBPFFS, "bpf", 0, "")
 }
 
-// processExists 检查进程是否存在
 func processExists(pid int) bool {
 	process, err := os.FindProcess(pid)
 	if err != nil {
@@ -1067,13 +1018,11 @@ func processExists(pid int) bool {
 	return err == nil
 }
 
-// netInterface 网卡信息
 type netInterface struct {
 	Name  string
 	Index int
 }
 
-// getInterfaceByName 通过名称获取网卡
 func getInterfaceByName(name string) (*netInterface, error) {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
 	if err != nil {
