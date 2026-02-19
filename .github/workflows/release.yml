@@ -3,16 +3,16 @@ name: Release Version
 on:
   push:
     tags:
-      - "v*" # 只有推送 v1.0.0, v4.0.1 这样的标签时才触发
+      - "v*"
 
 permissions:
-  contents: write # 需要写权限来创建 Release
+  contents: write
 
 jobs:
   release:
     name: Build and Release
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -22,7 +22,6 @@ jobs:
         with:
           go-version: '1.22.x'
 
-      # 使用 v2 key 缓存
       - name: 缓存 Go 模块
         uses: actions/cache@v4
         with:
@@ -33,12 +32,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-1.22-v2-
 
-      - name: 安装依赖 (含 bpftool 修复)
+      - name: 安装依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib libelf-dev
-          
-          # 下载并配置静态版 bpftool
           curl -L https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz | sudo tar -xz -C /usr/local/bin
           sudo chmod +x /usr/local/bin/bpftool
           sudo rm -f /usr/bin/bpftool
@@ -47,27 +44,51 @@ jobs:
       - name: 整理依赖
         run: go mod tidy
 
-      # 1. 编译 eBPF 内核程序
       - name: 构建 eBPF 内核程序
         run: |
-          # 忽略警告参数
           sed -i 's/CFLAGS :=/CFLAGS := -Wno-address-of-packed-member -Wno-unused-function /' ebpf/Makefile
           make ebpf
 
-      # 2. 编译全平台主程序
       - name: 构建全平台二进制文件
-        run: make release
+        run: |
+          mkdir -p dist
 
-      # 3. 【核心步骤】自动创建 GitHub Release 并上传文件
+          # 运行 Makefile 原有逻辑
+          make release
+
+          # ====== 删除所有压缩包，只保留裸二进制 ======
+          echo "清理所有压缩包..."
+          rm -f dist/*.tar.gz dist/*.zip dist/*.gz dist/*.bz2 dist/*.xz dist/*.tgz dist/*.7z
+
+          # ====== 补充构建客户端 ======
+          echo "构建 Windows 客户端..."
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+            -o dist/phantom-client-windows-amd64.exe ./cmd/phantom-client
+
+          echo "构建 Linux 客户端..."
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+            -o dist/phantom-client-linux-amd64 ./cmd/phantom-client
+
+          echo "构建 macOS (Intel) 客户端..."
+          GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+            -o dist/phantom-client-darwin-amd64 ./cmd/phantom-client
+
+          echo "构建 macOS (Apple Silicon) 客户端..."
+          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
+            -o dist/phantom-client-darwin-arm64 ./cmd/phantom-client
+
+      - name: 查看即将发布的文件
+        run: |
+          echo "===== 即将发布的文件 ====="
+          ls -lh dist/
+          ls -lh ebpf/*.o 2>/dev/null || true
+
       - name: 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          # 将 dist 目录下的所有文件，以及 ebpf 的 .o 文件都作为单独的附件上传
           files: |
             dist/*
             ebpf/*.o
-          # 自动生成更新日志
           generate_release_notes: true
-          # 如果是预发布版本（包含 -beta, -rc），标记为 Pre-release
           prerelease: ${{ contains(github.ref, '-') }}
