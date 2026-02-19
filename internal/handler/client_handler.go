@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,13 @@ const (
 	WriteTimeout      = 30 * time.Second
 	HeartbeatInterval = 15 * time.Second
 	SessionTimeout    = 120 * time.Second
+
+	// DefaultWSPath 默认 WebSocket 路径，与服务端 config.yaml 的 path 对应
+	DefaultWSPath = "/ws"
+
+	// MinEncryptedPacketLen TSKD 加密包最小长度
+	// 时间戳(8) + HMAC签名(部分) + 至少1字节载荷
+	MinEncryptedPacketLen = 18
 )
 
 type Config struct {
@@ -51,6 +59,21 @@ type Config struct {
 	DownloadMbps   int
 	TransportMode  string
 	TLSFingerprint string
+
+	// WSPath WebSocket 路径，必须与服务端一致
+	// 留空自动使用 "/ws"
+	WSPath string
+}
+
+// getWSPath 获取实际使用的 WebSocket 路径
+func (c *Config) getWSPath() string {
+	if c.WSPath == "" {
+		return DefaultWSPath
+	}
+	if !strings.HasPrefix(c.WSPath, "/") {
+		return "/" + c.WSPath
+	}
+	return c.WSPath
 }
 
 type Session struct {
@@ -89,7 +112,7 @@ type PhantomClientHandler struct {
 }
 
 // ============================================
-// WebSocket 适配器 — 把 WebSocket 包装为流式 Transport
+// WebSocket 适配器
 // ============================================
 
 type wsStreamAdapter struct {
@@ -99,14 +122,12 @@ type wsStreamAdapter struct {
 }
 
 func (w *wsStreamAdapter) Read(b []byte) (int, error) {
-	// 先消费缓冲区残留
 	if len(w.readBuf) > 0 {
 		n := copy(b, w.readBuf)
 		w.readBuf = w.readBuf[n:]
 		return n, nil
 	}
 
-	// 从 WebSocket 读取一条完整消息
 	_, msg, err := w.conn.ReadMessage()
 	if err != nil {
 		return 0, err
@@ -134,7 +155,7 @@ func (w *wsStreamAdapter) Close() error {
 }
 
 // ============================================
-// FakeTCP 适配器 — Linux 专用
+// FakeTCP 适配器
 // ============================================
 
 type fakeTCPAdapter struct {
@@ -177,10 +198,14 @@ func (a *fakeTCPAdapter) Close() error {
 }
 
 // ============================================
-// 核心构造函数 — 根据 TransportMode 选择通道
+// 核心构造函数
 // ============================================
 
 func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
+	// 关键修复：清除 PSK 中不可见的空白字符（换行符、空格、制表符）
+	// 这是 "UserID 不匹配" 的最常见原因
+	cfg.PSK = strings.TrimSpace(cfg.PSK)
+
 	timeWindowSec := int(cfg.TimeWindow.Seconds())
 	cry, err := crypto.New(cfg.PSK, timeWindowSec)
 	if err != nil {
@@ -193,13 +218,15 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	serverEndpoint := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.ServerPort)
 
 	switch {
-	// ========== WSS / WS 模式（全平台可用）==========
+	// ========== WSS / WS 模式 ==========
 	case cfg.TransportMode == "wss" || cfg.TransportMode == "ws":
 		scheme := "ws"
 		if cfg.TransportMode == "wss" {
 			scheme = "wss"
 		}
-		url := fmt.Sprintf("%s://%s/ws", scheme, serverEndpoint)
+
+		wsPath := cfg.getWSPath()
+		url := fmt.Sprintf("%s://%s%s", scheme, serverEndpoint, wsPath)
 
 		wsDialer := &websocket.Dialer{
 			HandshakeTimeout: ConnectTimeout,
@@ -260,30 +287,23 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 
 // ============================================
 // 加密发送
-// 流程: 调用方构建协议帧 (payload) -> 本函数进行 TSKD 加密 -> 写入传输层
 // ============================================
 
 func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
-	// 1. 拥塞控制：等待发送窗口
 	for !h.controller.CanSend(len(payload)) {
 		time.Sleep(h.controller.GetPacingInterval(len(payload)))
 	}
 
-	// 2. TSKD 加密
-	//    payload 已经是完整的协议帧（由 BuildClientConnectRequest / BuildClientDataRequest 等构建）
-	//    Encrypt 会在前面添加 TSKD 头（时间戳 + 签名 + 密钥派生）
 	encrypted, err := h.crypto.Encrypt(payload)
 	if err != nil {
 		return fmt.Errorf("加密失败: %w", err)
 	}
 
-	// 3. 写入传输层（UDP / WebSocket / FakeTCP）
 	n, err := h.transport.Write(encrypted)
 	if err != nil {
 		return fmt.Errorf("发送失败: %w", err)
 	}
 
-	// 4. 更新拥塞控制和统计
 	h.controller.OnPacketSent(0, n, false)
 	atomic.AddUint64(&h.stats.bytesSent, uint64(n))
 	atomic.AddUint64(&h.stats.packetsSent, 1)
@@ -310,14 +330,17 @@ func (h *PhantomClientHandler) receiveLoop() {
 			return
 		}
 
-		// TSKD 解密：去掉时间戳签名头，还原出协议帧
-		decrypted, err := h.crypto.Decrypt(buf[:n])
-		if err != nil {
-			// 解密失败：PSK 不匹配 / 时间偏差过大 / 数据被篡改
+		// 过滤过短的包（不足以构成有效的 TSKD 加密包）
+		if n < MinEncryptedPacketLen {
 			continue
 		}
 
-		// 解析协议帧
+		decrypted, err := h.crypto.Decrypt(buf[:n])
+		if err != nil {
+			// 解密失败原因：PSK 不一致 / 时间偏差 > TimeWindow / 数据损坏
+			continue
+		}
+
 		resp, err := protocol.ParseServerResponse(decrypted)
 		if err != nil {
 			continue
@@ -328,7 +351,6 @@ func (h *PhantomClientHandler) receiveLoop() {
 
 		h.controller.OnPacketAcked(0, 0, time.Millisecond*10)
 
-		// 分发到对应的会话
 		h.sessionsMu.RLock()
 		session, ok := h.sessions[resp.ReqID]
 		h.sessionsMu.RUnlock()
@@ -366,7 +388,6 @@ func (h *PhantomClientHandler) Handle(conn net.Conn, targetAddr string, targetPo
 	h.sessionsMu.Unlock()
 	defer h.unregisterSession(reqID)
 
-	// 构建连接请求协议帧，然后加密发送
 	payload, err := protocol.BuildClientConnectRequest(reqID, protocol.NetworkTCP, targetAddr, targetPort, initData)
 	if err != nil {
 		return fmt.Errorf("构建连接请求失败: %w", err)
@@ -413,28 +434,23 @@ func (h *PhantomClientHandler) waitForConnectAck(session *Session) error {
 func (h *PhantomClientHandler) runDataRelay(session *Session) error {
 	errChan := make(chan error, 2)
 
-	// 本地 → 远程
 	go func() {
 		errChan <- h.relayLocalToRemote(session)
 	}()
 
-	// 远程 → 本地
 	go func() {
 		errChan <- h.relayRemoteToLocal(session)
 	}()
 
-	// 任何一个方向结束就退出
 	err := <-errChan
 	session.cancel()
 
-	// 通知服务端关闭
 	closePacket := protocol.BuildClientCloseRequest(session.reqID)
 	h.sendEncryptedPacket(closePacket)
 
 	return err
 }
 
-// relayLocalToRemote 从本地连接读取数据发送到远程服务器
 func (h *PhantomClientHandler) relayLocalToRemote(session *Session) error {
 	buf := make([]byte, MaxPayloadSize)
 	for {
@@ -451,8 +467,6 @@ func (h *PhantomClientHandler) relayLocalToRemote(session *Session) error {
 		}
 
 		session.lastActive = time.Now()
-
-		// 构建数据帧，然后加密发送
 		p := protocol.BuildClientDataRequest(session.reqID, buf[:n])
 		if sendErr := h.sendEncryptedPacket(p); sendErr != nil {
 			return sendErr
@@ -460,7 +474,6 @@ func (h *PhantomClientHandler) relayLocalToRemote(session *Session) error {
 	}
 }
 
-// relayRemoteToLocal 从远程服务器接收数据写入本地连接
 func (h *PhantomClientHandler) relayRemoteToLocal(session *Session) error {
 	for {
 		select {
@@ -472,12 +485,10 @@ func (h *PhantomClientHandler) relayRemoteToLocal(session *Session) error {
 				continue
 			}
 
-			// 服务端发来断开包，优雅退出
 			if resp.IsDisconnect() {
 				return nil
 			}
 
-			// 正常数据包，写入本地连接
 			if resp.IsDataPacket() && len(resp.Payload) > 0 {
 				session.lastActive = time.Now()
 				session.localConn.SetWriteDeadline(time.Now().Add(WriteTimeout))
@@ -530,7 +541,6 @@ func (h *PhantomClientHandler) maintenanceLoop() {
 	}
 }
 
-// cleanupStaleSessions 清理长时间无活动的会话
 func (h *PhantomClientHandler) cleanupStaleSessions() {
 	now := time.Now()
 	var staleIDs []uint32
@@ -562,7 +572,6 @@ func (h *PhantomClientHandler) Close() error {
 // 统计
 // ============================================
 
-// Stats 统计信息结构体
 type Stats struct {
 	BytesSent      uint64
 	BytesReceived  uint64
@@ -572,7 +581,6 @@ type Stats struct {
 	SessionsActive int64
 }
 
-// GetStats 返回统计信息结构体
 func (h *PhantomClientHandler) GetStats() Stats {
 	h.sessionsMu.RLock()
 	activeCount := len(h.sessions)
