@@ -1,7 +1,6 @@
 // internal/protocol/client_types.go
 // 客户端专用协议构建与解析函数
 // 严格匹配服务端 ParseRequest 和 BuildResponse 的字节布局
-// 注意：TypeConnect / TypeData / TypeClose / AddrXxx / NetworkXxx 定义在 protocol.go 中
 
 package protocol
 
@@ -16,9 +15,6 @@ import (
 // ============================================
 
 const (
-	// 心跳类型（服务端 protocol.go 未定义，客户端扩展）
-	TypeHeartbeat byte = 0x04
-
 	// 响应状态码
 	StatusSuccess byte = 0x00
 	StatusError   byte = 0x01
@@ -54,10 +50,15 @@ func (r *ServerResponse) IsClosePacket() bool {
 	return r.Type == TypeClose
 }
 
-// IsDisconnect 判断是否为断开连接包（IsClosePacket 的别名）
-// 供 client_handler.go 中 relayRemoteToLocal 调用
+// IsDisconnect 判断是否为断开连接包
+// 修复：添加 IsDisconnect 方法供 client_handler.go 调用
 func (r *ServerResponse) IsDisconnect() bool {
 	return r.Type == TypeClose
+}
+
+// IsHeartbeatResponse 判断是否为心跳响应
+func (r *ServerResponse) IsHeartbeatResponse() bool {
+	return r.Type == TypeHeartbeat
 }
 
 // ============================================
@@ -66,7 +67,6 @@ func (r *ServerResponse) IsDisconnect() bool {
 
 // BuildClientConnectRequest 构建连接请求包
 // 格式: Type(1) + ReqID(4) + Network(1) + AddrType(1) + Addr(变长) + Port(2) + [InitData]
-// 此格式严格匹配服务端 ParseRequest 函数的解析逻辑
 func BuildClientConnectRequest(reqID uint32, network byte, host string, port uint16, initData []byte) ([]byte, error) {
 	// 1. 解析并编码目标地址
 	addrType, addrBytes, err := encodeAddress(host)
@@ -75,7 +75,6 @@ func BuildClientConnectRequest(reqID uint32, network byte, host string, port uin
 	}
 
 	// 2. 计算总长度
-	// Type(1) + ReqID(4) + Network(1) + AddrType(1) + Addr + Port(2) + InitData
 	headerLen := 1 + 4 + 1 + 1 + len(addrBytes) + 2
 	totalLen := headerLen + len(initData)
 
