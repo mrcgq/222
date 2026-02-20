@@ -21,7 +21,7 @@ import (
 )
 
 // =============================================================================
-// eBPF 常量定义
+// 常量定义
 // =============================================================================
 
 const (
@@ -43,57 +43,6 @@ const (
 	PinModeReuse
 	PinModeReplace
 	PinModeStrict
-)
-
-// =============================================================================
-// eBPF 结构体定义
-// =============================================================================
-
-// EBPFStats eBPF 统计信息结构
-// 修复：添加缺失的字段
-type EBPFStats struct {
-	PacketsRX         uint64
-	PacketsTX         uint64
-	BytesRX            uint64
-	BytesTX            uint64
-	PacketsDropped    uint64
-	SessionsCreated   uint64
-	SessionsDestroyed uint64 // 修复：缺失字段
-	AuthFailures      uint64 // 修复：缺失字段
-	ReplayBlocked     uint64 // 修复：缺失字段
-}
-
-// EBPFSessionKey eBPF 会话键结构
-type EBPFSessionKey struct {
-	ClientIP [4]byte
-	Bytes    uint64
-}
-
-// EBPFSessionValue eBPF 会话值结构
-type EBPFSessionValue struct {
-	IsClosed uint8
-}
-
-// EBPFGlobalConfig eBPF 全局配置结构
-type EBPFGlobalConfig struct {
-	Magic           uint32
-	ListenPort      uint16
-	Mode            uint8
-	LogLevel        uint8
-	SessionTimeout  uint32
-	MaxSessions     uint32
-	EnableStats     uint8
-	EnableConntrack uint8
-}
-
-// XDPMode eBPF XDP 模式
-type XDPMode string
-
-const (
-	XDPModeAuto   XDPMode = "auto"
-	XDPModeNative XDPMode = "native"
-	XDPModeGeneric XDPMode = "generic"
-	XDPModeOffload XDPMode = "offload"
 )
 
 // =============================================================================
@@ -913,7 +862,7 @@ func (l *EBPFLoader) ConfigureGlobal(listenPort uint16) error {
 }
 
 // GetStats 获取统计信息
-// 修复：正确处理 Per-CPU Map，必须传入切片指针并汇总所有 CPU 核心数据
+// 修复：只使用 EBPFStats 实际存在的字段
 func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -925,11 +874,11 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 	key := uint32(0)
 
 	// 方式1：Per-CPU 读取 (BPF_MAP_TYPE_PERCPU_ARRAY)
-	// cilium/ebpf 库要求传入 *[]T 才能自动按 CPU 数分配
 	var statsPerCPU []EBPFStats
 	err := l.statsMap.Lookup(&key, &statsPerCPU)
 	if err == nil && len(statsPerCPU) > 0 {
 		// 汇总所有 CPU 核心的统计数据
+		// 只使用 EBPFStats 结构体中实际定义的字段
 		final := &EBPFStats{}
 		for _, s := range statsPerCPU {
 			final.PacketsRX += s.PacketsRX
@@ -938,9 +887,6 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 			final.BytesTX += s.BytesTX
 			final.PacketsDropped += s.PacketsDropped
 			final.SessionsCreated += s.SessionsCreated
-			final.SessionsDestroyed += s.SessionsDestroyed // 修复：添加缺失字段
-			final.AuthFailures += s.AuthFailures       // 修复：添加缺失字段
-			final.ReplayBlocked += s.ReplayBlocked      // 修复：添加缺失字段
 		}
 		return final, nil
 	}
@@ -1087,7 +1033,7 @@ func getInterfaceByName(name string) (*netInterface, error) {
 	var ifr [40]byte
 	copy(ifr[:], name)
 
-	_, _, errno := syscall.SysCall(
+	_, _, errno := syscall.Syscall(
 		syscall.SYS_IOCTL,
 		uintptr(fd),
 		syscall.SIOCGIFINDEX,
