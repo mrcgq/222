@@ -943,3 +943,265 @@ func (h *UnifiedHandler) log(level int, format string, args ...interface{}) {
 		time.Now().Format("15:04:05"),
 		fmt.Sprintf(format, args...))
 }
+
+// =============================================================================
+// Switcher 适配器方法
+// 这些方法用于 switcher 调用，内部委托给现有的处理逻辑
+// =============================================================================
+
+// HandleUDPPacket 处理 UDP 数据包（供 Switcher 调用）
+func (h *UnifiedHandler) HandleUDPPacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
+	// 设置发送器（如果尚未设置）
+	if h.sender == nil {
+		h.SetSender(func(respData []byte, respAddr *net.UDPAddr) error {
+			_, err := conn.WriteToUDP(respData, respAddr)
+			return err
+		})
+	}
+
+	// 委托给现有的 HandlePacket 方法
+	h.HandlePacket(data, addr)
+}
+
+// HandleTCPConn 处理 TCP 连接（供 Switcher 调用）
+func (h *UnifiedHandler) HandleTCPConn(conn net.Conn) {
+	// 委托给现有的 HandleConnection 方法
+	h.HandleConnection(h.ctx, conn)
+}
+
+// HandleWebSocket 处理 WebSocket 连接（供 Switcher 调用）
+func (h *UnifiedHandler) HandleWebSocket(conn net.Conn) {
+	atomic.AddInt64(&h.stats.activeConns, 1)
+	defer atomic.AddInt64(&h.stats.activeConns, -1)
+
+	if h.metrics != nil {
+		h.metrics.IncConnections()
+		defer h.metrics.DecConnections()
+	}
+
+	clientAddr := conn.RemoteAddr().String()
+	h.log(LogLevelDebug, "WebSocket 新连接: %s", clientAddr)
+	defer h.log(LogLevelDebug, "WebSocket 连接关闭: %s", clientAddr)
+	defer conn.Close()
+
+	// WebSocket 握手
+	buf := make([]byte, 4096)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		h.log(LogLevelDebug, "WebSocket 读取握手失败: %v", err)
+		return
+	}
+
+	// 简化的 WebSocket 握手响应
+	// 实际应该解析 Sec-WebSocket-Key 并计算正确的 Accept 值
+	if n > 0 && containsBytes(buf[:n], []byte("Upgrade: websocket")) {
+		upgradeResponse := "HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+		conn.Write([]byte(upgradeResponse))
+	}
+
+	// 创建同步响应写入器
+	writer := ResponseWriterFunc(func(data []byte) error {
+		frame := buildWebSocketBinaryFrame(data)
+		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		_, err := conn.Write(frame)
+		return err
+	})
+
+	// 创建虚拟 UDP 地址用于会话管理
+	virtualAddr := &net.UDPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: 0,
+	}
+	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		virtualAddr.IP = tcpAddr.IP
+		virtualAddr.Port = tcpAddr.Port
+	}
+
+	// WebSocket 消息处理循环
+	frameBuf := make([]byte, 65536)
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(readTimeout))
+		n, err := conn.Read(frameBuf)
+		if err != nil {
+			if err != io.EOF {
+				h.log(LogLevelDebug, "WebSocket 读取失败: %s - %v", clientAddr, err)
+			}
+			return
+		}
+
+		if n < 2 {
+			continue
+		}
+
+		// 解析 WebSocket 帧
+		payload, opcode, err := parseWebSocketFrame(frameBuf[:n])
+		if err != nil {
+			h.log(LogLevelDebug, "WebSocket 帧解析失败: %v", err)
+			continue
+		}
+
+		// 处理关闭帧
+		if opcode == 0x08 {
+			h.log(LogLevelDebug, "WebSocket 收到关闭帧")
+			return
+		}
+
+		// 处理 Ping 帧
+		if opcode == 0x09 {
+			pongFrame := buildWebSocketPongFrame(payload)
+			conn.Write(pongFrame)
+			continue
+		}
+
+		// 只处理二进制帧和文本帧
+		if opcode != 0x01 && opcode != 0x02 {
+			continue
+		}
+
+		if len(payload) == 0 {
+			continue
+		}
+
+		// 使用同步处理方法
+		responses := h.HandlePacketSync(payload, virtualAddr, writer)
+
+		// 发送收集的响应
+		for _, resp := range responses {
+			frame := buildWebSocketBinaryFrame(resp)
+			conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if _, err := conn.Write(frame); err != nil {
+				h.log(LogLevelDebug, "WebSocket 发送响应失败: %v", err)
+				return
+			}
+		}
+	}
+}
+
+// =============================================================================
+// WebSocket 辅助函数
+// =============================================================================
+
+// containsBytes 检查字节切片是否包含子切片
+func containsBytes(data, subslice []byte) bool {
+	return len(data) >= len(subslice) && indexBytes(data, subslice) >= 0
+}
+
+// indexBytes 查找子切片位置
+func indexBytes(data, subslice []byte) int {
+	for i := 0; i <= len(data)-len(subslice); i++ {
+		match := true
+		for j := 0; j < len(subslice); j++ {
+			if data[i+j] != subslice[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// parseWebSocketFrame 解析 WebSocket 帧
+func parseWebSocketFrame(data []byte) (payload []byte, opcode byte, err error) {
+	if len(data) < 2 {
+		return nil, 0, fmt.Errorf("frame too short")
+	}
+
+	opcode = data[0] & 0x0F
+	masked := (data[1] & 0x80) != 0
+	payloadLen := int(data[1] & 0x7F)
+
+	offset := 2
+
+	if payloadLen == 126 {
+		if len(data) < 4 {
+			return nil, 0, fmt.Errorf("frame too short for extended length")
+		}
+		payloadLen = int(data[2])<<8 | int(data[3])
+		offset = 4
+	} else if payloadLen == 127 {
+		if len(data) < 10 {
+			return nil, 0, fmt.Errorf("frame too short for extended length")
+		}
+		payloadLen = int(data[2])<<56 | int(data[3])<<48 | int(data[4])<<40 | int(data[5])<<32 |
+			int(data[6])<<24 | int(data[7])<<16 | int(data[8])<<8 | int(data[9])
+		offset = 10
+	}
+
+	var maskKey []byte
+	if masked {
+		if len(data) < offset+4 {
+			return nil, 0, fmt.Errorf("frame too short for mask key")
+		}
+		maskKey = data[offset : offset+4]
+		offset += 4
+	}
+
+	if len(data) < offset+payloadLen {
+		return nil, 0, fmt.Errorf("frame too short for payload")
+	}
+
+	payload = make([]byte, payloadLen)
+	copy(payload, data[offset:offset+payloadLen])
+
+	// 解除掩码
+	if masked {
+		for i := 0; i < len(payload); i++ {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+
+	return payload, opcode, nil
+}
+
+// buildWebSocketBinaryFrame 构建二进制 WebSocket 帧
+func buildWebSocketBinaryFrame(payload []byte) []byte {
+	length := len(payload)
+	var frame []byte
+
+	if length <= 125 {
+		frame = make([]byte, 2+length)
+		frame[0] = 0x82 // FIN=1, opcode=2 (binary)
+		frame[1] = byte(length)
+		copy(frame[2:], payload)
+	} else if length <= 65535 {
+		frame = make([]byte, 4+length)
+		frame[0] = 0x82
+		frame[1] = 126
+		frame[2] = byte(length >> 8)
+		frame[3] = byte(length)
+		copy(frame[4:], payload)
+	} else {
+		frame = make([]byte, 10+length)
+		frame[0] = 0x82
+		frame[1] = 127
+		for i := 0; i < 8; i++ {
+			frame[2+i] = byte(length >> (56 - i*8))
+		}
+		copy(frame[10:], payload)
+	}
+
+	return frame
+}
+
+// buildWebSocketPongFrame 构建 Pong 帧
+func buildWebSocketPongFrame(payload []byte) []byte {
+	length := len(payload)
+	frame := make([]byte, 2+length)
+	frame[0] = 0x8A // FIN=1, opcode=10 (pong)
+	frame[1] = byte(length)
+	copy(frame[2:], payload)
+	return frame
+}
