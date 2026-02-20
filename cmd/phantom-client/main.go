@@ -6,14 +6,16 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/mrcgq/211/internal/handler"
 	"github.com/mrcgq/211/internal/socks5"
@@ -46,24 +48,24 @@ type Application struct {
 // ClientConfig 客户端配置
 type ClientConfig struct {
 	// 服务端
-	ServerAddr string `json:"server"`
-	ServerPort uint16 `json:"port"`
-	PSK        string `json:"psk"`
+	ServerAddr string `yaml:"server" json:"server"`
+	ServerPort uint16 `yaml:"port" json:"port"`
+	PSK        string `yaml:"psk" json:"psk"`
 
 	// 本地
-	SocksAddr string `json:"socks"`
+	SocksAddr string `yaml:"socks" json:"socks"`
 
 	// 性能
-	UploadMbps   int `json:"up"`
-	DownloadMbps int `json:"down"`
+	UploadMbps   int `yaml:"up" json:"up"`
+	DownloadMbps int `yaml:"down" json:"down"`
 
 	// 传输
-	TransportMode  string `json:"transport"`
-	TLSFingerprint string `json:"fingerprint"`
+	TransportMode  string `yaml:"transport" json:"transport"`
+	TLSFingerprint string `yaml:"fingerprint" json:"fingerprint"`
 
 	// 高级
-	TimeWindow time.Duration `json:"time_window"`
-	LogLevel   string        `json:"log_level"`
+	TimeWindow time.Duration `yaml:"time_window" json:"time_window"`
+	LogLevel   string        `yaml:"log_level" json:"log_level"`
 }
 
 // ============================================
@@ -93,28 +95,37 @@ func main() {
 
 // parseFlags 解析命令行参数
 func parseFlags() *ClientConfig {
-	cfg := &ClientConfig{}
+	cfg := &ClientConfig{
+		// 设置默认值
+		ServerPort:    54321,
+		SocksAddr:     "127.0.0.1:1080",
+		UploadMbps:    100,
+		DownloadMbps:  100,
+		TransportMode: "udp",
+		TimeWindow:    30 * time.Second,
+		LogLevel:      "info",
+	}
 
 	// 基础参数
-	flag.StringVar(&cfg.ServerAddr, "server", "", "VPS 服务器地址 (必需)")
-	port := flag.Int("port", 54321, "VPS 服务器端口")
-	flag.StringVar(&cfg.PSK, "psk", "", "预共享密钥 (必需)")
-	flag.StringVar(&cfg.SocksAddr, "socks", "127.0.0.1:1080", "本地 SOCKS5 地址")
+	server := flag.String("server", "", "VPS 服务器地址")
+	port := flag.Int("port", 0, "VPS 服务器端口")
+	psk := flag.String("psk", "", "预共享密钥")
+	socksAddr := flag.String("socks", "", "本地 SOCKS5 地址")
 
 	// 性能参数
-	flag.IntVar(&cfg.UploadMbps, "up", 100, "上行带宽 (Mbps)")
-	flag.IntVar(&cfg.DownloadMbps, "down", 100, "下行带宽 (Mbps)")
+	up := flag.Int("up", 0, "上行带宽 (Mbps)")
+	down := flag.Int("down", 0, "下行带宽 (Mbps)")
 
 	// 传输参数
-	flag.StringVar(&cfg.TransportMode, "transport", "udp", "传输模式: udp, faketcp, wss")
-	flag.StringVar(&cfg.TLSFingerprint, "fingerprint", "chrome", "TLS 指纹")
+	transport := flag.String("transport", "", "传输模式: udp, faketcp, wss")
+	fingerprint := flag.String("fingerprint", "", "TLS 指纹")
 
 	// 高级参数
-	timeWindow := flag.Int("time-window", 30, "时间窗口 (秒)")
-	flag.StringVar(&cfg.LogLevel, "log", "info", "日志级别")
+	timeWindow := flag.Int("time-window", 0, "时间窗口 (秒)")
+	logLevel := flag.String("log", "", "日志级别")
 
 	// 配置文件
-	configFile := flag.String("config", "", "配置文件路径")
+	configFile := flag.String("config", "", "配置文件路径 (YAML)")
 
 	// 其他
 	showVersion := flag.Bool("version", false, "显示版本")
@@ -130,23 +141,56 @@ func parseFlags() *ClientConfig {
 		os.Exit(0)
 	}
 
-	// 加载配置文件
+	// 修复：先加载配置文件，再用命令行参数覆盖
 	if *configFile != "" {
-		loadConfig(*configFile, cfg)
+		if err := loadConfigFile(*configFile, cfg); err != nil {
+			fmt.Printf("[WARN] 加载配置文件失败: %v\n", err)
+		}
 	}
 
-	// 应用参数
-	cfg.ServerPort = uint16(*port)
-	cfg.TimeWindow = time.Duration(*timeWindow) * time.Second
+	// 命令行参数覆盖配置文件
+	if *server != "" {
+		cfg.ServerAddr = *server
+	}
+	if *port != 0 {
+		cfg.ServerPort = uint16(*port)
+	}
+	if *psk != "" {
+		cfg.PSK = *psk
+	}
+	if *socksAddr != "" {
+		cfg.SocksAddr = *socksAddr
+	}
+	if *up != 0 {
+		cfg.UploadMbps = *up
+	}
+	if *down != 0 {
+		cfg.DownloadMbps = *down
+	}
+	if *transport != "" {
+		cfg.TransportMode = *transport
+	}
+	if *fingerprint != "" {
+		cfg.TLSFingerprint = *fingerprint
+	}
+	if *timeWindow != 0 {
+		cfg.TimeWindow = time.Duration(*timeWindow) * time.Second
+	}
+	if *logLevel != "" {
+		cfg.LogLevel = *logLevel
+	}
 
-	// 验证
+	// 清理 PSK 中的空白字符
+	cfg.PSK = strings.TrimSpace(cfg.PSK)
+
+	// 修复：最后进行验证
 	if cfg.ServerAddr == "" {
-		fmt.Println("[ERROR] 必须指定 -server")
+		fmt.Println("[ERROR] 必须指定服务器地址 (-server 或配置文件中的 server)")
 		flag.Usage()
 		os.Exit(1)
 	}
 	if cfg.PSK == "" {
-		fmt.Println("[ERROR] 必须指定 -psk")
+		fmt.Println("[ERROR] 必须指定预共享密钥 (-psk 或配置文件中的 psk)")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -154,14 +198,20 @@ func parseFlags() *ClientConfig {
 	return cfg
 }
 
-// loadConfig 加载配置文件
-func loadConfig(path string, cfg *ClientConfig) {
+// loadConfigFile 加载 YAML 配置文件
+func loadConfigFile(path string, cfg *ClientConfig) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Printf("[WARN] 无法读取配置文件: %v\n", err)
-		return
+		return fmt.Errorf("读取配置文件失败: %w", err)
 	}
-	json.Unmarshal(data, cfg)
+
+	// 使用 YAML 解析器
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("解析 YAML 失败: %w", err)
+	}
+
+	fmt.Printf("[INFO] 已加载配置文件: %s\n", path)
+	return nil
 }
 
 // printBanner 打印横幅
