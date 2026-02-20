@@ -1,6 +1,6 @@
 // =============================================================================
 // 文件: internal/tunnel/runner.go
-// 描述: Cloudflare Tunnel 进程管理 - 封装 cloudflared 子进程的启动、监控和停止
+// 描述: Cloudflare Tunnel 进程管理 - 通用部分
 // =============================================================================
 package tunnel
 
@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -158,7 +157,7 @@ func (r *CloudflaredRunner) Start(ctx context.Context) error {
 		return fmt.Errorf("cloudflared 已在运行中")
 	}
 
-	// 修复：确保二进制文件有执行权限
+	// 确保二进制文件有执行权限
 	if err := os.Chmod(r.binaryPath, 0755); err != nil {
 		r.log(1, "设置执行权限失败: %v (继续尝试启动)", err)
 	}
@@ -268,11 +267,8 @@ func (r *CloudflaredRunner) startProcess(ctx context.Context, args []string) err
 		"NO_AUTOUPDATE=true",
 	)
 
-	// 修复：设置进程组，便于完整清理子进程
-	// 注意：SysProcAttr 是标准库 syscall 包的一部分，适用于 Linux/Unix
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true, // 确保此字段存在 (Go 1.16+)
-	}
+	// 平台特定的进程配置
+	configurePlatformProcess(cmd)
 
 	if err := cmd.Start(); err != nil {
 		stdout.Close()
@@ -438,7 +434,6 @@ func (r *CloudflaredRunner) handleRestart(ctx context.Context) {
 }
 
 // Stop 停止 cloudflared 进程
-// 修复：使用进程组确保完整清理子进程
 func (r *CloudflaredRunner) Stop() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -455,22 +450,9 @@ func (r *CloudflaredRunner) Stop() error {
 		r.cancelFunc()
 	}
 
-	// 修复：处理不同平台
-	var pid int
+	// 使用平台特定的进程终止方法
 	if r.cmd != nil && r.cmd.Process != nil {
-		pid = r.cmd.Process.Pid
-	}
-
-	// 如果进程存在且不是 Windows (假设用户在使用标准 Unix syscall，若为 Windows 则需调整)
-	// 根据错误日志，代码主要用于 Linux 构建
-	if pid > 0 && r.cmd != nil && r.cmd.Process != nil {
-		// 注意：syscall.Kill(-pid) 用于终止进程组。仅在 Unix/Linux 下有效。
-		// 这里我们假设这是用于 Linux 环境的 `make release` (Linux target)
-		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
-			r.log(2, "发送 SIGTERM 到进程组失败: %v (可能不是 Linux 环境)", err)
-			// 回退到单进程信号
-			r.cmd.Process.Signal(syscall.SIGTERM)
-		}
+		terminateProcess(r.cmd.Process)
 	}
 
 	done := make(chan struct{})
@@ -485,11 +467,7 @@ func (r *CloudflaredRunner) Stop() error {
 	case <-time.After(GracefulStopTimeout):
 		r.log(0, "等待进程退出超时，强制终止")
 		if r.cmd != nil && r.cmd.Process != nil {
-			pid := r.cmd.Process.Pid
-			// 强制终止进程组
-			if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
-				r.cmd.Process.Kill()
-			}
+			killProcess(r.cmd.Process)
 		}
 	}
 
