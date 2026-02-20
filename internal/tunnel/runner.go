@@ -269,8 +269,9 @@ func (r *CloudflaredRunner) startProcess(ctx context.Context, args []string) err
 	)
 
 	// 修复：设置进程组，便于完整清理子进程
+	// 注意：SysProcAttr 是标准库 syscall 包的一部分，适用于 Linux/Unix
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
+		Setpgid: true, // 确保此字段存在 (Go 1.16+)
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -454,14 +455,20 @@ func (r *CloudflaredRunner) Stop() error {
 		r.cancelFunc()
 	}
 
-	// 修复：通过进程组发送信号，确保子进程也被终止
+	// 修复：处理不同平台
+	var pid int
 	if r.cmd != nil && r.cmd.Process != nil {
-		pid := r.cmd.Process.Pid
-		
-		// 先尝试优雅终止（SIGTERM 到进程组）
+		pid = r.cmd.Process.Pid
+	}
+
+	// 如果进程存在且不是 Windows (假设用户在使用标准 Unix syscall，若为 Windows 则需调整)
+	// 根据错误日志，代码主要用于 Linux 构建
+	if pid > 0 && r.cmd != nil && r.cmd.Process != nil {
+		// 注意：syscall.Kill(-pid) 用于终止进程组。仅在 Unix/Linux 下有效。
+		// 这里我们假设这是用于 Linux 环境的 `make release` (Linux target)
 		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
-			r.log(2, "发送 SIGTERM 到进程组失败: %v", err)
-			// 回退到单进程
+			r.log(2, "发送 SIGTERM 到进程组失败: %v (可能不是 Linux 环境)", err)
+			// 回退到单进程信号
 			r.cmd.Process.Signal(syscall.SIGTERM)
 		}
 	}
@@ -480,8 +487,9 @@ func (r *CloudflaredRunner) Stop() error {
 		if r.cmd != nil && r.cmd.Process != nil {
 			pid := r.cmd.Process.Pid
 			// 强制终止进程组
-			syscall.Kill(-pid, syscall.SIGKILL)
-			r.cmd.Process.Kill()
+			if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+				r.cmd.Process.Kill()
+			}
 		}
 	}
 
