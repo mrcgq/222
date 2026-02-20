@@ -21,7 +21,7 @@ import (
 )
 
 // =============================================================================
-// 常量定义
+// eBPF 常量定义
 // =============================================================================
 
 const (
@@ -43,6 +43,57 @@ const (
 	PinModeReuse
 	PinModeReplace
 	PinModeStrict
+)
+
+// =============================================================================
+// eBPF 结构体定义
+// =============================================================================
+
+// EBPFStats eBPF 统计信息结构
+// 修复：添加缺失的字段
+type EBPFStats struct {
+	PacketsRX         uint64
+	PacketsTX         uint64
+	BytesRX            uint64
+	BytesTX            uint64
+	PacketsDropped    uint64
+	SessionsCreated   uint64
+	SessionsDestroyed uint64 // 修复：缺失字段
+	AuthFailures      uint64 // 修复：缺失字段
+	ReplayBlocked     uint64 // 修复：缺失字段
+}
+
+// EBPFSessionKey eBPF 会话键结构
+type EBPFSessionKey struct {
+	ClientIP [4]byte
+	Bytes    uint64
+}
+
+// EBPFSessionValue eBPF 会话值结构
+type EBPFSessionValue struct {
+	IsClosed uint8
+}
+
+// EBPFGlobalConfig eBPF 全局配置结构
+type EBPFGlobalConfig struct {
+	Magic           uint32
+	ListenPort      uint16
+	Mode            uint8
+	LogLevel        uint8
+	SessionTimeout  uint32
+	MaxSessions     uint32
+	EnableStats     uint8
+	EnableConntrack uint8
+}
+
+// XDPMode eBPF XDP 模式
+type XDPMode string
+
+const (
+	XDPModeAuto   XDPMode = "auto"
+	XDPModeNative XDPMode = "native"
+	XDPModeGeneric XDPMode = "generic"
+	XDPModeOffload XDPMode = "offload"
 )
 
 // =============================================================================
@@ -887,9 +938,9 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 			final.BytesTX += s.BytesTX
 			final.PacketsDropped += s.PacketsDropped
 			final.SessionsCreated += s.SessionsCreated
-			final.SessionsDestroyed += s.SessionsDestroyed
-			final.AuthFailures += s.AuthFailures
-			final.ReplayBlocked += s.ReplayBlocked
+			final.SessionsDestroyed += s.SessionsDestroyed // 修复：添加缺失字段
+			final.AuthFailures += s.AuthFailures       // 修复：添加缺失字段
+			final.ReplayBlocked += s.ReplayBlocked      // 修复：添加缺失字段
 		}
 		return final, nil
 	}
@@ -1036,7 +1087,7 @@ func getInterfaceByName(name string) (*netInterface, error) {
 	var ifr [40]byte
 	copy(ifr[:], name)
 
-	_, _, errno := syscall.Syscall(
+	_, _, errno := syscall.SysCall(
 		syscall.SYS_IOCTL,
 		uintptr(fd),
 		syscall.SIOCGIFINDEX,
