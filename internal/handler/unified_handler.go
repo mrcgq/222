@@ -1,11 +1,6 @@
 // =============================================================================
 // 文件: internal/handler/unified_handler.go
-// 描述: 统一处理器 - 用户态核心处理中心，负责解析数据包并驱动代理逻辑
-// 职责:
-//   - 解析所有通过传输层上报的数据包
-//   - 管理代理连接的生命周期
-//   - 实现 Connect/Data/Close 指令处理
-//   - 异步反馈数据给传输层
+// 描述: 统一处理器 - 用户态核心处理中心
 // =============================================================================
 package handler
 
@@ -29,97 +24,87 @@ import (
 // 常量定义
 // =============================================================================
 
-// 日志级别
 const (
 	LogLevelError = iota
 	LogLevelInfo
 	LogLevelDebug
 )
 
-// 响应状态码 (本地定义，避免依赖 protocol 包的常量)
 const (
-	StatusOK    byte = 0x00 // 成功
-	StatusError byte = 0x01 // 错误
+	StatusOK    byte = 0x00
+	StatusError byte = 0x01
 )
 
-// 超时配置
 const (
-	connectTimeout     = 10 * time.Second  // 连接目标超时
-	writeTimeout       = 30 * time.Second  // 写入超时
-	readTimeout        = 5 * time.Minute   // 读取超时（空闲）
-	connCleanupPeriod  = 30 * time.Second  // 连接清理周期
-	connIdleTimeout    = 5 * time.Minute   // 连接空闲超时
-	sessionIdleTimeout = 10 * time.Minute  // 会话空闲超时
-	readBufferSize     = 32 * 1024         // 读取缓冲区大小
+	connectTimeout     = 10 * time.Second
+	writeTimeout       = 30 * time.Second
+	readTimeout        = 5 * time.Minute
+	connCleanupPeriod  = 30 * time.Second
+	connIdleTimeout    = 5 * time.Minute
+	sessionIdleTimeout = 10 * time.Minute
+	readBufferSize     = 32 * 1024
 )
 
 // =============================================================================
 // 类型定义
 // =============================================================================
 
-// Sender 数据发送回调函数类型
 type Sender func(data []byte, addr *net.UDPAddr) error
 
-// UnifiedHandler 统一处理器 - 用户态核心处理中心
 type UnifiedHandler struct {
-	// 依赖注入
-	crypto  *crypto.Crypto          // 加密器
-	cfg     *config.Config          // 配置
-	metrics *metrics.PhantomMetrics // 指标收集器
+	crypto  *crypto.Crypto
+	cfg     *config.Config
+	metrics *metrics.PhantomMetrics
 
-	// 日志配置
 	logLevel int
 
-	// 连接管理 - 使用 sync.Map 实现并发安全
-	connections sync.Map // reqID(uint32) -> *ProxyConnection
-	sessions    sync.Map // clientAddr(string) -> *ClientSession
+	connections sync.Map
+	sessions    sync.Map
 
-	// 发送回调（由传输层设置）
 	sender Sender
 
-	// 统计信息
 	stats handlerStats
 
-	// 生命周期控制
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-// ProxyConnection 代理连接 - 维护 reqID 到目标连接的映射
 type ProxyConnection struct {
-	ID         uint32       // 请求ID
-	Target     net.Conn     // 目标服务器连接
-	ClientAddr *net.UDPAddr // 客户端地址（UDP模式）
-	Network    string       // 网络类型 (tcp/udp)
-	TargetAddr string       // 目标地址
-	CreatedAt  time.Time    // 创建时间
-	LastActive time.Time    // 最后活跃时间
-	BytesSent  uint64       // 发送字节数
-	BytesRecv  uint64       // 接收字节数
-	closed     int32        // 关闭标志
-	mu         sync.Mutex   // 保护 LastActive 和 ClientAddr
+	ID         uint32
+	Target     net.Conn
+	ClientAddr *net.UDPAddr
+	Network    string
+	TargetAddr string
+	CreatedAt  time.Time
+	LastActive time.Time
+	BytesSent  uint64
+	BytesRecv  uint64
+	closed     int32
+	mu         sync.Mutex
 }
 
-// ClientSession 客户端会话
 type ClientSession struct {
-	Addr       *net.UDPAddr // 客户端地址
-	LastActive time.Time    // 最后活跃时间
-	ConnIDs    []uint32     // 关联的连接ID列表
-	mu         sync.Mutex   // 保护会话状态
+	Addr       *net.UDPAddr
+	LastActive time.Time
+	ConnIDs    []uint32
+	mu         sync.Mutex
 }
 
-// handlerStats 处理器统计信息
+// 修复：添加实际统计字段
 type handlerStats struct {
-	totalConns  uint64 // 总连接数
-	activeConns int64  // 活跃连接数
-	totalBytes  uint64 // 总传输字节数
+	totalConns     uint64
+	activeConns    int64
+	totalBytes     uint64
+	authFailures   uint64 // 认证失败次数
+	replayBlocked  uint64 // 重放攻击拦截次数
+	decryptErrors  uint64 // 解密错误次数
+	heartbeatsRecv uint64 // 收到的心跳数
 }
 
 // =============================================================================
 // 构造函数
 // =============================================================================
 
-// NewUnifiedHandler 创建统一处理器
 func NewUnifiedHandler(c *crypto.Crypto, cfg *config.Config) *UnifiedHandler {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -131,13 +116,11 @@ func NewUnifiedHandler(c *crypto.Crypto, cfg *config.Config) *UnifiedHandler {
 		cancel:   cancel,
 	}
 
-	// 启动后台清理协程
 	go h.cleanupLoop()
 
 	return h
 }
 
-// parseLogLevel 解析日志级别
 func parseLogLevel(level string) int {
 	switch level {
 	case "debug":
@@ -153,21 +136,17 @@ func parseLogLevel(level string) int {
 // 公共接口
 // =============================================================================
 
-// SetMetrics 设置指标收集器
 func (h *UnifiedHandler) SetMetrics(m *metrics.PhantomMetrics) {
 	h.metrics = m
 }
 
-// SetSender 设置数据发送回调（由传输层调用）
 func (h *UnifiedHandler) SetSender(fn Sender) {
 	h.sender = fn
 }
 
-// Close 关闭处理器
 func (h *UnifiedHandler) Close() error {
 	h.cancel()
 
-	// 关闭所有活跃连接
 	h.connections.Range(func(key, value interface{}) bool {
 		if conn, ok := value.(*ProxyConnection); ok {
 			h.closeConnection(conn.ID)
@@ -179,31 +158,54 @@ func (h *UnifiedHandler) Close() error {
 }
 
 // GetStats 获取统计信息
+// 修复：返回实际的统计数据
 func (h *UnifiedHandler) GetStats() map[string]interface{} {
 	return map[string]interface{}{
-		"total_conns":  atomic.LoadUint64(&h.stats.totalConns),
-		"active_conns": atomic.LoadInt64(&h.stats.activeConns),
-		"total_bytes":  atomic.LoadUint64(&h.stats.totalBytes),
+		"total_conns":     atomic.LoadUint64(&h.stats.totalConns),
+		"active_conns":    atomic.LoadInt64(&h.stats.activeConns),
+		"total_bytes":     atomic.LoadUint64(&h.stats.totalBytes),
+		"auth_failures":   atomic.LoadUint64(&h.stats.authFailures),
+		"replay_blocked":  atomic.LoadUint64(&h.stats.replayBlocked),
+		"decrypt_errors":  atomic.LoadUint64(&h.stats.decryptErrors),
+		"heartbeats_recv": atomic.LoadUint64(&h.stats.heartbeatsRecv),
 	}
 }
 
-// GetActiveConns 获取活跃连接数
 func (h *UnifiedHandler) GetActiveConns() int64 {
 	return atomic.LoadInt64(&h.stats.activeConns)
 }
 
+// GetAuthFailures 获取认证失败次数
+func (h *UnifiedHandler) GetAuthFailures() uint64 {
+	return atomic.LoadUint64(&h.stats.authFailures)
+}
+
+// GetReplayBlocked 获取重放攻击拦截次数
+func (h *UnifiedHandler) GetReplayBlocked() uint64 {
+	return atomic.LoadUint64(&h.stats.replayBlocked)
+}
+
 // =============================================================================
-// UDP 数据包处理（实现 PacketHandler 接口）
+// UDP 数据包处理
 // =============================================================================
 
-// HandlePacket 处理 UDP 数据包
-// 实现传输层的 PacketHandler 接口
 func (h *UnifiedHandler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
 	// 1. 解密数据
 	plaintext, err := h.crypto.Decrypt(data)
 	if err != nil {
+		// 修复：记录解密失败统计
+		atomic.AddUint64(&h.stats.decryptErrors, 1)
+		
+		// 区分不同的错误类型
+		errStr := err.Error()
+		if contains(errStr, "UserID") {
+			atomic.AddUint64(&h.stats.authFailures, 1)
+		} else if contains(errStr, "重放") || contains(errStr, "replay") {
+			atomic.AddUint64(&h.stats.replayBlocked, 1)
+		}
+		
 		h.log(LogLevelDebug, "解密失败: %v", err)
-		return nil // 静默丢弃无效数据包
+		return nil
 	}
 
 	// 2. 解析协议请求
@@ -227,15 +229,35 @@ func (h *UnifiedHandler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
 	case protocol.TypeClose:
 		h.handleUDPClose(req)
 
+	case protocol.TypeHeartbeat:
+		// 修复：正确处理心跳包并记录统计
+		atomic.AddUint64(&h.stats.heartbeatsRecv, 1)
+		h.handleUDPHeartbeat(req, from)
+
 	default:
 		h.log(LogLevelDebug, "未知请求类型: 0x%02X", req.Type)
 	}
 
-	// 响应通过 sender 异步发送，此处返回 nil
 	return nil
 }
 
-// handleUDPConnect 处理 UDP Connect 请求
+// handleUDPHeartbeat 处理心跳包
+func (h *UnifiedHandler) handleUDPHeartbeat(req *protocol.Request, from *net.UDPAddr) {
+	h.log(LogLevelDebug, "收到心跳: ID:%d from %s", req.ReqID, from.String())
+	
+	// 发送心跳响应
+	resp := protocol.BuildHeartbeatResponse(req.ReqID)
+	encrypted, err := h.crypto.Encrypt(resp)
+	if err != nil {
+		h.log(LogLevelError, "加密心跳响应失败: %v", err)
+		return
+	}
+	
+	if h.sender != nil {
+		h.sender(encrypted, from)
+	}
+}
+
 func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAddr) {
 	network := req.NetworkString()
 	target := req.TargetAddr()
@@ -243,7 +265,6 @@ func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAd
 	h.log(LogLevelInfo, "UDP Connect: %s %s (ID:%d) from %s",
 		network, target, req.ReqID, from.String())
 
-	// 建立到目标服务器的连接
 	targetConn, err := net.DialTimeout(network, target, connectTimeout)
 	if err != nil {
 		h.log(LogLevelDebug, "连接目标失败: %s - %v", target, err)
@@ -251,10 +272,8 @@ func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAd
 		return
 	}
 
-	// 配置 TCP 连接选项
 	h.configureTCPConnection(targetConn)
 
-	// 创建代理连接
 	conn := &ProxyConnection{
 		ID:         req.ReqID,
 		Target:     targetConn,
@@ -265,47 +284,37 @@ func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAd
 		LastActive: time.Now(),
 	}
 
-	// 存储连接映射
 	h.connections.Store(req.ReqID, conn)
 	atomic.AddUint64(&h.stats.totalConns, 1)
 	atomic.AddInt64(&h.stats.activeConns, 1)
 
-	// 更新指标
 	if h.metrics != nil {
 		h.metrics.IncConnections()
 	}
 
-	// 发送初始数据（如果有）
 	if len(req.Data) > 0 {
 		if err := h.writeToTarget(conn, req.Data); err != nil {
 			h.log(LogLevelDebug, "发送初始数据失败: %v", err)
-			// 继续处理，不关闭连接
 		}
 	}
 
-	// 发送成功响应
 	h.sendUDPResponse(req.ReqID, StatusOK, nil, from)
 
-	// 启动异步读取循环
 	go h.udpReadLoop(conn)
 }
 
-// handleUDPData 处理 UDP Data 请求
 func (h *UnifiedHandler) handleUDPData(req *protocol.Request, from *net.UDPAddr) {
-	// 查找连接
 	conn := h.getConnection(req.ReqID)
 	if conn == nil {
 		h.log(LogLevelDebug, "连接不存在: ID:%d", req.ReqID)
 		return
 	}
 
-	// 更新活跃时间和客户端地址（可能因NAT变化）
 	conn.mu.Lock()
 	conn.LastActive = time.Now()
 	conn.ClientAddr = from
 	conn.mu.Unlock()
 
-	// 转发数据到目标服务器
 	if len(req.Data) > 0 {
 		if err := h.writeToTarget(conn, req.Data); err != nil {
 			h.log(LogLevelDebug, "写入目标失败: ID:%d - %v", req.ReqID, err)
@@ -314,28 +323,23 @@ func (h *UnifiedHandler) handleUDPData(req *protocol.Request, from *net.UDPAddr)
 	}
 }
 
-// handleUDPClose 处理 UDP Close 请求
 func (h *UnifiedHandler) handleUDPClose(req *protocol.Request) {
 	h.log(LogLevelInfo, "UDP Close: ID:%d", req.ReqID)
 	h.closeConnection(req.ReqID)
 }
 
-// udpReadLoop UDP模式下从目标服务器读取数据并回传
 func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 	defer h.closeConnection(conn.ID)
 
 	buf := make([]byte, readBufferSize)
 
 	for {
-		// 检查连接是否已关闭
 		if atomic.LoadInt32(&conn.closed) != 0 {
 			return
 		}
 
-		// 设置读取超时
 		_ = conn.Target.SetReadDeadline(time.Now().Add(readTimeout))
 
-		// 从目标读取数据
 		n, err := conn.Target.Read(buf)
 		if err != nil {
 			if err != io.EOF {
@@ -344,7 +348,6 @@ func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 			return
 		}
 
-		// 更新统计和活跃时间
 		conn.mu.Lock()
 		conn.LastActive = time.Now()
 		clientAddr := conn.ClientAddr
@@ -353,34 +356,28 @@ func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 		atomic.AddUint64(&conn.BytesRecv, uint64(n))
 		atomic.AddUint64(&h.stats.totalBytes, uint64(n))
 
-		// 更新指标
 		if h.metrics != nil {
 			h.metrics.AddBytesReceived(int64(n))
 		}
 
-		// 发送响应到客户端
 		h.sendUDPResponse(conn.ID, protocol.TypeData, buf[:n], clientAddr)
 	}
 }
 
-// sendUDPResponse 发送 UDP 响应
 func (h *UnifiedHandler) sendUDPResponse(reqID uint32, status byte, data []byte, to *net.UDPAddr) {
 	if h.sender == nil {
 		h.log(LogLevelError, "Sender 未设置，无法发送响应")
 		return
 	}
 
-	// 构建响应
 	resp := protocol.BuildResponse(reqID, status, data)
 
-	// 加密
 	encrypted, err := h.crypto.Encrypt(resp)
 	if err != nil {
 		h.log(LogLevelError, "加密响应失败: %v", err)
 		return
 	}
 
-	// 通过传输层发送
 	if err := h.sender(encrypted, to); err != nil {
 		h.log(LogLevelDebug, "发送响应失败: %v", err)
 	} else if h.metrics != nil {
@@ -389,15 +386,13 @@ func (h *UnifiedHandler) sendUDPResponse(reqID uint32, status byte, data []byte,
 }
 
 // =============================================================================
-// TCP 连接处理（实现 TCPConnectionHandler 接口）
+// TCP 连接处理
 // =============================================================================
 
-// HandleConnection 处理一个 TCP 客户端连接
 func (h *UnifiedHandler) HandleConnection(ctx context.Context, clientConn net.Conn) {
 	atomic.AddInt64(&h.stats.activeConns, 1)
 	defer atomic.AddInt64(&h.stats.activeConns, -1)
 
-	// 更新指标
 	if h.metrics != nil {
 		h.metrics.IncConnections()
 		defer h.metrics.DecConnections()
@@ -407,15 +402,12 @@ func (h *UnifiedHandler) HandleConnection(ctx context.Context, clientConn net.Co
 	h.log(LogLevelDebug, "TCP 新连接: %s", clientAddr)
 	defer h.log(LogLevelDebug, "TCP 连接关闭: %s", clientAddr)
 
-	// 创建帧读写器
 	reader := transport.NewFrameReader(clientConn, transport.ReadTimeout)
 	writer := transport.NewFrameWriter(clientConn, transport.WriteTimeout)
 
-	// 主处理循环
 	h.tcpMainLoop(ctx, clientConn, reader, writer, clientAddr)
 }
 
-// tcpMainLoop TCP 主处理循环
 func (h *UnifiedHandler) tcpMainLoop(
 	ctx context.Context,
 	clientConn net.Conn,
@@ -432,7 +424,6 @@ func (h *UnifiedHandler) tcpMainLoop(
 		default:
 		}
 
-		// 读取加密帧
 		encryptedFrame, err := reader.ReadFrame()
 		if err != nil {
 			if err != io.EOF {
@@ -441,24 +432,22 @@ func (h *UnifiedHandler) tcpMainLoop(
 			return
 		}
 
-		// 解密
 		plaintext, err := h.crypto.Decrypt(encryptedFrame)
 		if err != nil {
+			// 修复：记录解密失败统计
+			atomic.AddUint64(&h.stats.decryptErrors, 1)
 			h.log(LogLevelDebug, "解密失败: %s - %v", clientAddr, err)
 			return
 		}
 
-		// 解析请求
 		req, err := protocol.ParseRequest(plaintext)
 		if err != nil {
 			h.log(LogLevelDebug, "解析请求失败: %s - %v", clientAddr, err)
 			continue
 		}
 
-		// 处理请求
 		switch req.Type {
 		case protocol.TypeConnect:
-			// Connect 请求后进入代理模式
 			h.handleTCPConnect(ctx, req, clientConn, reader, writer)
 			return
 
@@ -470,13 +459,17 @@ func (h *UnifiedHandler) tcpMainLoop(
 			h.log(LogLevelDebug, "收到 Close 请求: %s", clientAddr)
 			return
 
+		case protocol.TypeHeartbeat:
+			// 修复：处理 TCP 心跳
+			atomic.AddUint64(&h.stats.heartbeatsRecv, 1)
+			h.sendTCPResponse(writer, req.ReqID, protocol.TypeHeartbeat, nil)
+
 		default:
 			h.log(LogLevelDebug, "未知请求类型: 0x%02X", req.Type)
 		}
 	}
 }
 
-// handleTCPConnect 处理 TCP Connect 请求
 func (h *UnifiedHandler) handleTCPConnect(
 	ctx context.Context,
 	req *protocol.Request,
@@ -489,7 +482,6 @@ func (h *UnifiedHandler) handleTCPConnect(
 
 	h.log(LogLevelInfo, "TCP Connect: %s %s (ID:%d)", network, target, req.ReqID)
 
-	// 连接目标服务器
 	targetConn, err := net.DialTimeout(network, target, connectTimeout)
 	if err != nil {
 		h.log(LogLevelDebug, "连接目标失败: %s - %v", target, err)
@@ -498,10 +490,8 @@ func (h *UnifiedHandler) handleTCPConnect(
 	}
 	defer targetConn.Close()
 
-	// 配置 TCP 连接
 	h.configureTCPConnection(targetConn)
 
-	// 发送初始数据（如果有）
 	if len(req.Data) > 0 {
 		_ = targetConn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if _, err := targetConn.Write(req.Data); err != nil {
@@ -511,7 +501,6 @@ func (h *UnifiedHandler) handleTCPConnect(
 		}
 	}
 
-	// 发送成功响应
 	if err := h.sendTCPResponse(writer, req.ReqID, StatusOK, nil); err != nil {
 		h.log(LogLevelDebug, "发送响应失败: %v", err)
 		return
@@ -519,11 +508,9 @@ func (h *UnifiedHandler) handleTCPConnect(
 
 	h.log(LogLevelInfo, "TCP 代理建立: %s %s", network, target)
 
-	// 进入双向代理模式
 	h.tcpBidirectionalProxy(ctx, req.ReqID, clientConn, targetConn, reader, writer)
 }
 
-// tcpBidirectionalProxy TCP 双向代理
 func (h *UnifiedHandler) tcpBidirectionalProxy(
 	ctx context.Context,
 	reqID uint32,
@@ -537,7 +524,6 @@ func (h *UnifiedHandler) tcpBidirectionalProxy(
 
 	var wg sync.WaitGroup
 
-	// 客户端 -> 目标
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -545,7 +531,6 @@ func (h *UnifiedHandler) tcpBidirectionalProxy(
 		h.tcpClientToTarget(proxyCtx, reqID, targetConn, reader)
 	}()
 
-	// 目标 -> 客户端
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -557,7 +542,6 @@ func (h *UnifiedHandler) tcpBidirectionalProxy(
 	h.log(LogLevelInfo, "TCP 代理结束: ID:%d", reqID)
 }
 
-// tcpClientToTarget 客户端到目标的数据转发
 func (h *UnifiedHandler) tcpClientToTarget(
 	ctx context.Context,
 	reqID uint32,
@@ -571,7 +555,6 @@ func (h *UnifiedHandler) tcpClientToTarget(
 		default:
 		}
 
-		// 读取加密帧
 		encryptedFrame, err := reader.ReadFrame()
 		if err != nil {
 			if err != io.EOF {
@@ -580,14 +563,13 @@ func (h *UnifiedHandler) tcpClientToTarget(
 			return
 		}
 
-		// 解密
 		plaintext, err := h.crypto.Decrypt(encryptedFrame)
 		if err != nil {
+			atomic.AddUint64(&h.stats.decryptErrors, 1)
 			h.log(LogLevelDebug, "解密失败: ID:%d - %v", reqID, err)
 			return
 		}
 
-		// 解析请求
 		req, err := protocol.ParseRequest(plaintext)
 		if err != nil {
 			h.log(LogLevelDebug, "解析失败: ID:%d - %v", reqID, err)
@@ -613,7 +595,6 @@ func (h *UnifiedHandler) tcpClientToTarget(
 	}
 }
 
-// tcpTargetToClient 目标到客户端的数据转发
 func (h *UnifiedHandler) tcpTargetToClient(
 	ctx context.Context,
 	reqID uint32,
@@ -629,26 +610,21 @@ func (h *UnifiedHandler) tcpTargetToClient(
 		default:
 		}
 
-		// 设置读取超时
 		_ = targetConn.SetReadDeadline(time.Now().Add(transport.ReadTimeout))
 
-		// 从目标读取
 		n, err := targetConn.Read(buf)
 		if err != nil {
 			if err != io.EOF {
 				h.log(LogLevelDebug, "读取目标失败: ID:%d - %v", reqID, err)
 			}
-			// 发送关闭通知
 			_ = h.sendTCPResponse(writer, reqID, protocol.TypeClose, nil)
 			return
 		}
 
-		// 更新指标
 		if h.metrics != nil {
 			h.metrics.AddBytesReceived(int64(n))
 		}
 
-		// 发送到客户端
 		if err := h.sendTCPResponse(writer, reqID, protocol.TypeData, buf[:n]); err != nil {
 			h.log(LogLevelDebug, "发送到客户端失败: ID:%d - %v", reqID, err)
 			return
@@ -656,23 +632,18 @@ func (h *UnifiedHandler) tcpTargetToClient(
 	}
 }
 
-// sendTCPResponse 发送 TCP 响应
 func (h *UnifiedHandler) sendTCPResponse(writer *transport.FrameWriter, reqID uint32, status byte, data []byte) error {
-	// 构建响应
 	resp := protocol.BuildResponse(reqID, status, data)
 
-	// 加密
 	encrypted, err := h.crypto.Encrypt(resp)
 	if err != nil {
 		return fmt.Errorf("加密失败: %w", err)
 	}
 
-	// 发送帧
 	if err := writer.WriteFrame(encrypted); err != nil {
 		return err
 	}
 
-	// 更新指标
 	if h.metrics != nil {
 		h.metrics.AddBytesSent(int64(len(encrypted)))
 	}
@@ -684,7 +655,6 @@ func (h *UnifiedHandler) sendTCPResponse(writer *transport.FrameWriter, reqID ui
 // 连接管理
 // =============================================================================
 
-// getConnection 获取连接
 func (h *UnifiedHandler) getConnection(reqID uint32) *ProxyConnection {
 	if v, ok := h.connections.Load(reqID); ok {
 		return v.(*ProxyConnection)
@@ -692,7 +662,6 @@ func (h *UnifiedHandler) getConnection(reqID uint32) *ProxyConnection {
 	return nil
 }
 
-// closeConnection 关闭连接
 func (h *UnifiedHandler) closeConnection(reqID uint32) {
 	v, ok := h.connections.LoadAndDelete(reqID)
 	if !ok {
@@ -701,20 +670,16 @@ func (h *UnifiedHandler) closeConnection(reqID uint32) {
 
 	conn := v.(*ProxyConnection)
 
-	// 设置关闭标志（防止重复关闭）
 	if !atomic.CompareAndSwapInt32(&conn.closed, 0, 1) {
 		return
 	}
 
-	// 关闭目标连接
 	if conn.Target != nil {
 		_ = conn.Target.Close()
 	}
 
-	// 更新统计
 	atomic.AddInt64(&h.stats.activeConns, -1)
 
-	// 更新指标
 	if h.metrics != nil {
 		h.metrics.DecConnections()
 	}
@@ -724,7 +689,6 @@ func (h *UnifiedHandler) closeConnection(reqID uint32) {
 		time.Since(conn.CreatedAt).Round(time.Second))
 }
 
-// writeToTarget 写入数据到目标服务器
 func (h *UnifiedHandler) writeToTarget(conn *ProxyConnection, data []byte) error {
 	_ = conn.Target.SetWriteDeadline(time.Now().Add(writeTimeout))
 
@@ -736,7 +700,6 @@ func (h *UnifiedHandler) writeToTarget(conn *ProxyConnection, data []byte) error
 	atomic.AddUint64(&conn.BytesSent, uint64(n))
 	atomic.AddUint64(&h.stats.totalBytes, uint64(n))
 
-	// 更新指标
 	if h.metrics != nil {
 		h.metrics.AddBytesSent(int64(n))
 	}
@@ -744,7 +707,6 @@ func (h *UnifiedHandler) writeToTarget(conn *ProxyConnection, data []byte) error
 	return nil
 }
 
-// configureTCPConnection 配置 TCP 连接选项
 func (h *UnifiedHandler) configureTCPConnection(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
@@ -757,7 +719,6 @@ func (h *UnifiedHandler) configureTCPConnection(conn net.Conn) {
 // 会话管理
 // =============================================================================
 
-// updateSession 更新客户端会话
 func (h *UnifiedHandler) updateSession(addr *net.UDPAddr, connID uint32) {
 	key := addr.String()
 
@@ -773,7 +734,6 @@ func (h *UnifiedHandler) updateSession(addr *net.UDPAddr, connID uint32) {
 
 	session.LastActive = time.Now()
 
-	// 添加连接 ID（去重）
 	for _, id := range session.ConnIDs {
 		if id == connID {
 			return
@@ -786,7 +746,6 @@ func (h *UnifiedHandler) updateSession(addr *net.UDPAddr, connID uint32) {
 // 后台清理
 // =============================================================================
 
-// cleanupLoop 定期清理过期连接和会话
 func (h *UnifiedHandler) cleanupLoop() {
 	ticker := time.NewTicker(connCleanupPeriod)
 	defer ticker.Stop()
@@ -801,13 +760,11 @@ func (h *UnifiedHandler) cleanupLoop() {
 	}
 }
 
-// cleanup 执行清理
 func (h *UnifiedHandler) cleanup() {
 	now := time.Now()
 	cleanedConns := 0
 	cleanedSessions := 0
 
-	// 清理超时连接
 	h.connections.Range(func(key, value interface{}) bool {
 		conn := value.(*ProxyConnection)
 		conn.mu.Lock()
@@ -821,7 +778,6 @@ func (h *UnifiedHandler) cleanup() {
 		return true
 	})
 
-	// 清理超时会话
 	h.sessions.Range(func(key, value interface{}) bool {
 		session := value.(*ClientSession)
 		session.mu.Lock()
@@ -841,10 +797,26 @@ func (h *UnifiedHandler) cleanup() {
 }
 
 // =============================================================================
+// 辅助函数
+// =============================================================================
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsImpl(s, substr))
+}
+
+func containsImpl(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// =============================================================================
 // 日志
 // =============================================================================
 
-// log 输出日志
 func (h *UnifiedHandler) log(level int, format string, args ...interface{}) {
 	if level > h.logLevel {
 		return
