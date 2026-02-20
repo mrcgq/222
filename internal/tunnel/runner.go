@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -23,23 +24,14 @@ import (
 // =============================================================================
 
 const (
-	// URL 解析超时时间
-	URLParseTimeout = 30 * time.Second
-
-	// 进程健康检查间隔
-	HealthCheckInterval = 10 * time.Second
-
-	// 进程重启延迟
-	RestartDelay = 5 * time.Second
-
-	// 最大重启次数
-	MaxRestartAttempts = 5
-
-	// 重启计数器重置时间（成功运行这么长时间后重置重启计数）
+	URLParseTimeout         = 30 * time.Second
+	HealthCheckInterval     = 10 * time.Second
+	RestartDelay            = 5 * time.Second
+	MaxRestartAttempts      = 5
 	RestartCounterResetTime = 5 * time.Minute
+	GracefulStopTimeout     = 10 * time.Second
 )
 
-// TunnelMode 隧道模式
 type TunnelMode string
 
 const (
@@ -52,74 +44,61 @@ const (
 // CloudflaredRunner - cloudflared 进程管理器
 // =============================================================================
 
-// CloudflaredRunner 管理 cloudflared 子进程
 type CloudflaredRunner struct {
-	// 配置
 	binaryPath string
 	mode       TunnelMode
 	localAddr  string
 	localPort  int
 	protocol   string
 
-	// 固定隧道配置
 	cfToken    string
 	cfTunnelID string
 
-	// 权限管理
 	privManager *PrivilegeManager
 
-	// 进程状态
 	cmd        *exec.Cmd
 	cancelFunc context.CancelFunc
 	running    atomic.Bool
-	tunnelURL  atomic.Value // string
-	domain     atomic.Value // string
+	tunnelURL  atomic.Value
+	domain     atomic.Value
 
-	// 输出管道
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 
-	// 回调函数
 	onURLReady    func(url string)
 	onError       func(err error)
 	onStateChange func(running bool)
 
-	// 重启控制
 	restartCount   int
 	lastRestartAt  time.Time
 	autoRestart    bool
 	restartEnabled atomic.Bool
 
-	// 日志
 	logLevel  int
 	logPrefix string
 
-	// 同步
 	mu       sync.RWMutex
 	wg       sync.WaitGroup
 	doneChan chan struct{}
 }
 
-// RunnerConfig 运行器配置
 type RunnerConfig struct {
 	BinaryPath  string
 	Mode        TunnelMode
 	LocalAddr   string
 	LocalPort   int
-	Protocol    string // http, https, tcp
+	Protocol    string
 	CFToken     string
 	CFTunnelID  string
 	PrivManager *PrivilegeManager
 	AutoRestart bool
 	LogLevel    int
 
-	// 回调
 	OnURLReady    func(url string)
 	OnError       func(err error)
 	OnStateChange func(running bool)
 }
 
-// NewCloudflaredRunner 创建新的 cloudflared 运行器
 func NewCloudflaredRunner(cfg *RunnerConfig) (*CloudflaredRunner, error) {
 	if cfg.BinaryPath == "" {
 		return nil, fmt.Errorf("binaryPath 不能为空")
@@ -171,7 +150,6 @@ func NewCloudflaredRunner(cfg *RunnerConfig) (*CloudflaredRunner, error) {
 	return runner, nil
 }
 
-// Start 启动 cloudflared 进程
 func (r *CloudflaredRunner) Start(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -180,14 +158,16 @@ func (r *CloudflaredRunner) Start(ctx context.Context) error {
 		return fmt.Errorf("cloudflared 已在运行中")
 	}
 
-	// 创建可取消的上下文
+	// 修复：确保二进制文件有执行权限
+	if err := os.Chmod(r.binaryPath, 0755); err != nil {
+		r.log(1, "设置执行权限失败: %v (继续尝试启动)", err)
+	}
+
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancelFunc = cancel
 
-	// 重置状态
 	r.doneChan = make(chan struct{})
 
-	// 根据模式启动
 	var err error
 	switch r.mode {
 	case ModeTempTunnel:
@@ -208,25 +188,20 @@ func (r *CloudflaredRunner) Start(ctx context.Context) error {
 	r.running.Store(true)
 	r.notifyStateChange(true)
 
-	// 启动输出监控
 	r.wg.Add(1)
 	go r.monitorOutput(runCtx)
 
-	// 启动进程监控
 	r.wg.Add(1)
 	go r.monitorProcess(runCtx)
 
 	return nil
 }
 
-// startTempTunnel 启动临时隧道
 func (r *CloudflaredRunner) startTempTunnel(ctx context.Context) error {
-	// 构建本地 URL
 	localURL := fmt.Sprintf("%s://%s:%d", r.protocol, r.localAddr, r.localPort)
 
 	r.log(1, "启动临时隧道: %s -> cloudflare", localURL)
 
-	// 构建命令参数
 	args := []string{
 		"tunnel",
 		"--url", localURL,
@@ -236,18 +211,15 @@ func (r *CloudflaredRunner) startTempTunnel(ctx context.Context) error {
 	return r.startProcess(ctx, args)
 }
 
-// startFixedTunnel 启动固定隧道
 func (r *CloudflaredRunner) startFixedTunnel(ctx context.Context) error {
 	r.log(1, "启动固定隧道: tunnel_id=%s", r.cfTunnelID)
 
-	// 构建命令参数
 	args := []string{
 		"tunnel",
 		"run",
 		"--token", r.cfToken,
 	}
 
-	// 如果指定了 tunnel ID，添加到参数
 	if r.cfTunnelID != "" {
 		args = append(args, r.cfTunnelID)
 	}
@@ -255,7 +227,6 @@ func (r *CloudflaredRunner) startFixedTunnel(ctx context.Context) error {
 	return r.startProcess(ctx, args)
 }
 
-// startDirectTCP 启动直接 TCP 模式
 func (r *CloudflaredRunner) startDirectTCP(ctx context.Context) error {
 	localAddr := fmt.Sprintf("%s:%d", r.localAddr, r.localPort)
 
@@ -270,19 +241,15 @@ func (r *CloudflaredRunner) startDirectTCP(ctx context.Context) error {
 	return r.startProcess(ctx, args)
 }
 
-// startProcess 启动进程
 func (r *CloudflaredRunner) startProcess(ctx context.Context, args []string) error {
 	cmd := exec.CommandContext(ctx, r.binaryPath, args...)
 
-	// 配置权限降级
 	if r.privManager != nil && r.privManager.IsEnabled() {
 		if err := r.privManager.ConfigureCommand(cmd); err != nil {
 			r.log(0, "配置权限降级失败: %v", err)
-			// 继续执行，不中断
 		}
 	}
 
-	// 获取 stdout 和 stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("获取 stdout 失败: %w", err)
@@ -296,13 +263,16 @@ func (r *CloudflaredRunner) startProcess(ctx context.Context, args []string) err
 	}
 	r.stderr = stderr
 
-	// 设置环境变量（禁用自动更新检查）
 	cmd.Env = append(os.Environ(),
 		"TUNNEL_METRICS=",
 		"NO_AUTOUPDATE=true",
 	)
 
-	// 启动进程
+	// 修复：设置进程组，便于完整清理子进程
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+
 	if err := cmd.Start(); err != nil {
 		stdout.Close()
 		stderr.Close()
@@ -315,26 +285,19 @@ func (r *CloudflaredRunner) startProcess(ctx context.Context, args []string) err
 	return nil
 }
 
-// monitorOutput 监控进程输出
 func (r *CloudflaredRunner) monitorOutput(ctx context.Context) {
 	defer r.wg.Done()
 
-	// URL 匹配正则表达式
-	// 匹配格式如: https://xxx-xxx-xxx.trycloudflare.com
 	urlRegex := regexp.MustCompile(`https://[a-zA-Z0-9-]+\.trycloudflare\.com`)
-	// 备用匹配：任何 trycloudflare.com 域名
 	altRegex := regexp.MustCompile(`([a-zA-Z0-9-]+\.trycloudflare\.com)`)
 
 	urlFound := make(chan string, 1)
 	var urlOnce sync.Once
 
-	// 处理单行输出
 	processLine := func(line string, source string) {
 		r.log(2, "[%s] %s", source, line)
 
-		// 只在临时隧道模式下解析 URL
 		if r.mode == ModeTempTunnel {
-			// 尝试匹配完整 URL
 			if match := urlRegex.FindString(line); match != "" {
 				urlOnce.Do(func() {
 					urlFound <- match
@@ -342,7 +305,6 @@ func (r *CloudflaredRunner) monitorOutput(ctx context.Context) {
 				return
 			}
 
-			// 备用匹配
 			if strings.Contains(line, "trycloudflare.com") {
 				if matches := altRegex.FindStringSubmatch(line); len(matches) > 1 {
 					url := "https://" + matches[1]
@@ -353,20 +315,18 @@ func (r *CloudflaredRunner) monitorOutput(ctx context.Context) {
 			}
 		}
 
-		// 检测错误信息
 		if strings.Contains(strings.ToLower(line), "error") ||
 			strings.Contains(strings.ToLower(line), "failed") {
 			r.notifyError(fmt.Errorf("cloudflared: %s", line))
 		}
 	}
 
-	// 启动 stdout 读取
 	go func() {
 		if r.stdout == nil {
 			return
 		}
 		scanner := bufio.NewScanner(r.stdout)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 增大缓冲区
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			select {
 			case <-ctx.Done():
@@ -377,7 +337,6 @@ func (r *CloudflaredRunner) monitorOutput(ctx context.Context) {
 		}
 	}()
 
-	// 启动 stderr 读取
 	go func() {
 		if r.stderr == nil {
 			return
@@ -394,7 +353,6 @@ func (r *CloudflaredRunner) monitorOutput(ctx context.Context) {
 		}
 	}()
 
-	// 等待 URL（仅临时隧道模式）
 	if r.mode == ModeTempTunnel {
 		select {
 		case url := <-urlFound:
@@ -412,11 +370,9 @@ func (r *CloudflaredRunner) monitorOutput(ctx context.Context) {
 		}
 	}
 
-	// 继续等待上下文取消
 	<-ctx.Done()
 }
 
-// monitorProcess 监控进程状态
 func (r *CloudflaredRunner) monitorProcess(ctx context.Context) {
 	defer r.wg.Done()
 	defer close(r.doneChan)
@@ -425,7 +381,6 @@ func (r *CloudflaredRunner) monitorProcess(ctx context.Context) {
 		return
 	}
 
-	// 等待进程退出
 	err := r.cmd.Wait()
 
 	r.running.Store(false)
@@ -437,10 +392,8 @@ func (r *CloudflaredRunner) monitorProcess(ctx context.Context) {
 		r.log(1, "cloudflared 进程正常退出")
 	}
 
-	// 检查是否需要重启
 	select {
 	case <-ctx.Done():
-		// 上下文已取消，不重启
 		return
 	default:
 		if r.restartEnabled.Load() {
@@ -449,17 +402,14 @@ func (r *CloudflaredRunner) monitorProcess(ctx context.Context) {
 	}
 }
 
-// handleRestart 处理进程重启
 func (r *CloudflaredRunner) handleRestart(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 检查是否应该重置重启计数器
 	if time.Since(r.lastRestartAt) > RestartCounterResetTime {
 		r.restartCount = 0
 	}
 
-	// 检查重启次数
 	if r.restartCount >= MaxRestartAttempts {
 		r.log(0, "达到最大重启次数 (%d)，停止重启", MaxRestartAttempts)
 		r.notifyError(fmt.Errorf("cloudflared 多次重启失败"))
@@ -472,28 +422,26 @@ func (r *CloudflaredRunner) handleRestart(ctx context.Context) {
 	r.log(1, "准备重启 cloudflared (%d/%d)，延迟 %v",
 		r.restartCount, MaxRestartAttempts, RestartDelay)
 
-	// 延迟重启
 	select {
 	case <-time.After(RestartDelay):
 	case <-ctx.Done():
 		return
 	}
 
-	// 重新启动
-	r.mu.Unlock() // 释放锁以避免死锁
+	r.mu.Unlock()
 	if err := r.Start(ctx); err != nil {
 		r.log(0, "重启失败: %v", err)
 		r.notifyError(err)
 	}
-	r.mu.Lock() // 重新获取锁
+	r.mu.Lock()
 }
 
 // Stop 停止 cloudflared 进程
+// 修复：使用进程组确保完整清理子进程
 func (r *CloudflaredRunner) Stop() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 禁用自动重启
 	r.restartEnabled.Store(false)
 
 	if !r.running.Load() {
@@ -502,20 +450,22 @@ func (r *CloudflaredRunner) Stop() error {
 
 	r.log(1, "正在停止 cloudflared...")
 
-	// 取消上下文
 	if r.cancelFunc != nil {
 		r.cancelFunc()
 	}
 
-	// 发送 SIGTERM
+	// 修复：通过进程组发送信号，确保子进程也被终止
 	if r.cmd != nil && r.cmd.Process != nil {
-		if err := r.cmd.Process.Signal(os.Interrupt); err != nil {
-			r.log(2, "发送 SIGTERM 失败: %v，尝试 SIGKILL", err)
-			r.cmd.Process.Kill()
+		pid := r.cmd.Process.Pid
+		
+		// 先尝试优雅终止（SIGTERM 到进程组）
+		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
+			r.log(2, "发送 SIGTERM 到进程组失败: %v", err)
+			// 回退到单进程
+			r.cmd.Process.Signal(syscall.SIGTERM)
 		}
 	}
 
-	// 等待进程退出（带超时）
 	done := make(chan struct{})
 	go func() {
 		r.wg.Wait()
@@ -525,14 +475,16 @@ func (r *CloudflaredRunner) Stop() error {
 	select {
 	case <-done:
 		r.log(1, "cloudflared 已停止")
-	case <-time.After(10 * time.Second):
+	case <-time.After(GracefulStopTimeout):
 		r.log(0, "等待进程退出超时，强制终止")
 		if r.cmd != nil && r.cmd.Process != nil {
+			pid := r.cmd.Process.Pid
+			// 强制终止进程组
+			syscall.Kill(-pid, syscall.SIGKILL)
 			r.cmd.Process.Kill()
 		}
 	}
 
-	// 关闭管道
 	if r.stdout != nil {
 		r.stdout.Close()
 	}
@@ -547,12 +499,10 @@ func (r *CloudflaredRunner) Stop() error {
 	return nil
 }
 
-// IsRunning 检查是否运行中
 func (r *CloudflaredRunner) IsRunning() bool {
 	return r.running.Load()
 }
 
-// GetTunnelURL 获取隧道 URL
 func (r *CloudflaredRunner) GetTunnelURL() string {
 	if v := r.tunnelURL.Load(); v != nil {
 		return v.(string)
@@ -560,7 +510,6 @@ func (r *CloudflaredRunner) GetTunnelURL() string {
 	return ""
 }
 
-// GetDomain 获取域名
 func (r *CloudflaredRunner) GetDomain() string {
 	if v := r.domain.Load(); v != nil {
 		return v.(string)
@@ -568,7 +517,6 @@ func (r *CloudflaredRunner) GetDomain() string {
 	return ""
 }
 
-// GetPID 获取进程 PID
 func (r *CloudflaredRunner) GetPID() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -579,7 +527,6 @@ func (r *CloudflaredRunner) GetPID() int {
 	return 0
 }
 
-// WaitForURL 等待 URL 就绪
 func (r *CloudflaredRunner) WaitForURL(timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 
@@ -599,7 +546,6 @@ func (r *CloudflaredRunner) WaitForURL(timeout time.Duration) (string, error) {
 	return "", fmt.Errorf("等待 URL 超时")
 }
 
-// SetAutoRestart 设置自动重启
 func (r *CloudflaredRunner) SetAutoRestart(enabled bool) {
 	r.restartEnabled.Store(enabled)
 }
@@ -646,18 +592,14 @@ func (r *CloudflaredRunner) log(level int, format string, args ...interface{}) {
 // 辅助函数
 // =============================================================================
 
-// extractDomain 从 URL 中提取域名
 func extractDomain(url string) string {
-	// 移除协议前缀
 	url = strings.TrimPrefix(url, "https://")
 	url = strings.TrimPrefix(url, "http://")
 
-	// 移除路径
 	if idx := strings.Index(url, "/"); idx != -1 {
 		url = url[:idx]
 	}
 
-	// 移除端口
 	if idx := strings.Index(url, ":"); idx != -1 {
 		url = url[:idx]
 	}
@@ -669,7 +611,6 @@ func extractDomain(url string) string {
 // RunnerStatus 运行器状态
 // =============================================================================
 
-// RunnerStatus 运行器状态信息
 type RunnerStatus struct {
 	Running      bool          `json:"running"`
 	Mode         TunnelMode    `json:"mode"`
@@ -680,7 +621,6 @@ type RunnerStatus struct {
 	Uptime       time.Duration `json:"uptime,omitempty"`
 }
 
-// GetStatus 获取运行器状态
 func (r *CloudflaredRunner) GetStatus() RunnerStatus {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
