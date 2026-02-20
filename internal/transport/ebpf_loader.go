@@ -862,8 +862,7 @@ func (l *EBPFLoader) ConfigureGlobal(listenPort uint16) error {
 }
 
 // GetStats 获取统计信息
-// 核心修复：Per-CPU Map 必须传入 *[]EBPFStats（切片指针），不能传 *EBPFStats
-// 然后汇总所有 CPU 核心的数据
+// 修复：正确处理 Per-CPU Map，必须传入切片指针并汇总所有 CPU 核心数据
 func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -879,6 +878,7 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 	var statsPerCPU []EBPFStats
 	err := l.statsMap.Lookup(&key, &statsPerCPU)
 	if err == nil && len(statsPerCPU) > 0 {
+		// 汇总所有 CPU 核心的统计数据
 		final := &EBPFStats{}
 		for _, s := range statsPerCPU {
 			final.PacketsRX += s.PacketsRX
@@ -887,6 +887,9 @@ func (l *EBPFLoader) GetStats() (*EBPFStats, error) {
 			final.BytesTX += s.BytesTX
 			final.PacketsDropped += s.PacketsDropped
 			final.SessionsCreated += s.SessionsCreated
+			final.SessionsDestroyed += s.SessionsDestroyed
+			final.AuthFailures += s.AuthFailures
+			final.ReplayBlocked += s.ReplayBlocked
 		}
 		return final, nil
 	}
