@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/crypto/crypto.go
 // =============================================================================
@@ -36,13 +34,18 @@ type Crypto struct {
 	userID     [UserIDSize]byte
 	timeWindow int
 
-	aeadCache sync.Map // window -> cipher.AEAD
+	aeadCache sync.Map // window -> cachedAEAD
 
-	// 使用高性能防重放保护
 	recvGuard *ReplayGuard
 	sendGuard *ReplayGuard
 
 	mu sync.RWMutex
+}
+
+// cachedAEAD 带时间戳的缓存 AEAD
+type cachedAEAD struct {
+	aead      cipher.AEAD
+	createdAt time.Time
 }
 
 // New 创建加密器
@@ -94,7 +97,6 @@ func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
 			return nil, err
 		}
 
-		// 使用 CheckOnly 先验证，成功后再 Mark
 		if c.sendGuard.CheckOnly(nonce) {
 			c.sendGuard.Mark(nonce)
 			break
@@ -140,7 +142,7 @@ func (c *Crypto) Decrypt(data []byte) ([]byte, error) {
 
 	nonce := data[HeaderSize : HeaderSize+NonceSize]
 
-	// 重放检查：CheckOnly 不会标记，只有解密成功才标记
+	// 重放检查
 	if !c.recvGuard.CheckOnly(nonce) {
 		return nil, fmt.Errorf("重放攻击")
 	}
@@ -148,14 +150,15 @@ func (c *Crypto) Decrypt(data []byte) ([]byte, error) {
 	ciphertext := data[HeaderSize+NonceSize:]
 	header := data[:HeaderSize]
 
-	// 尝试多个时间窗口
-	for _, window := range c.validWindows() {
+	// 修复：尝试多个时间窗口，提供更好的容错性
+	windows := c.validWindows()
+	for _, window := range windows {
 		aead, err := c.getAEAD(window)
 		if err != nil {
 			continue
 		}
 		if plaintext, err := aead.Open(nil, nonce, ciphertext, header); err == nil {
-			// 解密成功后才标记 nonce
+			// 解密成功后标记 nonce
 			c.recvGuard.Mark(nonce)
 			return plaintext, nil
 		}
@@ -178,14 +181,19 @@ func (c *Crypto) currentWindow() int64 {
 	return time.Now().Unix() / int64(c.timeWindow)
 }
 
+// validWindows 返回有效的时间窗口列表
+// 修复：确保在窗口切换瞬间有足够的容错性
 func (c *Crypto) validWindows() []int64 {
 	w := c.currentWindow()
-	return []int64{w - 1, w, w + 1}
+	// 返回当前窗口、前一个窗口和后一个窗口
+	// 顺序：当前 -> 前一个 -> 后一个（按概率排序）
+	return []int64{w, w - 1, w + 1}
 }
 
 func (c *Crypto) getAEAD(window int64) (cipher.AEAD, error) {
 	if v, ok := c.aeadCache.Load(window); ok {
-		return v.(cipher.AEAD), nil
+		cached := v.(*cachedAEAD)
+		return cached.aead, nil
 	}
 
 	salt := make([]byte, 8)
@@ -200,7 +208,13 @@ func (c *Crypto) getAEAD(window int64) (cipher.AEAD, error) {
 	if err != nil {
 		return nil, fmt.Errorf("创建 AEAD 失败: %w", err)
 	}
-	c.aeadCache.Store(window, aead)
+
+	cached := &cachedAEAD{
+		aead:      aead,
+		createdAt: time.Now(),
+	}
+	c.aeadCache.Store(window, cached)
+
 	return aead, nil
 }
 
@@ -208,6 +222,7 @@ func (c *Crypto) validateTimestamp(ts uint16) bool {
 	current := uint16(time.Now().Unix() & 0xFFFF)
 	diff := int(current) - int(ts)
 
+	// 处理时间戳回绕
 	if diff < -32768 {
 		diff += 65536
 	} else if diff > 32768 {
@@ -217,17 +232,32 @@ func (c *Crypto) validateTimestamp(ts uint16) bool {
 		diff = -diff
 	}
 
-	return diff <= c.timeWindow*2
+	// 修复：增加容错范围，允许 timeWindow * 3 的偏差
+	// 这可以更好地处理网络延迟和时钟偏差
+	return diff <= c.timeWindow*3
 }
 
+// cleanupAEADLoop 定期清理过期的 AEAD 缓存
+// 修复：保留更长时间的缓存，提供窗口切换时的过渡期
 func (c *Crypto) cleanupAEADLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		cw := c.currentWindow()
+		now := time.Now()
+
 		c.aeadCache.Range(func(key, value interface{}) bool {
-			if w, ok := key.(int64); ok && cw-w > 2 {
+			w := key.(int64)
+			cached := value.(*cachedAEAD)
+
+			// 保留条件：
+			// 1. 窗口在有效范围内 (当前 ± 2)
+			// 2. 或者缓存时间不超过 2 分钟（提供额外的过渡期）
+			windowValid := cw-w <= 2 && w-cw <= 2
+			timeValid := now.Sub(cached.createdAt) < 2*time.Minute
+
+			if !windowValid && !timeValid {
 				c.aeadCache.Delete(key)
 			}
 			return true
@@ -243,9 +273,3 @@ func GeneratePSK() (string, error) {
 	}
 	return base64.StdEncoding.EncodeToString(psk), nil
 }
-
-
-
-
-
-
