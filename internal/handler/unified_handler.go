@@ -49,8 +49,24 @@ const (
 // 类型定义
 // =============================================================================
 
+// Sender UDP 发送函数类型
 type Sender func(data []byte, addr *net.UDPAddr) error
 
+// ResponseChannel 响应通道 - 用于同步返回响应
+type ResponseChannel struct {
+	Data chan []byte
+	Done chan struct{}
+}
+
+// NewResponseChannel 创建响应通道
+func NewResponseChannel() *ResponseChannel {
+	return &ResponseChannel{
+		Data: make(chan []byte, 16), // 缓冲多个响应
+		Done: make(chan struct{}),
+	}
+}
+
+// UnifiedHandler 统一处理器
 type UnifiedHandler struct {
 	crypto  *crypto.Crypto
 	cfg     *config.Config
@@ -58,10 +74,14 @@ type UnifiedHandler struct {
 
 	logLevel int
 
-	connections sync.Map
-	sessions    sync.Map
+	connections sync.Map // reqID -> *ProxyConnection
+	sessions    sync.Map // addr string -> *ClientSession
 
+	// UDP 发送器（用于纯 UDP 模式）
 	sender Sender
+
+	// WebSocket 响应通道映射（用于 WS 模式）
+	wsChannels sync.Map // addr string -> *ResponseChannel
 
 	stats handlerStats
 
@@ -69,6 +89,7 @@ type UnifiedHandler struct {
 	cancel context.CancelFunc
 }
 
+// ProxyConnection 代理连接
 type ProxyConnection struct {
 	ID         uint32
 	Target     net.Conn
@@ -81,8 +102,12 @@ type ProxyConnection struct {
 	BytesRecv  uint64
 	closed     int32
 	mu         sync.Mutex
+
+	// 响应通道（用于 WebSocket 模式）
+	respChan *ResponseChannel
 }
 
+// ClientSession 客户端会话
 type ClientSession struct {
 	Addr       *net.UDPAddr
 	LastActive time.Time
@@ -90,21 +115,22 @@ type ClientSession struct {
 	mu         sync.Mutex
 }
 
-// 修复：添加实际统计字段
+// handlerStats 统计信息
 type handlerStats struct {
 	totalConns     uint64
 	activeConns    int64
 	totalBytes     uint64
-	authFailures   uint64 // 认证失败次数
-	replayBlocked  uint64 // 重放攻击拦截次数
-	decryptErrors  uint64 // 解密错误次数
-	heartbeatsRecv uint64 // 收到的心跳数
+	authFailures   uint64
+	replayBlocked  uint64
+	decryptErrors  uint64
+	heartbeatsRecv uint64
 }
 
 // =============================================================================
 // 构造函数
 // =============================================================================
 
+// NewUnifiedHandler 创建统一处理器
 func NewUnifiedHandler(c *crypto.Crypto, cfg *config.Config) *UnifiedHandler {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -136,14 +162,17 @@ func parseLogLevel(level string) int {
 // 公共接口
 // =============================================================================
 
+// SetMetrics 设置指标收集器
 func (h *UnifiedHandler) SetMetrics(m *metrics.PhantomMetrics) {
 	h.metrics = m
 }
 
+// SetSender 设置 UDP 发送器
 func (h *UnifiedHandler) SetSender(fn Sender) {
 	h.sender = fn
 }
 
+// Close 关闭处理器
 func (h *UnifiedHandler) Close() error {
 	h.cancel()
 
@@ -158,7 +187,6 @@ func (h *UnifiedHandler) Close() error {
 }
 
 // GetStats 获取统计信息
-// 修复：返回实际的统计数据
 func (h *UnifiedHandler) GetStats() map[string]interface{} {
 	return map[string]interface{}{
 		"total_conns":     atomic.LoadUint64(&h.stats.totalConns),
@@ -171,6 +199,7 @@ func (h *UnifiedHandler) GetStats() map[string]interface{} {
 	}
 }
 
+// GetActiveConns 获取活跃连接数
 func (h *UnifiedHandler) GetActiveConns() int64 {
 	return atomic.LoadInt64(&h.stats.activeConns)
 }
@@ -186,53 +215,49 @@ func (h *UnifiedHandler) GetReplayBlocked() uint64 {
 }
 
 // =============================================================================
-// UDP 数据包处理
+// UDP 数据包处理（纯 UDP 模式）
 // =============================================================================
 
+// HandlePacket 处理 UDP 数据包（异步模式，响应通过 sender 发送）
 func (h *UnifiedHandler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
-	// 1. 解密数据
+	// 解密数据
 	plaintext, err := h.crypto.Decrypt(data)
 	if err != nil {
-		// 修复：记录解密失败统计
 		atomic.AddUint64(&h.stats.decryptErrors, 1)
-		
-		// 区分不同的错误类型
 		errStr := err.Error()
 		if contains(errStr, "UserID") {
 			atomic.AddUint64(&h.stats.authFailures, 1)
 		} else if contains(errStr, "重放") || contains(errStr, "replay") {
 			atomic.AddUint64(&h.stats.replayBlocked, 1)
 		}
-		
 		h.log(LogLevelDebug, "解密失败: %v", err)
 		return nil
 	}
 
-	// 2. 解析协议请求
+	// 解析协议请求
 	req, err := protocol.ParseRequest(plaintext)
 	if err != nil {
 		h.log(LogLevelDebug, "解析请求失败: %v", err)
 		return nil
 	}
 
-	// 3. 更新会话信息
+	// 更新会话信息
 	h.updateSession(from, req.ReqID)
 
-	// 4. 根据请求类型分发处理
+	// 根据请求类型分发处理（使用 sender 异步发送响应）
 	switch req.Type {
 	case protocol.TypeConnect:
-		h.handleUDPConnect(req, from)
+		h.handleUDPConnect(req, from, nil)
 
 	case protocol.TypeData:
-		h.handleUDPData(req, from)
+		h.handleUDPData(req, from, nil)
 
 	case protocol.TypeClose:
 		h.handleUDPClose(req)
 
 	case protocol.TypeHeartbeat:
-		// 修复：正确处理心跳包并记录统计
 		atomic.AddUint64(&h.stats.heartbeatsRecv, 1)
-		h.handleUDPHeartbeat(req, from)
+		h.handleUDPHeartbeat(req, from, nil)
 
 	default:
 		h.log(LogLevelDebug, "未知请求类型: 0x%02X", req.Type)
@@ -241,39 +266,95 @@ func (h *UnifiedHandler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
 	return nil
 }
 
+// =============================================================================
+// WebSocket 数据包处理（同步模式）
+// =============================================================================
+
+// HandlePacketWithChannel 处理数据包，响应通过 channel 返回
+// 这是 WebSocket 模式的入口点
+func (h *UnifiedHandler) HandlePacketWithChannel(data []byte, from *net.UDPAddr, respChan *ResponseChannel) {
+	// 解密数据
+	plaintext, err := h.crypto.Decrypt(data)
+	if err != nil {
+		atomic.AddUint64(&h.stats.decryptErrors, 1)
+		errStr := err.Error()
+		if contains(errStr, "UserID") {
+			atomic.AddUint64(&h.stats.authFailures, 1)
+		} else if contains(errStr, "重放") || contains(errStr, "replay") {
+			atomic.AddUint64(&h.stats.replayBlocked, 1)
+		}
+		h.log(LogLevelDebug, "解密失败: %v", err)
+		return
+	}
+
+	// 解析协议请求
+	req, err := protocol.ParseRequest(plaintext)
+	if err != nil {
+		h.log(LogLevelDebug, "解析请求失败: %v", err)
+		return
+	}
+
+	// 更新会话信息
+	h.updateSession(from, req.ReqID)
+
+	// 注册响应通道
+	h.wsChannels.Store(from.String(), respChan)
+
+	// 根据请求类型分发处理
+	switch req.Type {
+	case protocol.TypeConnect:
+		h.handleUDPConnect(req, from, respChan)
+
+	case protocol.TypeData:
+		h.handleUDPData(req, from, respChan)
+
+	case protocol.TypeClose:
+		h.handleUDPClose(req)
+
+	case protocol.TypeHeartbeat:
+		atomic.AddUint64(&h.stats.heartbeatsRecv, 1)
+		h.handleUDPHeartbeat(req, from, respChan)
+
+	default:
+		h.log(LogLevelDebug, "未知请求类型: 0x%02X", req.Type)
+	}
+}
+
 // handleUDPHeartbeat 处理心跳包
-func (h *UnifiedHandler) handleUDPHeartbeat(req *protocol.Request, from *net.UDPAddr) {
+func (h *UnifiedHandler) handleUDPHeartbeat(req *protocol.Request, from *net.UDPAddr, respChan *ResponseChannel) {
 	h.log(LogLevelDebug, "收到心跳: ID:%d from %s", req.ReqID, from.String())
-	
-	// 发送心跳响应
+
+	// 构建心跳响应
 	resp := protocol.BuildHeartbeatResponse(req.ReqID)
 	encrypted, err := h.crypto.Encrypt(resp)
 	if err != nil {
 		h.log(LogLevelError, "加密心跳响应失败: %v", err)
 		return
 	}
-	
-	if h.sender != nil {
-		h.sender(encrypted, from)
-	}
+
+	// 发送响应
+	h.sendResponse(encrypted, from, respChan)
 }
 
-func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAddr) {
+// handleUDPConnect 处理连接请求
+func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAddr, respChan *ResponseChannel) {
 	network := req.NetworkString()
 	target := req.TargetAddr()
 
-	h.log(LogLevelInfo, "UDP Connect: %s %s (ID:%d) from %s",
+	h.log(LogLevelInfo, "Connect: %s %s (ID:%d) from %s",
 		network, target, req.ReqID, from.String())
 
+	// 连接目标
 	targetConn, err := net.DialTimeout(network, target, connectTimeout)
 	if err != nil {
 		h.log(LogLevelDebug, "连接目标失败: %s - %v", target, err)
-		h.sendUDPResponse(req.ReqID, StatusError, nil, from)
+		h.sendStatusResponse(req.ReqID, StatusError, nil, from, respChan)
 		return
 	}
 
 	h.configureTCPConnection(targetConn)
 
+	// 创建代理连接
 	conn := &ProxyConnection{
 		ID:         req.ReqID,
 		Target:     targetConn,
@@ -282,6 +363,7 @@ func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAd
 		TargetAddr: target,
 		CreatedAt:  time.Now(),
 		LastActive: time.Now(),
+		respChan:   respChan,
 	}
 
 	h.connections.Store(req.ReqID, conn)
@@ -292,18 +374,22 @@ func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAd
 		h.metrics.IncConnections()
 	}
 
+	// 发送初始数据
 	if len(req.Data) > 0 {
 		if err := h.writeToTarget(conn, req.Data); err != nil {
 			h.log(LogLevelDebug, "发送初始数据失败: %v", err)
 		}
 	}
 
-	h.sendUDPResponse(req.ReqID, StatusOK, nil, from)
+	// 发送成功响应
+	h.sendStatusResponse(req.ReqID, StatusOK, nil, from, respChan)
 
-	go h.udpReadLoop(conn)
+	// 启动读取循环
+	go h.proxyReadLoop(conn)
 }
 
-func (h *UnifiedHandler) handleUDPData(req *protocol.Request, from *net.UDPAddr) {
+// handleUDPData 处理数据请求
+func (h *UnifiedHandler) handleUDPData(req *protocol.Request, from *net.UDPAddr, respChan *ResponseChannel) {
 	conn := h.getConnection(req.ReqID)
 	if conn == nil {
 		h.log(LogLevelDebug, "连接不存在: ID:%d", req.ReqID)
@@ -313,6 +399,10 @@ func (h *UnifiedHandler) handleUDPData(req *protocol.Request, from *net.UDPAddr)
 	conn.mu.Lock()
 	conn.LastActive = time.Now()
 	conn.ClientAddr = from
+	// 更新响应通道（可能客户端重连了）
+	if respChan != nil {
+		conn.respChan = respChan
+	}
 	conn.mu.Unlock()
 
 	if len(req.Data) > 0 {
@@ -323,12 +413,14 @@ func (h *UnifiedHandler) handleUDPData(req *protocol.Request, from *net.UDPAddr)
 	}
 }
 
+// handleUDPClose 处理关闭请求
 func (h *UnifiedHandler) handleUDPClose(req *protocol.Request) {
-	h.log(LogLevelInfo, "UDP Close: ID:%d", req.ReqID)
+	h.log(LogLevelInfo, "Close: ID:%d", req.ReqID)
 	h.closeConnection(req.ReqID)
 }
 
-func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
+// proxyReadLoop 从目标读取数据并发送给客户端
+func (h *UnifiedHandler) proxyReadLoop(conn *ProxyConnection) {
 	defer h.closeConnection(conn.ID)
 
 	buf := make([]byte, readBufferSize)
@@ -351,6 +443,7 @@ func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 		conn.mu.Lock()
 		conn.LastActive = time.Now()
 		clientAddr := conn.ClientAddr
+		respChan := conn.respChan
 		conn.mu.Unlock()
 
 		atomic.AddUint64(&conn.BytesRecv, uint64(n))
@@ -360,16 +453,25 @@ func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 			h.metrics.AddBytesReceived(int64(n))
 		}
 
-		h.sendUDPResponse(conn.ID, protocol.TypeData, buf[:n], clientAddr)
+		// 构建响应
+		resp := protocol.BuildResponse(conn.ID, protocol.TypeData, buf[:n])
+		encrypted, err := h.crypto.Encrypt(resp)
+		if err != nil {
+			h.log(LogLevelError, "加密响应失败: %v", err)
+			continue
+		}
+
+		// 发送响应
+		h.sendResponse(encrypted, clientAddr, respChan)
 	}
 }
 
-func (h *UnifiedHandler) sendUDPResponse(reqID uint32, status byte, data []byte, to *net.UDPAddr) {
-	if h.sender == nil {
-		h.log(LogLevelError, "Sender 未设置，无法发送响应")
-		return
-	}
+// =============================================================================
+// 响应发送
+// =============================================================================
 
+// sendStatusResponse 发送状态响应
+func (h *UnifiedHandler) sendStatusResponse(reqID uint32, status byte, data []byte, to *net.UDPAddr, respChan *ResponseChannel) {
 	resp := protocol.BuildResponse(reqID, status, data)
 
 	encrypted, err := h.crypto.Encrypt(resp)
@@ -378,17 +480,70 @@ func (h *UnifiedHandler) sendUDPResponse(reqID uint32, status byte, data []byte,
 		return
 	}
 
-	if err := h.sender(encrypted, to); err != nil {
-		h.log(LogLevelDebug, "发送响应失败: %v", err)
-	} else if h.metrics != nil {
-		h.metrics.AddBytesSent(int64(len(encrypted)))
+	h.sendResponse(encrypted, to, respChan)
+}
+
+// sendResponse 统一响应发送（自动选择通道）
+func (h *UnifiedHandler) sendResponse(data []byte, to *net.UDPAddr, respChan *ResponseChannel) {
+	// 优先使用响应通道（WebSocket 模式）
+	if respChan != nil {
+		select {
+		case respChan.Data <- data:
+			// 发送成功
+			if h.metrics != nil {
+				h.metrics.AddBytesSent(int64(len(data)))
+			}
+		case <-respChan.Done:
+			// 通道已关闭
+			h.log(LogLevelDebug, "响应通道已关闭")
+		default:
+			// 通道满了，尝试从 wsChannels 获取
+			h.sendViaWSChannel(data, to)
+		}
+		return
 	}
+
+	// 尝试从 wsChannels 获取（可能连接还在但 respChan 为空）
+	if h.sendViaWSChannel(data, to) {
+		return
+	}
+
+	// 最后使用 UDP sender
+	if h.sender != nil {
+		if err := h.sender(data, to); err != nil {
+			h.log(LogLevelDebug, "发送响应失败: %v", err)
+		} else if h.metrics != nil {
+			h.metrics.AddBytesSent(int64(len(data)))
+		}
+	} else {
+		h.log(LogLevelError, "无可用发送通道")
+	}
+}
+
+// sendViaWSChannel 通过 WebSocket 通道发送
+func (h *UnifiedHandler) sendViaWSChannel(data []byte, to *net.UDPAddr) bool {
+	if v, ok := h.wsChannels.Load(to.String()); ok {
+		respChan := v.(*ResponseChannel)
+		select {
+		case respChan.Data <- data:
+			if h.metrics != nil {
+				h.metrics.AddBytesSent(int64(len(data)))
+			}
+			return true
+		case <-respChan.Done:
+			h.wsChannels.Delete(to.String())
+		default:
+			h.log(LogLevelDebug, "WebSocket 响应通道满")
+		}
+	}
+	return false
 }
 
 // =============================================================================
 // TCP 连接处理
 // =============================================================================
 
+// HandleConnection 处理 TCP 连接
 func (h *UnifiedHandler) HandleConnection(ctx context.Context, clientConn net.Conn) {
 	atomic.AddInt64(&h.stats.activeConns, 1)
 	defer atomic.AddInt64(&h.stats.activeConns, -1)
@@ -434,7 +589,6 @@ func (h *UnifiedHandler) tcpMainLoop(
 
 		plaintext, err := h.crypto.Decrypt(encryptedFrame)
 		if err != nil {
-			// 修复：记录解密失败统计
 			atomic.AddUint64(&h.stats.decryptErrors, 1)
 			h.log(LogLevelDebug, "解密失败: %s - %v", clientAddr, err)
 			return
@@ -460,7 +614,6 @@ func (h *UnifiedHandler) tcpMainLoop(
 			return
 
 		case protocol.TypeHeartbeat:
-			// 修复：处理 TCP 心跳
 			atomic.AddUint64(&h.stats.heartbeatsRecv, 1)
 			h.sendTCPResponse(writer, req.ReqID, protocol.TypeHeartbeat, nil)
 
@@ -787,6 +940,17 @@ func (h *UnifiedHandler) cleanup() {
 		if idle > sessionIdleTimeout {
 			h.sessions.Delete(key)
 			cleanedSessions++
+		}
+		return true
+	})
+
+	// 清理无效的 WebSocket 通道
+	h.wsChannels.Range(func(key, value interface{}) bool {
+		respChan := value.(*ResponseChannel)
+		select {
+		case <-respChan.Done:
+			h.wsChannels.Delete(key)
+		default:
 		}
 		return true
 	})
