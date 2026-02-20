@@ -46,7 +46,7 @@ const (
 	DefaultWSPath = "/ws"
 
 	// MinEncryptedPacketLen TSKD 加密包最小长度
-	// 时间戳(8) + HMAC签名(部分) + 至少1字节载荷
+	// UserID(4) + Timestamp(2) + Nonce(12) = 18 字节最小头部
 	MinEncryptedPacketLen = 18
 )
 
@@ -202,7 +202,7 @@ func (a *fakeTCPAdapter) Close() error {
 // ============================================
 
 func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
-	// 关键修复：清除 PSK 中不可见的空白字符（换行符、空格、制表符）
+	// 修复：清除 PSK 中不可见的空白字符（换行符、空格、制表符）
 	// 这是 "UserID 不匹配" 的最常见原因
 	cfg.PSK = strings.TrimSpace(cfg.PSK)
 
@@ -330,7 +330,8 @@ func (h *PhantomClientHandler) receiveLoop() {
 			return
 		}
 
-		// 过滤过短的包（不足以构成有效的 TSKD 加密包）
+		// 修复：过滤过短的包（不足以构成有效的 TSKD 加密包）
+		// 避免 WebSocket 控制帧等噪音进入解密流程
 		if n < MinEncryptedPacketLen {
 			continue
 		}
@@ -338,6 +339,7 @@ func (h *PhantomClientHandler) receiveLoop() {
 		decrypted, err := h.crypto.Decrypt(buf[:n])
 		if err != nil {
 			// 解密失败原因：PSK 不一致 / 时间偏差 > TimeWindow / 数据损坏
+			// 静默丢弃，不打印日志避免刷屏
 			continue
 		}
 
