@@ -1,4 +1,3 @@
-
 // =============================================================================
 // 文件: cmd/phantom-server/main.go
 // 描述: 主程序入口 - 集成 Prometheus 指标、Cloudflare 隧道、DDNS 和 TLS 伪装
@@ -239,7 +238,7 @@ func main() {
 	}
 
 	// 创建智能链路切换器
-	sw := switcher.New(cfg, cry, unifiedHandler)
+	sw := switcher.NewSwitcher(cfg, cry, unifiedHandler)
 
 	if phantomMetrics != nil {
 		sw.SetMetrics(phantomMetrics)
@@ -384,7 +383,6 @@ type handlerStatsAdapter struct {
 	h *handler.UnifiedHandler
 }
 
-
 func (a *handlerStatsAdapter) GetActiveConnections() int64 {
 	return int64(a.h.GetActiveConns())
 }
@@ -460,6 +458,7 @@ func createHealthStatus(cfg *config.Config, sw *switcher.Switcher, h *handler.Un
 
 	stats := sw.GetStats()
 
+	// 使用 TransportState 而不是 State
 	if stats.CurrentState == switcher.StateRunning {
 		status.Components["transport"] = metrics.ComponentHealth{
 			Status:  "healthy",
