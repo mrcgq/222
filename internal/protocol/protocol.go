@@ -1,10 +1,6 @@
-
-
-
 // =============================================================================
 // 文件: internal/protocol/protocol.go
 // =============================================================================
-
 
 package protocol
 
@@ -16,9 +12,10 @@ import (
 
 // 消息类型
 const (
-	TypeConnect = 0x01
-	TypeData    = 0x02
-	TypeClose   = 0x03
+	TypeConnect   = 0x01
+	TypeData      = 0x02
+	TypeClose     = 0x03
+	TypeHeartbeat = 0x04 // 修复：添加心跳类型支持
 )
 
 // 地址类型
@@ -56,7 +53,7 @@ func ParseRequest(data []byte) (*Request, error) {
 		ReqID: binary.BigEndian.Uint32(data[1:5]),
 	}
 
-	// Connect 和 Data 有不同的格式
+	// 根据请求类型分发处理
 	switch req.Type {
 	case TypeConnect:
 		return parseConnect(req, data[5:])
@@ -66,6 +63,8 @@ func ParseRequest(data []byte) (*Request, error) {
 		}
 		return req, nil
 	case TypeClose:
+		return req, nil
+	case TypeHeartbeat: // 修复：正确处理心跳包
 		return req, nil
 	default:
 		return nil, fmt.Errorf("未知类型: %d", req.Type)
@@ -156,15 +155,20 @@ func BuildResponse(reqID uint32, status byte, data []byte) []byte {
 	return resp
 }
 
+// BuildHeartbeatResponse 构建心跳响应
+func BuildHeartbeatResponse(reqID uint32) []byte {
+	resp := make([]byte, 5)
+	resp[0] = TypeHeartbeat
+	binary.BigEndian.PutUint32(resp[1:5], reqID)
+	return resp
+}
+
 // IsARQPacket 检查是否可能是 ARQ 包
-// ARQ 包格式: Seq(4) + Ack(4) + Flags(1) + Len(2) + Payload
-// 协议包格式: Type(1) + ReqID(4) + ...
-// 通过检查第一个字节来区分：ARQ 的 Seq 高位通常不为 0x01-0x03
 func IsARQPacket(data []byte) bool {
 	if len(data) < 18 {
 		return false
 	}
 	firstByte := data[0]
-	return firstByte != TypeConnect && firstByte != TypeData && firstByte != TypeClose
+	return firstByte != TypeConnect && firstByte != TypeData && 
+	       firstByte != TypeClose && firstByte != TypeHeartbeat
 }
-
