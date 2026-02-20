@@ -88,7 +88,7 @@ func NewFakeTCPClient(serverAddr string, cfg *FakeTCPConfig) (*FakeTCPClient, er
 		config:        cfg,
 		serverAddr:    addr,
 		logLevel:      level,
-		natMode:       NATModeAuto, // 默认自动检测
+		natMode:       NATModeAuto,
 		recvChan:      make(chan []byte, 256),
 		maxRetries:    3,
 		retryInterval: 500 * time.Millisecond,
@@ -105,7 +105,6 @@ func NewFakeTCPClientWithTLS(serverAddr string, cfg *FakeTCPConfig, tlsCfg *conf
 	if tlsCfg != nil && tlsCfg.Enabled {
 		client.tlsConfig = tlsCfg
 
-		// 创建 uTLS 客户端
 		utlsConfig := &UTLSConfig{
 			ServerName:         tlsCfg.GetEffectiveSNI(),
 			Fingerprint:        Fingerprint(tlsCfg.Fingerprint),
@@ -137,7 +136,6 @@ func (c *FakeTCPClient) SetNATMode(mode NATTraversalMode) {
 
 // Connect 连接到服务器 (增强版)
 func (c *FakeTCPClient) Connect(ctx context.Context) error {
-	// 步骤 1: 初始化 NAT 辅助器
 	localPort := c.generateLocalPort()
 	natHelper, err := NewNATHelper(c.natMode, localPort, c.serverAddr)
 	if err != nil {
@@ -148,13 +146,11 @@ func (c *FakeTCPClient) Connect(ctx context.Context) error {
 
 	c.log(1, "NAT 模式: %d, 本地端口: %d", natHelper.mode, c.localAddr.Port)
 
-	// 步骤 2: 执行 NAT 打洞 (如果需要)
 	if err := c.natHelper.PunchHole(ctx); err != nil {
 		c.natHelper.Close()
 		return fmt.Errorf("NAT 打洞失败: %w", err)
 	}
 
-	// 步骤 3: 创建原始套接字
 	conn, err := c.createRawSocket()
 	if err != nil {
 		c.natHelper.Close()
@@ -162,36 +158,30 @@ func (c *FakeTCPClient) Connect(ctx context.Context) error {
 	}
 	c.rawConn = conn
 
-	// 步骤 4: 发送模拟 SYN (TCP 绑定模式)
 	if c.natHelper.mode == NATModeTCPBind {
 		c.natHelper.SimulateSYN(&net.TCPAddr{
 			IP:   c.serverAddr.IP,
 			Port: c.serverAddr.Port,
 		})
-		time.Sleep(50 * time.Millisecond) // 等待 conntrack 记录建立
+		time.Sleep(50 * time.Millisecond)
 	}
 
-	// 步骤 5: 初始化会话
 	c.sessionMgr = NewFakeTCPSessionManager(c.config, c.localAddr)
 	c.session = c.sessionMgr.GetOrCreateSession(c.serverAddr)
 
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	atomic.StoreInt32(&c.running, 1)
 
-	// 步骤 6: 启动读取循环
 	c.wg.Add(1)
 	go c.readLoop()
 
-	// 步骤 7: 启动 NAT 保活
 	c.natHelper.StartKeepAlive(c.ctx)
 
-	// 步骤 8: 发送 SYN (带重试)
 	if err := c.sendSYNWithRetry(ctx); err != nil {
 		c.Close()
 		return err
 	}
 
-	// 步骤 9: 等待连接建立
 	select {
 	case <-ctx.Done():
 		c.Close()
@@ -204,7 +194,6 @@ func (c *FakeTCPClient) Connect(ctx context.Context) error {
 			c.serverAddr, atomic.LoadInt32(&c.synRetries))
 	}
 
-	// 步骤 10: 如果启用 TLS，进行 TLS 握手
 	if c.tlsConfig != nil && c.tlsConfig.Enabled {
 		if err := c.upgradeTLS(ctx); err != nil {
 			c.Close()
@@ -223,10 +212,8 @@ func (c *FakeTCPClient) upgradeTLS(ctx context.Context) error {
 		return fmt.Errorf("uTLS 客户端未初始化")
 	}
 
-	// 创建 FakeTCP 适配器
 	adapter := NewFakeConnAdapter(c)
 
-	// 使用 uTLS 包装连接
 	tlsConn, err := c.utlsClient.WrapConn(adapter, c.tlsConfig.GetEffectiveSNI())
 	if err != nil {
 		return err
@@ -243,7 +230,6 @@ func (c *FakeTCPClient) createRawSocket() (*net.IPConn, error) {
 		return nil, fmt.Errorf("创建原始套接字失败: %w", err)
 	}
 
-	// 设置 IP_HDRINCL
 	rawConn, err := conn.SyscallConn()
 	if err != nil {
 		conn.Close()
@@ -279,7 +265,6 @@ func (c *FakeTCPClient) sendSYNWithRetry(ctx context.Context) error {
 
 		atomic.StoreInt32(&c.synRetries, int32(i+1))
 
-		// 重新执行 NAT 打洞 (每次重试前)
 		if i > 0 && c.natHelper.mode == NATModeUDPHole {
 			c.natHelper.PunchHole(ctx)
 			time.Sleep(20 * time.Millisecond)
@@ -295,7 +280,6 @@ func (c *FakeTCPClient) sendSYNWithRetry(ctx context.Context) error {
 
 		c.log(2, "SYN 已发送 (尝试 %d/%d)", i+1, c.maxRetries)
 
-		// 等待一段时间看是否收到 SYN-ACK
 		waitCtx, cancel := context.WithTimeout(ctx, c.retryInterval*2)
 		select {
 		case <-waitCtx.Done():
@@ -303,7 +287,6 @@ func (c *FakeTCPClient) sendSYNWithRetry(ctx context.Context) error {
 			if atomic.LoadInt32(&c.connected) == 1 {
 				return nil
 			}
-			// 超时，继续重试
 			continue
 		case <-c.waitConnected():
 			cancel()
@@ -365,12 +348,10 @@ func (c *FakeTCPClient) readLoop() {
 			}
 		}
 
-		// 检查是否来自服务器
 		if !srcAddr.IP.Equal(c.serverAddr.IP) {
 			continue
 		}
 
-		// 解析 IP 头
 		ipHeader, ipHeaderLen, err := DecodeIPHeader(buf[:n])
 		if err != nil {
 			continue
@@ -380,20 +361,17 @@ func (c *FakeTCPClient) readLoop() {
 			continue
 		}
 
-		// 解析 TCP 头
 		tcpData := buf[ipHeaderLen:n]
 		tcpHeader, tcpHeaderLen, err := DecodeTCPHeader(tcpData)
 		if err != nil {
 			continue
 		}
 
-		// 检查端口
 		if tcpHeader.SrcPort != uint16(c.serverAddr.Port) ||
 			tcpHeader.DstPort != uint16(c.localAddr.Port) {
 			continue
 		}
 
-		// 验证校验和
 		if !VerifyTCPChecksum(ipHeader.SrcIP, ipHeader.DstIP, tcpData) {
 			c.log(2, "TCP 校验和错误")
 			continue
@@ -401,14 +379,12 @@ func (c *FakeTCPClient) readLoop() {
 
 		payload := tcpData[tcpHeaderLen:]
 
-		// 处理包
 		c.handlePacket(tcpHeader, payload)
 	}
 }
 
 // handlePacket 处理收到的包
 func (c *FakeTCPClient) handlePacket(tcpHeader *TCPHeader, payload []byte) {
-	// 收到任何包都说明 NAT 穿透成功
 	c.log(2, "收到包: Flags=0x%02x, Seq=%d, Ack=%d, Len=%d",
 		tcpHeader.Flags, tcpHeader.SeqNum, tcpHeader.AckNum, len(payload))
 
@@ -418,7 +394,6 @@ func (c *FakeTCPClient) handlePacket(tcpHeader *TCPHeader, payload []byte) {
 		return
 	}
 
-	// 检查是否已建立连接
 	c.session.mu.RLock()
 	state := c.session.State
 	c.session.mu.RUnlock()
@@ -428,14 +403,12 @@ func (c *FakeTCPClient) handlePacket(tcpHeader *TCPHeader, payload []byte) {
 		c.log(1, "连接状态: ESTABLISHED")
 	}
 
-	// 发送响应
 	if response != nil {
 		if err := c.sendPacket(response); err != nil {
 			c.log(2, "发送响应失败: %v", err)
 		}
 	}
 
-	// 传递数据
 	if len(data) > 0 {
 		select {
 		case c.recvChan <- data:
@@ -448,14 +421,11 @@ func (c *FakeTCPClient) handlePacket(tcpHeader *TCPHeader, payload []byte) {
 
 // sendPacket 发送数据包
 func (c *FakeTCPClient) sendPacket(pkt *FakeTCPPacket) error {
-	// 更新本地地址 (确保使用 NAT helper 分配的端口)
 	pkt.TCPHeader.SrcPort = uint16(c.localAddr.Port)
 	pkt.TCPHeader.DstPort = uint16(c.serverAddr.Port)
 
-	// 编码 TCP 头部
 	tcpHeaderBuf := EncodeTCPHeader(pkt.TCPHeader)
 
-	// 计算校验和
 	tcpHeaderBuf[16] = 0
 	tcpHeaderBuf[17] = 0
 	checksum := CalculateTCPChecksum(
@@ -466,7 +436,6 @@ func (c *FakeTCPClient) sendPacket(pkt *FakeTCPPacket) error {
 	)
 	binary.BigEndian.PutUint16(tcpHeaderBuf[16:18], checksum)
 
-	// 构建完整包
 	var packet []byte
 	packet = append(packet, tcpHeaderBuf...)
 	packet = append(packet, pkt.Payload...)
@@ -477,13 +446,11 @@ func (c *FakeTCPClient) sendPacket(pkt *FakeTCPPacket) error {
 
 // Send 发送数据
 func (c *FakeTCPClient) Send(data []byte) error {
-	// 如果启用 TLS，通过 TLS 连接发送
 	if c.tlsConn != nil {
 		_, err := c.tlsConn.Write(data)
 		return err
 	}
 
-	// 原始 FakeTCP 发送
 	return c.sendRaw(data)
 }
 
@@ -493,7 +460,6 @@ func (c *FakeTCPClient) sendRaw(data []byte) error {
 		return fmt.Errorf("未连接")
 	}
 
-	// 分片发送
 	c.session.mu.RLock()
 	mss := int(c.session.MSS)
 	c.session.mu.RUnlock()
@@ -529,7 +495,6 @@ func (c *FakeTCPClient) sendRaw(data []byte) error {
 
 // Recv 接收数据
 func (c *FakeTCPClient) Recv(ctx context.Context) ([]byte, error) {
-	// 如果启用 TLS，从 TLS 连接读取
 	if c.tlsConn != nil {
 		buf := make([]byte, 32*1024)
 		n, err := c.tlsConn.Read(buf)
@@ -539,7 +504,6 @@ func (c *FakeTCPClient) Recv(ctx context.Context) ([]byte, error) {
 		return buf[:n], nil
 	}
 
-	// 原始 FakeTCP 接收
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -565,13 +529,11 @@ func (c *FakeTCPClient) Close() error {
 	atomic.StoreInt32(&c.running, 0)
 	atomic.StoreInt32(&c.connected, 0)
 
-	// 关闭 TLS 连接
 	if c.tlsConn != nil {
 		c.tlsConn.Close()
 		c.tlsConn = nil
 	}
 
-	// 发送 FIN
 	if c.session != nil && c.session.State == TCPStateEstablished {
 		finPkt := c.sessionMgr.CloseConnection(c.session)
 		if finPkt != nil {
@@ -583,7 +545,6 @@ func (c *FakeTCPClient) Close() error {
 		c.cancel()
 	}
 
-	// 关闭 NAT 辅助器
 	if c.natHelper != nil {
 		c.natHelper.Close()
 	}
@@ -617,6 +578,56 @@ func (c *FakeTCPClient) GetNATMode() NATTraversalMode {
 // GetLocalAddr 获取本地地址
 func (c *FakeTCPClient) GetLocalAddr() *net.UDPAddr {
 	return c.localAddr
+}
+
+// 修复：实现 net.Conn 接口所需的 LocalAddr 方法
+func (c *FakeTCPClient) LocalAddr() net.Addr {
+	if c.localAddr != nil {
+		return c.localAddr
+	}
+	return &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+}
+
+// 修复：实现 net.Conn 接口所需的 RemoteAddr 方法
+func (c *FakeTCPClient) RemoteAddr() net.Addr {
+	if c.serverAddr != nil {
+		return c.serverAddr
+	}
+	return &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+}
+
+// 修复：实现 net.Conn 接口所需的 SetDeadline 方法
+func (c *FakeTCPClient) SetDeadline(t time.Time) error {
+	return c.rawConn.SetDeadline(t)
+}
+
+// 修复：实现 net.Conn 接口所需的 SetReadDeadline 方法
+func (c *FakeTCPClient) SetReadDeadline(t time.Time) error {
+	return c.rawConn.SetReadDeadline(t)
+}
+
+// 修复：实现 net.Conn 接口所需的 SetWriteDeadline 方法
+func (c *FakeTCPClient) SetWriteDeadline(t time.Time) error {
+	return c.rawConn.SetWriteDeadline(t)
+}
+
+// 修复：实现 io.Reader 接口
+func (c *FakeTCPClient) Read(b []byte) (int, error) {
+	data, err := c.Recv(c.ctx)
+	if err != nil {
+		return 0, err
+	}
+	n := copy(b, data)
+	return n, nil
+}
+
+// 修复：实现 io.Writer 接口
+func (c *FakeTCPClient) Write(b []byte) (int, error) {
+	err := c.Send(b)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 // generateLocalPort 生成本地端口
