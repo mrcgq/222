@@ -222,47 +222,35 @@ func (m *QualityMonitor) GetQuality() *LinkQualityMetrics {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	q := &LinkQualityMetrics{
-		LastCheck:            m.lastUpdate,
-		LastSuccess:          m.lastSuccess,
-		LastFailure:          m.lastFailure,
-		MinRTT:               m.minRTT,
-		MaxRTT:               m.maxRTT,
-		ActiveConns:          m.activeConns,
-		TotalConns:           m.totalConns,
-		FailedConns:          m.failedConns,
-		ConsecutiveFailures:  m.consecutiveFailures,
-		ConsecutiveSuccesses: m.consecutiveSuccesses,
-	}
-
 	// 计算平均 RTT
+	var avgRTT time.Duration
+	var rttJitter time.Duration
 	if m.rttCount > 0 {
 		var sum time.Duration
 		for i := 0; i < m.rttCount; i++ {
 			sum += m.rttSamples[i]
 		}
-		q.AvgRTT = sum / time.Duration(m.rttCount)
-		q.RTT = q.AvgRTT
+		avgRTT = sum / time.Duration(m.rttCount)
 
 		// 计算 RTT 抖动 (标准差)
 		var variance float64
-		avgNs := float64(q.AvgRTT.Nanoseconds())
+		avgNs := float64(avgRTT.Nanoseconds())
 		for i := 0; i < m.rttCount; i++ {
 			diff := float64(m.rttSamples[i].Nanoseconds()) - avgNs
 			variance += diff * diff
 		}
-		q.RTTJitter = time.Duration(math.Sqrt(variance / float64(m.rttCount)))
+		rttJitter = time.Duration(math.Sqrt(variance / float64(m.rttCount)))
 	}
 
 	// 计算丢包率
+	var lossRate float64
 	if m.lossCount > 0 {
-		q.LossRate = float64(m.recentLosses) / float64(m.lossCount)
-		q.RecentLosses = m.recentLosses
-		q.TotalLosses = uint64(m.recentLosses)
-		q.TotalPackets = uint64(m.lossCount)
+		lossRate = float64(m.recentLosses) / float64(m.lossCount)
 	}
 
 	// 计算吞吐量
+	var throughput float64
+	var peakThroughput float64
 	if len(m.throughputSamples) > 0 {
 		var totalBytes int64
 		var totalDuration time.Duration
@@ -271,68 +259,87 @@ func (m *QualityMonitor) GetQuality() *LinkQualityMetrics {
 			totalDuration += s.duration
 		}
 		if totalDuration > 0 {
-			q.Throughput = float64(totalBytes) / totalDuration.Seconds()
-			q.AvgThroughput = q.Throughput
+			throughput = float64(totalBytes) / totalDuration.Seconds()
 		}
 
 		// 峰值吞吐量
 		for _, s := range m.throughputSamples {
 			if s.duration > 0 {
 				tp := float64(s.bytes) / s.duration.Seconds()
-				if tp > q.PeakThroughput {
-					q.PeakThroughput = tp
+				if tp > peakThroughput {
+					peakThroughput = tp
 				}
 			}
 		}
 	}
 
 	// 计算可用性
-	q.Available = m.consecutiveFailures < 5 &&
+	available := m.consecutiveFailures < 5 &&
 		(m.lastSuccess.IsZero() || time.Since(m.lastSuccess) < 30*time.Second)
 
-	if q.Available {
-		q.State = StateRunning
+	var state LinkState
+	if available {
+		state = StateRunning
 	} else if m.consecutiveFailures > 0 {
-		q.State = StateDegraded
+		state = StateDegraded
 	} else {
-		q.State = StateUnknown
+		state = StateUnknown
+	}
+
+	// 构建 LinkQualityMetrics（只使用已定义的字段）
+	q := &LinkQualityMetrics{
+		RTT:                  avgRTT,
+		LossRate:             lossRate,
+		Throughput:           throughput,
+		Available:            available,
+		State:                state,
+		Score:                0, // 稍后计算
+		LastSuccess:          m.lastSuccess,
+		LastFailure:          m.lastFailure,
+		ConsecutiveFailures:  m.consecutiveFailures,
+		ConsecutiveSuccesses: m.consecutiveSuccesses,
+		RecentLosses:         m.recentLosses,
+		TotalLosses:          uint64(m.recentLosses),
+		TotalPackets:         uint64(m.lossCount),
+		AvgThroughput:        throughput,
+		PeakThroughput:       peakThroughput,
 	}
 
 	// 计算评分
-	q.Score = m.calculateScore(q)
+	q.Score = m.calculateScoreInternal(avgRTT, lossRate, throughput, rttJitter)
 
 	return q
 }
 
-// calculateScore 计算综合评分 (0-100)
-func (m *QualityMonitor) calculateScore(q *LinkQualityMetrics) float64 {
+// calculateScoreInternal 内部计算评分方法 (0-100)
+func (m *QualityMonitor) calculateScoreInternal(avgRTT time.Duration, lossRate, throughput float64, rttJitter time.Duration) float64 {
 	var score float64 = 100
 
 	// RTT 评分 (越低越好)
-	if q.AvgRTT > 0 {
-		rttMs := float64(q.AvgRTT.Milliseconds())
+	if avgRTT > 0 {
+		rttMs := float64(avgRTT.Milliseconds())
 		rttScore := 100 - math.Min(rttMs/5, 100) // 500ms 以上得 0 分
 		score = score*rttWeight + rttScore*(1-rttWeight)
 	}
 
 	// 丢包率评分 (越低越好)
-	lossScore := 100 * (1 - math.Min(q.LossRate*10, 1)) // 10% 以上得 0 分
+	lossScore := 100 * (1 - math.Min(lossRate*10, 1)) // 10% 以上得 0 分
 	score = score*(1-lossWeight) + lossScore*lossWeight
 
 	// 吞吐量评分
-	if q.Throughput > 0 {
+	if throughput > 0 {
 		// 假设 10 MB/s 为满分
-		tpScore := math.Min(q.Throughput/(10*1024*1024)*100, 100)
+		tpScore := math.Min(throughput/(10*1024*1024)*100, 100)
 		score = score*(1-throughputWeight) + tpScore*throughputWeight
 	}
 
 	// 稳定性评分
 	stabilityScore := 100.0
-	if q.ConsecutiveFailures > 0 {
-		stabilityScore -= float64(q.ConsecutiveFailures) * 20
+	if m.consecutiveFailures > 0 {
+		stabilityScore -= float64(m.consecutiveFailures) * 20
 	}
-	if q.RTTJitter > 50*time.Millisecond {
-		stabilityScore -= float64(q.RTTJitter.Milliseconds()) / 10
+	if rttJitter > 50*time.Millisecond {
+		stabilityScore -= float64(rttJitter.Milliseconds()) / 10
 	}
 	stabilityScore = math.Max(stabilityScore, 0)
 	score = score*(1-stabilityWeight) + stabilityScore*stabilityWeight
