@@ -1,7 +1,3 @@
-
-
-
-
 // =============================================================================
 // 文件: internal/switcher/decision.go
 // 描述: 智能链路切换 - 决策引擎
@@ -116,7 +112,7 @@ func (d *DecisionEngine) Evaluate(currentMode TransportMode) *SwitchDecision {
 }
 
 // checkSwitchConditions 检查切换条件
-func (d *DecisionEngine) checkSwitchConditions(currentMode TransportMode, quality *LinkQuality) SwitchReason {
+func (d *DecisionEngine) checkSwitchConditions(currentMode TransportMode, quality *LinkQualityMetrics) SwitchReason {
 	// 连续失败
 	if quality.ConsecutiveFailures >= d.config.FailThreshold {
 		return ReasonConnectionFailed
@@ -146,7 +142,7 @@ func (d *DecisionEngine) checkSwitchConditions(currentMode TransportMode, qualit
 }
 
 // checkRecoveryConditions 检查恢复条件
-func (d *DecisionEngine) checkRecoveryConditions(currentMode TransportMode, quality *LinkQuality) SwitchReason {
+func (d *DecisionEngine) checkRecoveryConditions(currentMode TransportMode, quality *LinkQualityMetrics) SwitchReason {
 	// 获取当前模式优先级
 	currentPriority := d.getModePriority(currentMode)
 
@@ -257,7 +253,7 @@ func (d *DecisionEngine) selectTargetMode(currentMode TransportMode, reason Swit
 type modeCandidate struct {
 	mode     TransportMode
 	score    float64
-	quality  *LinkQuality
+	quality  *LinkQualityMetrics
 	priority int
 }
 
@@ -272,7 +268,7 @@ func (d *DecisionEngine) getModePriority(mode TransportMode) int {
 }
 
 // getQuality 获取模式质量
-func (d *DecisionEngine) getQuality(mode TransportMode) *LinkQuality {
+func (d *DecisionEngine) getQuality(mode TransportMode) *LinkQualityMetrics {
 	if monitor, ok := d.qualities[mode]; ok {
 		return monitor.GetQuality()
 	}
@@ -342,11 +338,11 @@ func (d *DecisionEngine) GetQualityMonitor(mode TransportMode) *QualityMonitor {
 }
 
 // GetAllQualities 获取所有模式质量
-func (d *DecisionEngine) GetAllQualities() map[TransportMode]*LinkQuality {
+func (d *DecisionEngine) GetAllQualities() map[TransportMode]*LinkQualityMetrics {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	result := make(map[TransportMode]*LinkQuality)
+	result := make(map[TransportMode]*LinkQualityMetrics)
 	for mode, monitor := range d.qualities {
 		result[mode] = monitor.GetQuality()
 	}
@@ -410,9 +406,3 @@ func (d *DecisionEngine) Reset() {
 	d.cooldowns = make(map[TransportMode]time.Time)
 	d.probeResults = make(map[TransportMode]*probeResult)
 }
-
-
-
-
-
-
