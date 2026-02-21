@@ -60,7 +60,6 @@ func (w *UDPTransportWrapper) GetStats() TransportStats {
 
 // Probe 探测连接质量
 func (w *UDPTransportWrapper) Probe() (time.Duration, error) {
-	// UDP 探测：简单返回成功，实际延迟由其他机制测量
 	return time.Millisecond, nil
 }
 
@@ -78,22 +77,18 @@ func NewTCPTransportWrapper(server *transport.TCPServer) *TCPTransportWrapper {
 	return &TCPTransportWrapper{server: server}
 }
 
-// Send 发送数据 (TCP 不支持 UDP 风格的 SendTo，返回错误或忽略)
+// Send 发送数据 (TCP 不支持 UDP 风格的 SendTo)
 func (w *TCPTransportWrapper) Send(data []byte, addr *net.UDPAddr) error {
-	// TCP 是面向连接的，不支持直接 SendTo
-	// 这里返回不支持的错误，或者可以维护一个连接映射
 	return fmt.Errorf("TCP does not support SendTo, use connection-based sending")
 }
 
 // IsRunning 是否运行中
 func (w *TCPTransportWrapper) IsRunning() bool {
-	// TCPServer 没有 IsRunning 方法，检查 listener 是否存在
 	return w.server != nil
 }
 
 // GetStats 获取统计信息
 func (w *TCPTransportWrapper) GetStats() TransportStats {
-	// TCPServer 没有 GetStats 方法，返回空统计
 	return TransportStats{
 		LastActivity: time.Now(),
 	}
@@ -101,9 +96,7 @@ func (w *TCPTransportWrapper) GetStats() TransportStats {
 
 // Probe 探测连接质量
 func (w *TCPTransportWrapper) Probe() (time.Duration, error) {
-	start := time.Now()
-	// TCP 探测需要建立连接，这里简化处理
-	return time.Since(start), nil
+	return time.Millisecond, nil
 }
 
 // =============================================================================
@@ -139,19 +132,20 @@ func (w *FakeTCPTransportWrapper) GetStats() TransportStats {
 		return TransportStats{}
 	}
 	stats := w.server.GetStats()
+	// FakeTCPStats 字段是 uint64，需要转换为 int64
+	// Errors 使用 ChecksumErrors + InvalidPackets + DroppedPackets 的总和
 	return TransportStats{
-		BytesSent:     stats.BytesSent,
-		BytesReceived: stats.BytesReceived,
-		PacketsSent:   stats.PacketsSent,
-		PacketsRecv:   stats.PacketsReceived,
-		Errors:        stats.Errors,
+		BytesSent:     int64(stats.BytesSent),
+		BytesReceived: int64(stats.BytesReceived),
+		PacketsSent:   int64(stats.PacketsSent),
+		PacketsRecv:   int64(stats.PacketsReceived),
+		Errors:        int64(stats.ChecksumErrors + stats.InvalidPackets + stats.DroppedPackets),
 		LastActivity:  time.Now(),
 	}
 }
 
 // Probe 探测连接质量
 func (w *FakeTCPTransportWrapper) Probe() (time.Duration, error) {
-	// FakeTCP 延迟略高于 UDP
 	return time.Millisecond * 2, nil
 }
 
@@ -179,7 +173,6 @@ func (w *WSTransportWrapper) Send(data []byte, addr *net.UDPAddr) error {
 
 // IsRunning 是否运行中
 func (w *WSTransportWrapper) IsRunning() bool {
-	// WebSocketServer 没有 IsRunning 方法，检查 server 是否存在
 	return w.server != nil
 }
 
@@ -196,7 +189,6 @@ func (w *WSTransportWrapper) GetStats() TransportStats {
 
 // Probe 探测连接质量
 func (w *WSTransportWrapper) Probe() (time.Duration, error) {
-	// WebSocket 延迟较高
 	return time.Millisecond * 5, nil
 }
 
@@ -245,7 +237,6 @@ func (w *EBPFTransportWrapper) GetStats() TransportStats {
 
 // Probe 探测连接质量
 func (w *EBPFTransportWrapper) Probe() (time.Duration, error) {
-	// eBPF 在内核态运行，延迟极低
 	return time.Microsecond * 100, nil
 }
 
