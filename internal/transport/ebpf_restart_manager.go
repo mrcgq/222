@@ -1,4 +1,5 @@
 //go:build linux
+
 // =============================================================================
 // 文件: internal/transport/ebpf_restart_manager.go
 // 描述: eBPF 平滑重启管理器
@@ -97,8 +98,8 @@ func (m *GracefulRestartManager) PrepareRestart(listenPorts []uint16) error {
 		}
 	}
 
-	// 准备 loader
-	if err := m.loader.PrepareGracefulRestart(); err != nil {
+	// 准备 loader - 调用 loader 的方法
+	if err := m.loader.prepareGracefulRestart(); err != nil {
 		return fmt.Errorf("准备 loader 失败: %w", err)
 	}
 
@@ -136,8 +137,8 @@ func (m *GracefulRestartManager) TryRestore() (*RestartState, error) {
 		return nil, fmt.Errorf("旧进程 %d 仍在运行", state.PID)
 	}
 
-	// 尝试恢复 loader
-	if err := m.loader.RecoverFromRestart(); err != nil {
+	// 尝试恢复 loader - 调用 loader 的方法
+	if err := m.loader.recoverFromRestart(); err != nil {
 		return nil, fmt.Errorf("恢复 loader 失败: %w", err)
 	}
 
