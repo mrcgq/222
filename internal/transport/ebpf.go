@@ -308,7 +308,7 @@ func (e *EBPFAccelerator) collectStats() {
 	}
 
 	e.mu.Lock()
-	e.stats.EBPFStats = *stats
+	e.stats.Stats = *stats
 	e.stats.Uptime = time.Since(e.startTime)
 	e.stats.EventsProcessed = atomic.LoadUint64(&e.eventsProcessed)
 	e.mu.Unlock()
@@ -383,8 +383,8 @@ func (e *EBPFAccelerator) SendTo(data []byte, addr *net.UDPAddr) error {
 		return fmt.Errorf("发送失败: %w", err)
 	}
 
-	atomic.AddUint64(&e.stats.EBPFStats.PacketsTX, 1)
-	atomic.AddUint64(&e.stats.EBPFStats.BytesTX, uint64(len(data)))
+	atomic.AddUint64(&e.stats.Stats.PacketsTX, 1)
+	atomic.AddUint64(&e.stats.Stats.BytesTX, uint64(len(data)))
 
 	return nil
 }
@@ -393,7 +393,7 @@ func (e *EBPFAccelerator) SendTo(data []byte, addr *net.UDPAddr) error {
 func (e *EBPFAccelerator) GetStats() EBPFStats {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.stats.EBPFStats
+	return e.stats.Stats
 }
 
 // GetAcceleratorStats 获取加速器统计
