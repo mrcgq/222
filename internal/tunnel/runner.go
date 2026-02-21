@@ -1,5 +1,4 @@
 
-
 // =============================================================================
 // 文件: internal/tunnel/runner.go
 // 描述: Cloudflare Tunnel 进程管理 - 通用部分
@@ -662,6 +661,17 @@ func (r *CloudflaredRunner) GetStatus() RunnerStatus {
 		RestartCount: r.restartCount,
 	}
 }
+
+
+
+
+
+
+
+
+
+
+
 
 
 
