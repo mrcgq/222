@@ -1,3 +1,4 @@
+
 // =============================================================================
 // 文件: internal/protocol/protocol.go
 // =============================================================================
@@ -172,3 +173,5 @@ func IsARQPacket(data []byte) bool {
 	return firstByte != TypeConnect && firstByte != TypeData && 
 	       firstByte != TypeClose && firstByte != TypeHeartbeat
 }
+
+
