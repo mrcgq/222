@@ -1,4 +1,3 @@
-
 // =============================================================================
 // 文件: cmd/phantom-server/main.go
 // 描述: 主程序入口 - 集成 Prometheus 指标、Cloudflare 隧道、DDNS 和 TLS 伪装
@@ -357,7 +356,7 @@ func (a *switcherStatsAdapter) IsARQEnabled() bool {
 }
 
 func (a *switcherStatsAdapter) GetARQActiveConns() int {
-	return int(a.sw.GetStats().ARQActiveConns)
+	return a.sw.GetStats().ARQActiveConns
 }
 
 func (a *switcherStatsAdapter) GetModeStats() map[string]metrics.ModeStatData {
@@ -365,15 +364,18 @@ func (a *switcherStatsAdapter) GetModeStats() map[string]metrics.ModeStatData {
 	for mode, ms := range a.sw.GetStats().ModeStats {
 		data := metrics.ModeStatData{
 			State:          ms.State.String(),
-			SwitchInCount:  ms.SwitchInCount,
-			SwitchOutCount: ms.SwitchOutCount,
-			FailureCount:   ms.FailureCount,
+			SwitchInCount:  uint64(ms.SwitchInCount),  // int -> uint64
+			SwitchOutCount: uint64(ms.SwitchOutCount), // int -> uint64
+			FailureCount:   uint64(ms.FailCount),      // FailCount 不是 FailureCount
 			TotalTimeSec:   ms.TotalTime.Seconds(),
 		}
-		if ms.Quality != nil {
+		// QualityInfo 是值类型，不需要判断 nil
+		// 检查是否有有效数据（RTT > 0 表示有数据）
+		if ms.Quality.RTT > 0 || ms.Quality.Loss > 0 {
 			data.RTTMs = float64(ms.Quality.RTT.Milliseconds())
-			data.LossRate = ms.Quality.LossRate
-			data.TotalPackets = ms.Quality.TotalPackets
+			data.LossRate = ms.Quality.Loss // Loss 不是 LossRate
+			// QualityInfo 没有 TotalPackets 字段，设为 0
+			data.TotalPackets = 0
 		}
 		result[string(mode)] = data
 	}
@@ -383,7 +385,6 @@ func (a *switcherStatsAdapter) GetModeStats() map[string]metrics.ModeStatData {
 type handlerStatsAdapter struct {
 	h *handler.UnifiedHandler
 }
-
 
 func (a *handlerStatsAdapter) GetActiveConnections() int64 {
 	return int64(a.h.GetActiveConns())
@@ -708,6 +709,3 @@ func truncateString(s string, maxLen int) string {
 	}
 	return s[:maxLen-3] + "..."
 }
-
-
-
