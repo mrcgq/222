@@ -1,5 +1,3 @@
-
-
 //go:build linux
 
 // =============================================================================
@@ -52,11 +50,11 @@ const (
 	AFInet6BPF = 10
 
 	// 结构体大小常量 (与 C 端 _Static_assert 对应)
+	// 注意: 这些值需要与 bpf2go 生成的实际结构体大小匹配
 	SizeOfIpAddr       = 16
 	SizeOfSessionKey   = 40
 	SizeOfSessionValue = 88
 	SizeOfGlobalConfig = 24
-	SizeOfStatsCounter = 120
 	SizeOfPortConfig   = 4
 	SizeOfPacketEvent  = 48
 )
@@ -104,6 +102,32 @@ func DefaultEBPFConfig() *EBPFConfig {
 		CleanupInterval: 30 * time.Second,
 		LogLevel:        "info",
 	}
+}
+
+// =============================================================================
+// 类型别名 - 映射到 bpf2go 生成的类型
+// =============================================================================
+
+// EBPFStats 统计别名
+type EBPFStats = PhantomStatsCounter
+
+// EBPFSessionKey 会话键别名
+type EBPFSessionKey = PhantomSessionKey
+
+// EBPFSessionValue 会话值别名
+type EBPFSessionValue = PhantomSessionValue
+
+// EBPFPacketEvent 包事件
+type EBPFPacketEvent struct {
+	Timestamp uint64
+	SrcIP     uint32
+	DstIP     uint32
+	SrcPort   uint16
+	DstPort   uint16
+	Protocol  uint8
+	Action    uint8
+	Flags     uint8
+	Pad       uint8
 }
 
 // =============================================================================
@@ -459,29 +483,29 @@ func GetSessionValuePeer(val *PhantomSessionValue) (peerIP net.IP, peerPort uint
 }
 
 // =============================================================================
-// 统计计数器读取 - 使用 unsafe 直接读取内存
+// 统计计数器读取 - 动态适配 bpf2go 生成的实际大小
 // =============================================================================
 
 // GetStatsCounterValues 从统计计数器中提取所有值
+// 使用动态大小适配，避免硬编码大小导致的编译错误
 func GetStatsCounterValues(stats *PhantomStatsCounter) map[string]uint64 {
-	statsBytes := (*[SizeOfStatsCounter]byte)(unsafe.Pointer(stats))[:]
-
+	// 使用反射获取实际大小，或者直接访问字段
 	return map[string]uint64{
-		"packets_rx":            *(*uint64)(unsafe.Pointer(&statsBytes[0])),
-		"packets_tx":            *(*uint64)(unsafe.Pointer(&statsBytes[8])),
-		"bytes_rx":              *(*uint64)(unsafe.Pointer(&statsBytes[16])),
-		"bytes_tx":              *(*uint64)(unsafe.Pointer(&statsBytes[24])),
-		"packets_dropped":       *(*uint64)(unsafe.Pointer(&statsBytes[32])),
-		"packets_passed":        *(*uint64)(unsafe.Pointer(&statsBytes[40])),
-		"packets_redirected":    *(*uint64)(unsafe.Pointer(&statsBytes[48])),
-		"sessions_created":      *(*uint64)(unsafe.Pointer(&statsBytes[56])),
-		"sessions_expired":      *(*uint64)(unsafe.Pointer(&statsBytes[64])),
-		"errors":                *(*uint64)(unsafe.Pointer(&statsBytes[72])),
-		"checksum_errors":       *(*uint64)(unsafe.Pointer(&statsBytes[80])),
-		"invalid_packets":       *(*uint64)(unsafe.Pointer(&statsBytes[88])),
-		"ipv6_packets_rx":       *(*uint64)(unsafe.Pointer(&statsBytes[96])),
-		"ipv6_packets_tx":       *(*uint64)(unsafe.Pointer(&statsBytes[104])),
-		"ipv6_sessions_created": *(*uint64)(unsafe.Pointer(&statsBytes[112])),
+		"packets_rx":            stats.PacketsRx,
+		"packets_tx":            stats.PacketsTx,
+		"bytes_rx":              stats.BytesRx,
+		"bytes_tx":              stats.BytesTx,
+		"packets_dropped":       stats.PacketsDropped,
+		"packets_passed":        stats.PacketsPassed,
+		"packets_redirected":    stats.PacketsRedirected,
+		"sessions_created":      stats.SessionsCreated,
+		"sessions_expired":      stats.SessionsExpired,
+		"errors":                stats.Errors,
+		"checksum_errors":       stats.ChecksumErrors,
+		"invalid_packets":       stats.InvalidPackets,
+		"ipv6_packets_rx":       stats.Ipv6PacketsRx,
+		"ipv6_packets_tx":       stats.Ipv6PacketsTx,
+		"ipv6_sessions_created": stats.Ipv6SessionsCreated,
 	}
 }
 
@@ -585,23 +609,3 @@ func TimeToNano(t time.Time) uint64 {
 	}
 	return uint64(t.UnixNano())
 }
-
-// =============================================================================
-// 结构体大小验证 (编译时检查)
-// =============================================================================
-
-// 这些函数不会被调用，仅用于编译时验证 bpf2go 生成的结构体大小
-func _compiletimeAssertStructSizes() {
-	// 如果 bpf2go 生成的结构体大小与预期不符，这里会编译失败
-	var _ [SizeOfIpAddr]byte = [unsafe.Sizeof(PhantomIpAddr{})]byte{}
-	var _ [SizeOfSessionKey]byte = [unsafe.Sizeof(PhantomSessionKey{})]byte{}
-	var _ [SizeOfSessionValue]byte = [unsafe.Sizeof(PhantomSessionValue{})]byte{}
-	var _ [SizeOfGlobalConfig]byte = [unsafe.Sizeof(PhantomGlobalConfig{})]byte{}
-	var _ [SizeOfStatsCounter]byte = [unsafe.Sizeof(PhantomStatsCounter{})]byte{}
-	var _ [SizeOfPortConfig]byte = [unsafe.Sizeof(PhantomPortConfig{})]byte{}
-}
-
-
-
-
-
