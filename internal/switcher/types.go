@@ -1,10 +1,8 @@
-
-
 // =============================================================================
 // 文件: internal/switcher/types.go
-// 描述: 智能链路切换 - 类型定义 (ARQ 已从独立模式中移除)
-//       新增：eBPF 端口独占状态标记
+// 描述: 智能链路切换 - 类型定义
 // =============================================================================
+
 package switcher
 
 import (
@@ -12,11 +10,14 @@ import (
 	"time"
 )
 
-// TransportMode 传输模式 (不含 ARQ，ARQ 是 UDP 的增强层)
+// =============================================================================
+// 传输模式
+// =============================================================================
+
+// TransportMode 传输模式
 type TransportMode string
 
 const (
-	ModeAuto      TransportMode = "auto"
 	ModeUDP       TransportMode = "udp"
 	ModeTCP       TransportMode = "tcp"
 	ModeFakeTCP   TransportMode = "faketcp"
@@ -24,80 +25,128 @@ const (
 	ModeEBPF      TransportMode = "ebpf"
 )
 
-// AllModes 所有支持的模式 (不含 ARQ)
-var AllModes = []TransportMode{
-	ModeEBPF,
-	ModeFakeTCP,
-	ModeUDP,
-	ModeTCP,
-	ModeWebSocket,
+// AllModes 所有模式列表
+var AllModes = []TransportMode{ModeUDP, ModeTCP, ModeFakeTCP, ModeWebSocket, ModeEBPF}
+
+// String 返回模式字符串
+func (m TransportMode) String() string {
+	return string(m)
 }
 
-// TransportState 传输层状态
+// =============================================================================
+// 传输状态
+// =============================================================================
+
+// TransportState 传输状态
 type TransportState int
 
 const (
 	StateUnknown TransportState = iota
-	StateStarting
 	StateRunning
 	StateDegraded
 	StateFailed
 	StateStopped
 )
 
+// String 返回状态字符串
 func (s TransportState) String() string {
-	names := []string{"unknown", "starting", "running", "degraded", "failed", "stopped"}
-	if int(s) < len(names) {
-		return names[s]
+	switch s {
+	case StateRunning:
+		return "running"
+	case StateDegraded:
+		return "degraded"
+	case StateFailed:
+		return "failed"
+	case StateStopped:
+		return "stopped"
+	default:
+		return "unknown"
 	}
-	return "unknown"
 }
 
-// PortOwnership 端口所有权状态
-type PortOwnership int
+// =============================================================================
+// 切换原因
+// =============================================================================
+
+// SwitchReason 切换原因
+type SwitchReason string
 
 const (
-	PortOwnerNone    PortOwnership = iota // 无所有者
-	PortOwnerUDP                          // UDP 独占
-	PortOwnerEBPF                         // eBPF 独占
-	PortOwnerShared                       // 共享 (理论上不应该发生)
+	ReasonManual      SwitchReason = "manual"
+	ReasonHighLatency SwitchReason = "high_latency"
+	ReasonHighLoss    SwitchReason = "high_loss"
+	ReasonFailed      SwitchReason = "failed"
+	ReasonRecovered   SwitchReason = "recovered"
+	ReasonProbe       SwitchReason = "probe"
+	ReasonCooldown    SwitchReason = "cooldown"
+	ReasonBetter      SwitchReason = "better_option"
 )
 
-func (p PortOwnership) String() string {
-	names := []string{"none", "udp", "ebpf", "shared"}
-	if int(p) < len(names) {
-		return names[p]
-	}
-	return "unknown"
+// String 返回原因字符串
+func (r SwitchReason) String() string {
+	return string(r)
 }
 
-// LinkQuality 链路质量
-type LinkQuality struct {
-	Available            bool
-	State                TransportState
-	LastCheck            time.Time
-	LastSuccess          time.Time
-	LastFailure          time.Time
-	RTT                  time.Duration
-	MinRTT               time.Duration
-	MaxRTT               time.Duration
-	AvgRTT               time.Duration
-	RTTJitter            time.Duration
-	LossRate             float64
-	RecentLosses         int
-	TotalLosses          uint64
-	TotalPackets         uint64
-	Throughput           float64
-	PeakThroughput       float64
-	AvgThroughput        float64
-	ActiveConns          int
-	TotalConns           uint64
-	FailedConns          uint64
-	ConsecutiveFailures  int
-	ConsecutiveSuccesses int
-	ErrorCount           uint64
-	Score                float64
+// =============================================================================
+// 传输处理器接口
+// =============================================================================
+
+// TransportHandler 传输处理器接口
+type TransportHandler interface {
+	// Send 发送数据到指定地址
+	Send(data []byte, addr *net.UDPAddr) error
+
+	// IsRunning 检查是否运行中
+	IsRunning() bool
+
+	// GetStats 获取统计信息
+	GetStats() TransportStats
+
+	// Probe 探测连接质量，返回 RTT
+	Probe() (time.Duration, error)
 }
+
+// TransportStats 传输统计
+type TransportStats struct {
+	BytesSent     int64
+	BytesReceived int64
+	PacketsSent   int64
+	PacketsRecv   int64
+	Errors        int64
+	ActiveConns   int
+	LastActivity  time.Time
+}
+
+// =============================================================================
+// 模式统计
+// =============================================================================
+
+// ModeStats 模式统计
+type ModeStats struct {
+	Mode           TransportMode
+	State          TransportState
+	Quality        QualityInfo
+	TotalTime      time.Duration
+	LastActive     time.Time
+	SwitchInCount  int
+	SwitchOutCount int
+	FailCount      int
+	SuccessCount   int
+}
+
+// QualityInfo 质量信息
+type QualityInfo struct {
+	RTT       time.Duration
+	Loss      float64
+	Jitter    time.Duration
+	Bandwidth int64
+	State     TransportState
+	Score     float64
+}
+
+// =============================================================================
+// 切换事件
+// =============================================================================
 
 // SwitchEvent 切换事件
 type SwitchEvent struct {
@@ -105,38 +154,82 @@ type SwitchEvent struct {
 	FromMode  TransportMode
 	ToMode    TransportMode
 	Reason    SwitchReason
-	Quality   *LinkQuality
 	Success   bool
 	Duration  time.Duration
+	Error     error
 }
 
-// SwitchReason 切换原因
-type SwitchReason int
+// =============================================================================
+// 切换器统计
+// =============================================================================
 
-const (
-	ReasonNone SwitchReason = iota
-	ReasonInitial
-	ReasonHighRTT
-	ReasonHighLoss
-	ReasonLowThroughput
-	ReasonConnectionFailed
-	ReasonTimeout
-	ReasonManual
-	ReasonRecovery
-	ReasonProbe
-	ReasonDegraded
-)
+// SwitcherStats 切换器统计
+type SwitcherStats struct {
+	// 当前状态
+	CurrentMode     TransportMode
+	CurrentState    TransportState
+	CurrentQuality  QualityInfo
+	CurrentModeTime time.Duration
 
-func (r SwitchReason) String() string {
-	names := []string{
-		"none", "initial", "high_rtt", "high_loss", "low_throughput",
-		"connection_failed", "timeout", "manual", "recovery", "probe", "degraded",
-	}
-	if int(r) < len(names) {
-		return names[r]
-	}
-	return "unknown"
+	// 切换统计
+	TotalSwitches    uint64
+	SuccessSwitches  uint64
+	FailedSwitches   uint64
+	LastSwitch       time.Time
+	LastSwitchReason SwitchReason
+
+	// 模式统计
+	ModeStats map[TransportMode]*ModeStats
+
+	// ARQ 统计
+	ARQEnabled     bool
+	ARQActiveConns int
+
+	// eBPF 统计
+	EBPFStats map[string]uint64
+
+	// 运行时间
+	Uptime time.Duration
 }
+
+// =============================================================================
+// 配置
+// =============================================================================
+
+// SwitcherConfig 切换器配置
+type SwitcherConfig struct {
+	// 基础配置
+	Enabled           bool
+	CheckInterval     time.Duration
+	RTTThreshold      time.Duration
+	LossThreshold     float64
+	FailThreshold     int
+	RecoverThreshold  int
+	MinSwitchInterval time.Duration
+	MaxSwitchRate     int
+	CooldownPeriod    time.Duration
+
+	// 回退配置
+	EnableFallback bool
+	FallbackMode   TransportMode
+
+	// 探测配置
+	EnableProbe     bool
+	ProbeInterval   time.Duration
+	ProbePacketSize int
+	ProbeCount      int
+	ProbeTimeout    time.Duration
+
+	// 优先级
+	Priority []TransportMode
+
+	// 日志
+	LogLevel string
+}
+
+// =============================================================================
+// 决策结果
+// =============================================================================
 
 // SwitchDecision 切换决策
 type SwitchDecision struct {
@@ -144,105 +237,14 @@ type SwitchDecision struct {
 	TargetMode   TransportMode
 	Reason       SwitchReason
 	Confidence   float64
-	Alternatives []TransportMode
 }
 
-// SwitcherConfig 切换器内部配置
-type SwitcherConfig struct {
-	Enabled             bool
-	CheckInterval       time.Duration
-	ProbeInterval       time.Duration
-	RecoveryInterval    time.Duration
-	RTTThreshold        time.Duration
-	LossThreshold       float64
-	ThroughputThreshold float64
-	FailThreshold       int
-	RecoverThreshold    int
-	MinSwitchInterval   time.Duration
-	MaxSwitchRate       float64
-	CooldownPeriod      time.Duration
-	Priority            []TransportMode
-	EnableFallback      bool
-	FallbackMode        TransportMode
-	FallbackTimeout     time.Duration
-	EnableProbe         bool
-	ProbePacketSize     int
-	ProbeCount          int
-	ProbeTimeout        time.Duration
-	LogLevel            string
+// ProbeResult 探测结果
+type ProbeResult struct {
+	Mode      TransportMode
+	RTT       time.Duration
+	Loss      float64
+	Available bool
+	Error     error
+	Timestamp time.Time
 }
-
-// DefaultSwitcherConfig 默认配置
-func DefaultSwitcherConfig() *SwitcherConfig {
-	return &SwitcherConfig{
-		Enabled:             true,
-		CheckInterval:       time.Second,
-		ProbeInterval:       30 * time.Second,
-		RecoveryInterval:    10 * time.Second,
-		RTTThreshold:        300 * time.Millisecond,
-		LossThreshold:       0.10,
-		ThroughputThreshold: 100 * 1024,
-		FailThreshold:       3,
-		RecoverThreshold:    5,
-		MinSwitchInterval:   5 * time.Second,
-		MaxSwitchRate:       6,
-		CooldownPeriod:      10 * time.Second,
-		Priority: []TransportMode{
-			ModeEBPF,
-			ModeFakeTCP,
-			ModeUDP,
-			ModeWebSocket,
-		},
-		EnableFallback:  true,
-		FallbackMode:    ModeWebSocket,
-		FallbackTimeout: 30 * time.Second,
-		EnableProbe:     true,
-		ProbePacketSize: 64,
-		ProbeCount:      3,
-		ProbeTimeout:    5 * time.Second,
-		LogLevel:        "info",
-	}
-}
-
-// TransportHandler 传输层处理接口
-type TransportHandler interface {
-	Start() error
-	Stop() error
-	IsRunning() bool
-	Send(data []byte, addr *net.UDPAddr) error
-	GetState() TransportState
-	GetQuality() *LinkQuality
-	GetStats() map[string]interface{}
-	Probe(addr *net.UDPAddr) (time.Duration, error)
-}
-
-// SwitcherStats 切换器统计
-type SwitcherStats struct {
-	CurrentMode      TransportMode
-	CurrentState     TransportState
-	CurrentQuality   *LinkQuality
-	TotalSwitches    uint64
-	SuccessSwitches  uint64
-	FailedSwitches   uint64
-	LastSwitch       time.Time
-	LastSwitchReason SwitchReason
-	ModeStats        map[TransportMode]*ModeStats
-	Uptime           time.Duration
-	CurrentModeTime  time.Duration
-	ARQEnabled       bool
-	ARQActiveConns   int64
-	PortOwnership    PortOwnership // 新增：端口所有权状态
-}
-
-// ModeStats 模式统计
-type ModeStats struct {
-	Mode           TransportMode
-	State          TransportState
-	Quality        *LinkQuality
-	TotalTime      time.Duration
-	SwitchInCount  uint64
-	SwitchOutCount uint64
-	FailureCount   uint64
-	LastActive     time.Time
-}
-
