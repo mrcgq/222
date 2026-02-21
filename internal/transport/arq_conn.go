@@ -20,12 +20,12 @@ import (
 
 // 错误定义
 var (
-	ErrConnClosed     = fmt.Errorf("连接已关闭")
-	ErrConnNotReady   = fmt.Errorf("连接未建立")
-	ErrSendQueueFull  = fmt.Errorf("发送队列已满")
-	ErrRecvQueueFull  = fmt.Errorf("接收队列已满")
-	ErrConnTimeout    = fmt.Errorf("连接超时")
-	ErrInvalidState   = fmt.Errorf("无效状态")
+	ErrConnClosed    = fmt.Errorf("连接已关闭")
+	ErrConnNotReady  = fmt.Errorf("连接未建立")
+	ErrSendQueueFull = fmt.Errorf("发送队列已满")
+	ErrRecvQueueFull = fmt.Errorf("接收队列已满")
+	ErrConnTimeout   = fmt.Errorf("连接超时")
+	ErrInvalidState  = fmt.Errorf("无效状态")
 )
 
 // ARQConn ARQ 连接
@@ -307,7 +307,7 @@ func (c *ARQConn) handleSyn(pkt *ARQPacket) {
 func (c *ARQConn) closeEstablishedChannel() {
 	c.establishedMu.Lock()
 	defer c.establishedMu.Unlock()
-	
+
 	select {
 	case <-c.established:
 		// 已经关闭
@@ -375,7 +375,9 @@ func (c *ARQConn) handleData(pkt *ARQPacket) {
 	// 读取有序数据
 	orderedData := c.recvBuf.ReadOrdered()
 	for _, data := range orderedData {
-		// 使用非阻塞发送，但带有重试
+		// 修复：完全非阻塞入队
+		// 当队列满时直接丢弃，依靠 ARQ 机制让对端重传
+		// 彻底消除极端流量下的 Goroutine 泄漏风险
 		if !c.tryEnqueueRecv(data) {
 			atomic.AddUint64(&c.stats.RecvQueueDrops, 1)
 		}
@@ -390,25 +392,18 @@ func (c *ARQConn) handleData(pkt *ARQPacket) {
 	c.mu.Unlock()
 }
 
-// tryEnqueueRecv 尝试入队接收数据，带重试
+// tryEnqueueRecv 尝试入队接收数据
+// 修复：完全非阻塞，队列满时直接返回 false
+// 这是 ARQ (可靠传输)，丢弃后对方没有收到 ACK 会自动重传
+// 绝对不能在这里阻塞 Goroutine，否则在 DDoS 或极大吞吐时会耗尽资源
 func (c *ARQConn) tryEnqueueRecv(data []byte) bool {
-	// 首先尝试非阻塞
 	select {
 	case c.recvQueue <- data:
 		return true
 	default:
-	}
-
-	// 带超时重试
-	timer := time.NewTimer(100 * time.Millisecond)
-	defer timer.Stop()
-
-	select {
-	case c.recvQueue <- data:
-		return true
-	case <-timer.C:
-		return false
-	case <-c.ctx.Done():
+		// 核心修复：队列满时直接丢弃！
+		// 因为这是 ARQ (可靠传输)，丢弃后对方没有收到 ACK 会自动重传
+		// 绝对不能在这里阻塞 Goroutine
 		return false
 	}
 }
@@ -936,7 +931,7 @@ func (c *ARQConn) timeWait() {
 	case <-time.After(2 * c.rto):
 	case <-c.ctx.Done():
 	}
-	
+
 	c.mu.Lock()
 	c.state = ARQStateClosed
 	c.mu.Unlock()
@@ -1076,3 +1071,8 @@ func (c *ARQConn) WaitEstablished(ctx context.Context) error {
 		return nil
 	}
 }
+
+
+
+
+
