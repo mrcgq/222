@@ -1,3 +1,4 @@
+
 // internal/handler/client_handler.go
 package handler
 
@@ -46,8 +47,9 @@ const (
 	DefaultWSPath = "/ws"
 
 	// MinEncryptedPacketLen TSKD 加密包最小长度
-	// UserID(4) + Timestamp(2) + Nonce(12) = 18 字节最小头部
-	MinEncryptedPacketLen = 18
+	// UserID(4) + Timestamp(2) + Nonce(12) + Poly1305_Tag(16) = 34 字节最小头部
+	// 修复：原值 18 漏算了 ChaCha20-Poly1305 的 16 字节 MAC Tag
+	MinEncryptedPacketLen = 34
 )
 
 type Config struct {
@@ -332,6 +334,7 @@ func (h *PhantomClientHandler) receiveLoop() {
 
 		// 修复：过滤过短的包（不足以构成有效的 TSKD 加密包）
 		// 避免 WebSocket 控制帧等噪音进入解密流程
+		// 最小长度 = UserID(4) + Timestamp(2) + Nonce(12) + Tag(16) = 34
 		if n < MinEncryptedPacketLen {
 			continue
 		}
@@ -596,3 +599,6 @@ func (h *PhantomClientHandler) GetStats() Stats {
 		SessionsActive: int64(activeCount),
 	}
 }
+
+
+
