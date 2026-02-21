@@ -1,6 +1,9 @@
+
+
 // =============================================================================
 // 文件: internal/switcher/switcher.go
-// 描述: 智能链路切换器实现
+// 描述: 智能链路切换 - 核心切换器
+// 修复：初始化时创建 BlacklistManager 并注入 Handler
 // =============================================================================
 package switcher
 
@@ -13,686 +16,587 @@ import (
 	"time"
 
 	"github.com/mrcgq/211/internal/config"
+	"github.com/mrcgq/211/internal/congestion"
 	"github.com/mrcgq/211/internal/crypto"
+	ebpfpkg "github.com/mrcgq/211/internal/ebpf"
 	"github.com/mrcgq/211/internal/handler"
 	"github.com/mrcgq/211/internal/metrics"
+	"github.com/mrcgq/211/internal/transport"
 )
 
 // Switcher 智能链路切换器
 type Switcher struct {
 	cfg       *config.Config
-	swCfg     *SwitcherConfig
+	switchCfg *SwitcherConfig
 	crypto    *crypto.Crypto
 	handler   *handler.UnifiedHandler
 	metrics   *metrics.PhantomMetrics
 
-	// 当前状态
-	currentMode  TransportMode
-	currentState TransportState
-	startTime    time.Time
-	modeStart    time.Time
-	lastSwitch   time.Time
+	transports map[TransportMode]TransportHandler
+	udpServer  *transport.UDPServer
+	tcpServer  *transport.TCPServer
+	fakeTCP    *transport.FakeTCPServer
+	webSocket  *transport.WebSocketServer
+	ebpf       *transport.EBPFAccelerator
 
-	// 端口所有权
-	portOwnership PortOwnership
+	// eBPF 加载器（新增）
+	ebpfLoader *ebpfpkg.Loader
 
-	// 监听器
-	udpConn   *net.UDPConn
-	tcpLn     net.Listener
-	wsLn      net.Listener
-	fakeTCPLn net.Listener
+	congestion *congestion.Hysteria2Controller
 
-	// 统计
+	decision *DecisionEngine
+	prober   *Prober
+
+	currentMode TransportMode
+	modeStats   map[TransportMode]*ModeStats
+
+	// eBPF 是否成功挂载（作为 UDP 的加速插件）
+	ebpfAttached bool
+
+	// 异步质量更新队列
+	qualityUpdates chan *qualityUpdate
+
 	totalSwitches   uint64
 	successSwitches uint64
 	failedSwitches  uint64
-	modeStats       map[TransportMode]*ModeStats
-	switchHistory   []SwitchEvent
+	startTime       time.Time
+	modeStartTime   time.Time
 
-	// 功能标志
-	hasEBPF      bool
-	hasFakeTCP   bool
-	hasHysteria2 bool
-	hasARQ       bool
-	hasWebSocket bool
-
-	// ARQ 状态
-	arqEnabled     bool
-	arqActiveConns int64
-
-	// 控制
-	mu       sync.RWMutex
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
-	stopOnce sync.Once
+	mu       sync.RWMutex
+	logLevel int
 }
 
-// NewSwitcher 创建新的切换器
-func NewSwitcher(cfg *config.Config, cry *crypto.Crypto, h *handler.UnifiedHandler) *Switcher {
-	mode := TransportMode(cfg.Mode)
-	if mode == "" {
-		mode = ModeAuto
+// qualityUpdate 质量更新事件
+type qualityUpdate struct {
+	mode    TransportMode
+	success bool
+	bytes   int64
+	rtt     time.Duration
+}
+
+// arqHandlerWrapper ARQ 事件包装器
+type arqHandlerWrapper struct {
+	handler *handler.UnifiedHandler
+}
+
+func (h *arqHandlerWrapper) OnData(data []byte, from *net.UDPAddr) {
+	h.handler.HandlePacket(data, from)
+}
+
+func (h *arqHandlerWrapper) OnConnected(addr *net.UDPAddr) {}
+
+func (h *arqHandlerWrapper) OnDisconnected(addr *net.UDPAddr, reason error) {}
+
+// New 创建切换器
+func New(cfg *config.Config, cry *crypto.Crypto, h *handler.UnifiedHandler) *Switcher {
+	switchCfg := &SwitcherConfig{
+		Enabled:           cfg.Switcher.Enabled,
+		CheckInterval:     time.Duration(cfg.Switcher.CheckInterval) * time.Millisecond,
+		RTTThreshold:      time.Duration(cfg.Switcher.RTTThreshold) * time.Millisecond,
+		LossThreshold:     cfg.Switcher.LossThreshold,
+		FailThreshold:     cfg.Switcher.FailThreshold,
+		RecoverThreshold:  cfg.Switcher.RecoverThreshold,
+		MinSwitchInterval: 5 * time.Second,
+		MaxSwitchRate:     6,
+		CooldownPeriod:    10 * time.Second,
+		EnableFallback:    true,
+		FallbackMode:      ModeWebSocket,
+		EnableProbe:       true,
+		ProbeInterval:     30 * time.Second,
+		ProbePacketSize:   64,
+		ProbeCount:        3,
+		ProbeTimeout:      5 * time.Second,
+		LogLevel:          cfg.LogLevel,
 	}
 
-	sw := &Switcher{
-		cfg:           cfg,
-		swCfg:         DefaultSwitcherConfig(),
-		crypto:        cry,
-		handler:       h,
-		currentMode:   mode,
-		currentState:  StateStopped,
-		portOwnership: PortOwnerNone,
-		modeStats:     make(map[TransportMode]*ModeStats),
-		switchHistory: make([]SwitchEvent, 0, 100),
+	// 解析优先级 (过滤 ARQ)
+	for _, modeStr := range cfg.Switcher.Priority {
+		mode := TransportMode(modeStr)
+		if mode != "arq" {
+			switchCfg.Priority = append(switchCfg.Priority, mode)
+		}
+	}
+	if len(switchCfg.Priority) == 0 {
+		switchCfg.Priority = []TransportMode{ModeEBPF, ModeFakeTCP, ModeUDP, ModeWebSocket}
 	}
 
-	// 初始化模式统计
-	for _, m := range AllModes {
-		sw.modeStats[m] = &ModeStats{
-			Mode:  m,
-			State: StateStopped,
+	logLevel := 1
+	switch cfg.LogLevel {
+	case "debug":
+		logLevel = 2
+	case "error":
+		logLevel = 0
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := &Switcher{
+		cfg:            cfg,
+		switchCfg:      switchCfg,
+		crypto:         cry,
+		handler:        h,
+		transports:     make(map[TransportMode]TransportHandler),
+		decision:       NewDecisionEngine(switchCfg),
+		prober:         NewProber(switchCfg),
+		modeStats:      make(map[TransportMode]*ModeStats),
+		qualityUpdates: make(chan *qualityUpdate, 1000),
+		startTime:      time.Now(),
+		ctx:            ctx,
+		cancel:         cancel,
+		logLevel:       logLevel,
+	}
+
+	if cfg.Hysteria2.Enabled {
+		s.congestion = congestion.NewHysteria2Controller(
+			cfg.Hysteria2.UpMbps,
+			cfg.Hysteria2.DownMbps,
+		)
+	}
+
+	for _, mode := range AllModes {
+		s.modeStats[mode] = &ModeStats{
+			Mode:  mode,
+			State: StateUnknown,
 		}
 	}
 
-	// 检测功能
-	sw.detectFeatures()
-
-	return sw
-}
-
-// detectFeatures 检测可用功能
-func (s *Switcher) detectFeatures() {
-	// UDP + ARQ
-	s.hasARQ = s.cfg.ARQ.Enabled
-
-	// FakeTCP
-	s.hasFakeTCP = s.cfg.FakeTCP.Enabled
-
-	// WebSocket
-	s.hasWebSocket = s.cfg.WebSocket.Enabled
-
-	// Hysteria2 拥塞控制
-	s.hasHysteria2 = s.cfg.Hysteria2.Enabled
-
-	// eBPF (仅 Linux，需要 root)
-	s.hasEBPF = s.cfg.EBPF.Enabled && isEBPFAvailable()
+	return s
 }
 
 // SetMetrics 设置指标收集器
 func (s *Switcher) SetMetrics(m *metrics.PhantomMetrics) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.metrics = m
 }
 
 // Start 启动切换器
 func (s *Switcher) Start(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.log(1, "启动智能链路切换器...")
 
-	if s.currentState == StateRunning || s.currentState == StateStarting {
-		return fmt.Errorf("switcher already running")
-	}
-
-	s.ctx, s.cancel = context.WithCancel(ctx)
-	s.currentState = StateStarting
-	s.startTime = time.Now()
-
-	// 根据模式启动
-	var err error
-	switch s.currentMode {
-	case ModeAuto:
-		err = s.startAutoMode()
-	case ModeUDP:
-		err = s.startUDPMode()
-	case ModeFakeTCP:
-		err = s.startFakeTCPMode()
-	case ModeWebSocket:
-		err = s.startWebSocketMode()
-	case ModeEBPF:
-		err = s.startEBPFMode()
-	case ModeTCP:
-		err = s.startTCPMode()
-	default:
-		err = s.startUDPMode()
-	}
-
-	if err != nil {
-		s.currentState = StateFailed
-		return fmt.Errorf("start transport failed: %w", err)
-	}
-
-	s.currentState = StateRunning
-	s.modeStart = time.Now()
-
-	// 更新模式统计
-	if stats, ok := s.modeStats[s.currentMode]; ok {
-		stats.State = StateRunning
-		stats.SwitchInCount++
-		stats.LastActive = time.Now()
-	}
-
-	// 记录切换事件
-	s.recordSwitchEvent(TransportMode(""), s.currentMode, ReasonInitial, true)
-
-	// 启动监控协程
+	// 启动异步质量更新处理器
 	s.wg.Add(1)
-	go s.monitorLoop()
+	go s.qualityUpdateLoop()
 
-	return nil
-}
-
-// startAutoMode 自动模式启动 - 按优先级尝试
-func (s *Switcher) startAutoMode() error {
-	for _, mode := range s.swCfg.Priority {
-		var err error
-		switch mode {
-		case ModeEBPF:
-			if s.hasEBPF {
-				err = s.startEBPFMode()
-			} else {
-				continue
-			}
-		case ModeFakeTCP:
-			if s.hasFakeTCP {
-				err = s.startFakeTCPMode()
-			} else {
-				continue
-			}
-		case ModeUDP:
-			err = s.startUDPMode()
-		case ModeWebSocket:
-			if s.hasWebSocket {
-				err = s.startWebSocketMode()
-			} else {
-				continue
-			}
-		case ModeTCP:
-			err = s.startTCPMode()
-		default:
-			continue
-		}
-
-		if err == nil {
-			s.currentMode = mode
-			return nil
-		}
-	}
-
-	return fmt.Errorf("no available transport mode")
-}
-
-// startUDPMode 启动 UDP 模式
-func (s *Switcher) startUDPMode() error {
-	addr, err := net.ResolveUDPAddr("udp", s.cfg.Listen)
-	if err != nil {
-		return fmt.Errorf("resolve udp addr: %w", err)
-	}
-
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return fmt.Errorf("listen udp: %w", err)
-	}
-
-	// 设置缓冲区
-	conn.SetReadBuffer(4 * 1024 * 1024)
-	conn.SetWriteBuffer(4 * 1024 * 1024)
-
-	s.udpConn = conn
-	s.portOwnership = PortOwnerUDP
-	s.arqEnabled = s.cfg.ARQ.Enabled
-
-	// 启动 UDP 处理协程
-	s.wg.Add(1)
-	go s.handleUDP()
-
-	return nil
-}
-
-// startTCPMode 启动 TCP 模式
-func (s *Switcher) startTCPMode() error {
-	ln, err := net.Listen("tcp", s.cfg.Listen)
-	if err != nil {
-		return fmt.Errorf("listen tcp: %w", err)
-	}
-
-	s.tcpLn = ln
-
-	s.wg.Add(1)
-	go s.handleTCP()
-
-	return nil
-}
-
-// startFakeTCPMode 启动 FakeTCP 模式
-func (s *Switcher) startFakeTCPMode() error {
-	if !s.cfg.FakeTCP.Enabled {
-		return fmt.Errorf("faketcp not enabled in config")
-	}
-
-	listenAddr := s.cfg.FakeTCP.Listen
-	if listenAddr == "" {
-		listenAddr = s.cfg.Listen
-	}
-
-	// FakeTCP 实际上需要 raw socket，这里简化实现
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return fmt.Errorf("listen faketcp: %w", err)
-	}
-
-	s.fakeTCPLn = ln
-
-	s.wg.Add(1)
-	go s.handleFakeTCP()
-
-	return nil
-}
-
-// startWebSocketMode 启动 WebSocket 模式
-func (s *Switcher) startWebSocketMode() error {
-	if !s.cfg.WebSocket.Enabled {
-		return fmt.Errorf("websocket not enabled in config")
-	}
-
-	listenAddr := s.cfg.WebSocket.Listen
-	if listenAddr == "" {
-		return fmt.Errorf("websocket listen address not configured")
-	}
-
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return fmt.Errorf("listen websocket: %w", err)
-	}
-
-	s.wsLn = ln
-
-	s.wg.Add(1)
-	go s.handleWebSocket()
-
-	return nil
-}
-
-// startEBPFMode 启动 eBPF 模式
-func (s *Switcher) startEBPFMode() error {
-	if !s.hasEBPF {
-		return fmt.Errorf("ebpf not available")
-	}
-
-	// eBPF 模式需要独占端口
-	if s.portOwnership != PortOwnerNone && s.portOwnership != PortOwnerEBPF {
-		return fmt.Errorf("port already owned by %s", s.portOwnership)
-	}
-
-	// 实际的 eBPF 实现会在这里加载 BPF 程序
-	// 这里先回退到 UDP 模式
-	if err := s.startUDPMode(); err != nil {
+	if err := s.startTransports(ctx); err != nil {
 		return err
 	}
 
-	s.portOwnership = PortOwnerEBPF
+	s.handler.SetSender(s.SendTo)
+	s.selectInitialMode()
+
+	if s.switchCfg.Enabled {
+		s.wg.Add(1)
+		go s.monitorLoop()
+
+		if s.switchCfg.EnableProbe {
+			s.wg.Add(1)
+			go s.probeLoop()
+		}
+	}
+
+	s.log(1, "智能链路切换器已启动, 当前模式: %s, eBPF加速: %v", s.currentMode, s.ebpfAttached)
 	return nil
 }
 
-// handleUDP 处理 UDP 连接
-func (s *Switcher) handleUDP() {
+// qualityUpdateLoop 异步质量更新循环
+func (s *Switcher) qualityUpdateLoop() {
 	defer s.wg.Done()
 
-	buf := make([]byte, 65536)
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		default:
-		}
-
-		s.udpConn.SetReadDeadline(time.Now().Add(time.Second))
-		n, remoteAddr, err := s.udpConn.ReadFromUDP(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			select {
-			case <-s.ctx.Done():
+		case update, ok := <-s.qualityUpdates:
+			if !ok {
 				return
-			default:
-				continue
 			}
+			s.decision.UpdateQuality(update.mode, func(monitor *QualityMonitor) {
+				if update.success {
+					if update.rtt > 0 {
+						monitor.RecordRTT(update.rtt)
+					}
+					monitor.RecordPacket(true)
+					if update.bytes > 0 {
+						monitor.RecordBytes(update.bytes)
+					}
+				} else {
+					monitor.RecordPacket(false)
+				}
+			})
 		}
-
-		// 复制数据避免竞争
-		data := make([]byte, n)
-		copy(data, buf[:n])
-
-		// 处理数据包
-		go s.handler.HandleUDPPacket(s.udpConn, remoteAddr, data)
 	}
 }
 
-// handleTCP 处理 TCP 连接
-func (s *Switcher) handleTCP() {
-	defer s.wg.Done()
+// startTransports 启动所有传输层
+// 核心逻辑：UDP 始终先启动持有端口，eBPF 作为内核加速插件附加
+func (s *Switcher) startTransports(ctx context.Context) error {
+	logLevel := s.cfg.LogLevel
 
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
+	// ==========================================================================
+	// 1. UDP 服务器 (始终先启动，持有主端口)
+	// ==========================================================================
+	s.udpServer = transport.NewUDPServer(s.cfg.Listen, s.handler, logLevel)
+	if s.congestion != nil {
+		s.udpServer.SetCongestionController(s.congestion)
+	}
+
+	// 启用 ARQ 增强层
+	if s.cfg.ARQ.Enabled {
+		arqConfig := &transport.ARQConnConfig{
+			MaxWindowSize:   s.cfg.ARQ.WindowSize,
+			RTOMin:          time.Duration(s.cfg.ARQ.RTOMinMs) * time.Millisecond,
+			RTOMax:          time.Duration(s.cfg.ARQ.RTOMaxMs) * time.Millisecond,
+			MaxRetries:      s.cfg.ARQ.MaxRetries,
+			EnableSACK:      s.cfg.ARQ.EnableSACK,
+			EnableTimestamp: s.cfg.ARQ.EnableTimestamp,
+		}
+		arqHandler := &arqHandlerWrapper{handler: s.handler}
+		s.udpServer.EnableARQ(arqConfig, arqHandler)
+		s.log(1, "ARQ 增强层已启用 (窗口: %d)", s.cfg.ARQ.WindowSize)
+	}
+
+	if err := s.udpServer.Start(ctx); err != nil {
+		return fmt.Errorf("UDP 启动失败: %w", err)
+	}
+	s.registerTransport(ModeUDP, NewUDPTransportWrapper(s.udpServer))
+	s.modeStats[ModeUDP].State = StateRunning
+	s.log(1, "UDP 服务器已启动: %s", s.cfg.Listen)
+
+	// ==========================================================================
+	// 2. eBPF 加速插件 (附加到已有的 UDP 之上，不再监听端口)
+	// 修复：使用新的 eBPF Loader 并创建 BlacklistManager
+	// ==========================================================================
+	if s.cfg.EBPF.Enabled {
+		s.log(1, "正在加载 eBPF 加速插件...")
+
+		// 创建 eBPF 加载器
+		loaderConfig := &ebpfpkg.LoaderConfig{
+			ProgramPath: s.cfg.EBPF.ProgramPath,
+			Interface:   s.cfg.EBPF.Interface,
+			XDPMode:     s.cfg.EBPF.XDPMode,
+			MapSize:     s.cfg.EBPF.MapSize,
+			EnableStats: s.cfg.EBPF.EnableStats,
 		}
 
-		conn, err := s.tcpLn.Accept()
-		if err != nil {
-			select {
-			case <-s.ctx.Done():
-				return
-			default:
-				continue
+		s.ebpfLoader = ebpfpkg.NewLoader(loaderConfig)
+
+		// 加载 eBPF 程序
+		if err := s.ebpfLoader.Load(); err != nil {
+			s.log(1, "eBPF 程序加载失败: %v (使用标准 UDP 模式)", err)
+			s.ebpfLoader = nil
+		} else {
+			// 附加 XDP 程序
+			if err := s.ebpfLoader.Attach("xdp_phantom_main"); err != nil {
+				s.log(1, "eBPF XDP 附加失败: %v (使用标准 UDP 模式)", err)
+				s.ebpfLoader.Close()
+				s.ebpfLoader = nil
+			} else {
+				s.ebpfAttached = true
+				s.modeStats[ModeEBPF].State = StateRunning
+
+				// 修复：获取黑名单管理器并注入 Handler
+				if blacklistMgr := s.ebpfLoader.GetBlacklistManager(); blacklistMgr != nil {
+					s.handler.SetBlacklistManager(blacklistMgr)
+					s.log(1, "XDP 黑名单管理器已注入 Handler")
+				}
+
+				s.log(1, "eBPF 内核加速已就绪，正在加速 UDP 流量")
 			}
 		}
 
-		go s.handler.HandleTCPConn(conn)
+		// 兼容旧的 EBPFAccelerator（如果需要）
+		if s.ebpfLoader == nil {
+			s.ebpf = transport.NewEBPFAccelerator(
+				s.cfg.EBPF.Interface,
+				s.cfg.EBPF.XDPMode,
+				s.cfg.EBPF.ProgramPath,
+				s.cfg.EBPF.MapSize,
+				s.cfg.EBPF.EnableStats,
+				s.handler,
+				logLevel,
+			)
+
+			if err := s.ebpf.Start(ctx, s.cfg.Listen); err != nil {
+				s.log(1, "eBPF 加速挂载失败: %v (使用标准 UDP 模式)", err)
+				s.ebpf = nil
+			} else if s.ebpf.IsActive() {
+				s.ebpfAttached = true
+				s.registerTransport(ModeEBPF, NewEBPFTransportWrapper(s.ebpf))
+				s.modeStats[ModeEBPF].State = StateRunning
+				s.log(1, "eBPF 内核加速已就绪 (旧模式)")
+			} else {
+				s.log(1, "eBPF 未激活")
+				s.ebpf = nil
+			}
+		}
 	}
+
+	// ==========================================================================
+	// 3. TCP (使用相同端口，TCP 和 UDP 可以共存)
+	// ==========================================================================
+	s.tcpServer = transport.NewTCPServer(s.cfg.Listen, s.handler, logLevel)
+	if err := s.tcpServer.Start(ctx); err != nil {
+		s.log(1, "TCP 启动失败: %v (继续运行)", err)
+	} else {
+		s.registerTransport(ModeTCP, NewTCPTransportWrapper(s.tcpServer))
+		s.modeStats[ModeTCP].State = StateRunning
+	}
+
+	// ==========================================================================
+	// 4. FakeTCP (使用独立端口)
+	// ==========================================================================
+	if s.cfg.FakeTCP.Enabled {
+		s.fakeTCP = transport.NewFakeTCPServer(
+			s.cfg.FakeTCP.Listen,
+			s.cfg.FakeTCP.Interface,
+			s.handler,
+			logLevel,
+		)
+
+		if s.cfg.FakeTCP.UseEBPF && s.cfg.EBPF.ProgramPath != "" {
+			if err := s.fakeTCP.EnableEBPFTC(s.cfg.EBPF.ProgramPath); err != nil {
+				s.log(1, "FakeTCP eBPF TC 加速失败: %v (回退到用户态)", err)
+			}
+		}
+
+		if err := s.fakeTCP.Start(ctx); err != nil {
+			s.log(1, "FakeTCP 启动失败: %v", err)
+		} else {
+			s.registerTransport(ModeFakeTCP, NewFakeTCPTransportWrapper(s.fakeTCP))
+			s.modeStats[ModeFakeTCP].State = StateRunning
+		}
+	}
+
+	// ==========================================================================
+	// 5. WebSocket (使用独立端口)
+	// ==========================================================================
+	if s.cfg.WebSocket.Enabled {
+		s.webSocket = transport.NewWebSocketServer(
+			s.cfg.WebSocket.Listen,
+			s.cfg.WebSocket.Path,
+			s.cfg.WebSocket.Host,
+			s.cfg.WebSocket.TLS,
+			s.cfg.WebSocket.CertFile,
+			s.cfg.WebSocket.KeyFile,
+			s.handler,
+			logLevel,
+		)
+		if err := s.webSocket.Start(ctx); err != nil {
+			s.log(1, "WebSocket 启动失败: %v", err)
+		} else {
+			s.registerTransport(ModeWebSocket, NewWSTransportWrapper(s.webSocket))
+			s.modeStats[ModeWebSocket].State = StateRunning
+		}
+	}
+
+	return nil
 }
 
-// handleFakeTCP 处理 FakeTCP 连接
-func (s *Switcher) handleFakeTCP() {
-	defer s.wg.Done()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-
-		conn, err := s.fakeTCPLn.Accept()
-		if err != nil {
-			select {
-			case <-s.ctx.Done():
-				return
-			default:
-				continue
-			}
-		}
-
-		go s.handler.HandleTCPConn(conn)
-	}
+// registerTransport 注册传输层
+func (s *Switcher) registerTransport(mode TransportMode, handler TransportHandler) {
+	s.transports[mode] = handler
+	s.prober.RegisterTransport(mode, handler)
 }
 
-// handleWebSocket 处理 WebSocket 连接
-func (s *Switcher) handleWebSocket() {
-	defer s.wg.Done()
+// selectInitialMode 选择初始模式
+func (s *Switcher) selectInitialMode() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	for {
-		select {
-		case <-s.ctx.Done():
+	// 如果 eBPF 已挂载，优先使用 eBPF 模式
+	if s.ebpfAttached {
+		if stats, ok := s.modeStats[ModeEBPF]; ok && stats.State == StateRunning {
+			s.currentMode = ModeEBPF
+			s.modeStartTime = time.Now()
+			s.modeStats[ModeEBPF].LastActive = time.Now()
+			s.modeStats[ModeEBPF].SwitchInCount++
+			s.log(1, "初始模式: %s (内核加速)", ModeEBPF)
 			return
-		default:
 		}
-
-		conn, err := s.wsLn.Accept()
-		if err != nil {
-			select {
-			case <-s.ctx.Done():
-				return
-			default:
-				continue
-			}
-		}
-
-		go s.handler.HandleWebSocket(conn)
 	}
+
+	// 按优先级选择
+	for _, mode := range s.switchCfg.Priority {
+		if stats, ok := s.modeStats[mode]; ok && stats.State == StateRunning {
+			s.currentMode = mode
+			s.modeStartTime = time.Now()
+			s.modeStats[mode].LastActive = time.Now()
+			s.modeStats[mode].SwitchInCount++
+			s.log(1, "初始模式: %s", mode)
+			return
+		}
+	}
+
+	// 默认 UDP
+	s.currentMode = ModeUDP
+	s.modeStartTime = time.Now()
 }
 
 // monitorLoop 监控循环
 func (s *Switcher) monitorLoop() {
 	defer s.wg.Done()
 
-	checkTicker := time.NewTicker(s.swCfg.CheckInterval)
-	defer checkTicker.Stop()
-
-	probeTicker := time.NewTicker(s.swCfg.ProbeInterval)
-	defer probeTicker.Stop()
+	ticker := time.NewTicker(s.switchCfg.CheckInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-checkTicker.C:
-			s.checkQuality()
-		case <-probeTicker.C:
-			if s.swCfg.EnableProbe {
-				s.probeAlternatives()
-			}
+		case <-ticker.C:
+			s.checkAndSwitch()
 		}
 	}
 }
 
-// checkQuality 检查链路质量
-func (s *Switcher) checkQuality() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// checkAndSwitch 检查并切换
+func (s *Switcher) checkAndSwitch() {
+	s.mu.RLock()
+	currentMode := s.currentMode
+	s.mu.RUnlock()
 
-	// 更新当前模式统计
-	if stats, ok := s.modeStats[s.currentMode]; ok {
-		stats.TotalTime += s.swCfg.CheckInterval
-		stats.Quality = s.getCurrentQuality()
-	}
-
-	// 检查是否需要切换
-	decision := s.evaluateSwitchDecision()
-	if decision.ShouldSwitch {
-		s.executeSwitch(decision)
-	}
-}
-
-// getCurrentQuality 获取当前链路质量
-func (s *Switcher) getCurrentQuality() *LinkQuality {
-	// 从 handler 获取统计
-	handlerStats := s.handler.GetStats()
-
-	quality := &LinkQuality{
-		Available:   true,
-		State:       s.currentState,
-		LastCheck:   time.Now(),
-		LastSuccess: time.Now(),
-	}
-
-	if activeConns, ok := handlerStats["active_conns"].(uint64); ok {
-		quality.ActiveConns = int(activeConns)
-	}
-	if totalConns, ok := handlerStats["total_conns"].(uint64); ok {
-		quality.TotalConns = totalConns
-	}
-
-	return quality
-}
-
-// evaluateSwitchDecision 评估是否需要切换
-func (s *Switcher) evaluateSwitchDecision() *SwitchDecision {
-	decision := &SwitchDecision{
-		ShouldSwitch: false,
-		TargetMode:   s.currentMode,
-		Confidence:   0,
-	}
-
-	// 获取当前质量
-	quality := s.getCurrentQuality()
-	if quality == nil {
-		return decision
-	}
-
-	// 检查 RTT
-	if quality.RTT > s.swCfg.RTTThreshold {
-		decision.Reason = ReasonHighRTT
-		decision.Confidence = 0.7
-	}
-
-	// 检查丢包率
-	if quality.LossRate > s.swCfg.LossThreshold {
-		decision.Reason = ReasonHighLoss
-		decision.Confidence = 0.8
-	}
-
-	// 检查连续失败
-	if quality.ConsecutiveFailures >= s.swCfg.FailThreshold {
-		decision.Reason = ReasonConnectionFailed
-		decision.Confidence = 0.9
-		decision.ShouldSwitch = true
-	}
-
-	// 冷却检查
-	if decision.ShouldSwitch && time.Since(s.lastSwitch) < s.swCfg.CooldownPeriod {
-		decision.ShouldSwitch = false
-	}
-
-	// 选择目标模式
-	if decision.ShouldSwitch {
-		decision.TargetMode = s.selectBestAlternative()
-	}
-
-	return decision
-}
-
-// selectBestAlternative 选择最佳备选模式
-func (s *Switcher) selectBestAlternative() TransportMode {
-	for _, mode := range s.swCfg.Priority {
-		if mode == s.currentMode {
-			continue
-		}
-		if s.isModeAvailable(mode) {
-			return mode
-		}
-	}
-
-	if s.swCfg.EnableFallback {
-		return s.swCfg.FallbackMode
-	}
-
-	return s.currentMode
-}
-
-// isModeAvailable 检查模式是否可用
-func (s *Switcher) isModeAvailable(mode TransportMode) bool {
-	switch mode {
-	case ModeEBPF:
-		return s.hasEBPF
-	case ModeFakeTCP:
-		return s.hasFakeTCP
-	case ModeWebSocket:
-		return s.hasWebSocket
-	case ModeUDP, ModeTCP:
-		return true
-	default:
-		return false
-	}
-}
-
-// executeSwitch 执行切换
-func (s *Switcher) executeSwitch(decision *SwitchDecision) {
-	if decision.TargetMode == s.currentMode {
+	decision := s.decision.Evaluate(currentMode)
+	if !decision.ShouldSwitch {
 		return
 	}
 
-	oldMode := s.currentMode
-	s.currentState = StateDegraded
-
-	// 记录切换开始
-	atomic.AddUint64(&s.totalSwitches, 1)
-
-	// 更新旧模式统计
-	if stats, ok := s.modeStats[oldMode]; ok {
-		stats.SwitchOutCount++
-	}
-
-	// 切换到新模式 (简化版：仅更新状态)
-	s.currentMode = decision.TargetMode
-	s.lastSwitch = time.Now()
-	s.modeStart = time.Now()
-
-	// 更新新模式统计
-	if stats, ok := s.modeStats[s.currentMode]; ok {
-		stats.SwitchInCount++
-		stats.State = StateRunning
-		stats.LastActive = time.Now()
-	}
-
-	s.currentState = StateRunning
-	atomic.AddUint64(&s.successSwitches, 1)
-
-	// 记录切换事件
-	s.recordSwitchEvent(oldMode, s.currentMode, decision.Reason, true)
+	s.doSwitch(currentMode, decision.TargetMode, decision.Reason)
 }
 
-// probeAlternatives 探测备选模式
-func (s *Switcher) probeAlternatives() {
-	// 简化实现：仅更新可用性
+// doSwitch 执行切换
+func (s *Switcher) doSwitch(fromMode, toMode TransportMode, reason SwitchReason) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	for _, mode := range AllModes {
-		if mode == s.currentMode {
-			continue
-		}
-		if stats, ok := s.modeStats[mode]; ok {
-			stats.Quality = &LinkQuality{
-				Available: s.isModeAvailable(mode),
-				LastCheck: time.Now(),
-			}
-		}
+	if s.currentMode != fromMode {
+		s.mu.Unlock()
+		return
 	}
-}
 
-// recordSwitchEvent 记录切换事件
-func (s *Switcher) recordSwitchEvent(from, to TransportMode, reason SwitchReason, success bool) {
+	toStats, ok := s.modeStats[toMode]
+	if !ok || toStats.State != StateRunning {
+		s.mu.Unlock()
+		s.log(2, "目标模式 %s 不可用, 取消切换", toMode)
+		return
+	}
+
+	switchStart := time.Now()
+	oldMode := s.currentMode
+	s.currentMode = toMode
+	s.modeStartTime = time.Now()
+
+	if fromStats, ok := s.modeStats[fromMode]; ok {
+		fromStats.TotalTime += time.Since(fromStats.LastActive)
+		fromStats.SwitchOutCount++
+	}
+	toStats.LastActive = time.Now()
+	toStats.SwitchInCount++
+
+	s.mu.Unlock()
+
 	event := SwitchEvent{
 		Timestamp: time.Now(),
-		FromMode:  from,
-		ToMode:    to,
+		FromMode:  oldMode,
+		ToMode:    toMode,
 		Reason:    reason,
-		Success:   success,
+		Success:   true,
+		Duration:  time.Since(switchStart),
 	}
 
-	// 保留最近 100 个事件
-	if len(s.switchHistory) >= 100 {
-		s.switchHistory = s.switchHistory[1:]
+	s.decision.RecordSwitch(event)
+	atomic.AddUint64(&s.totalSwitches, 1)
+	atomic.AddUint64(&s.successSwitches, 1)
+
+	if s.metrics != nil {
+		s.metrics.RecordModeSwitch(string(oldMode), string(toMode))
 	}
-	s.switchHistory = append(s.switchHistory, event)
+
+	s.log(1, "链路切换: %s -> %s (原因: %s, 耗时: %v)",
+		oldMode, toMode, reason, event.Duration)
 }
 
-// Stop 停止切换器
-func (s *Switcher) Stop() {
-	s.stopOnce.Do(func() {
+// probeLoop 探测循环
+func (s *Switcher) probeLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(s.switchCfg.ProbeInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.probeInactiveModes()
+		}
+	}
+}
+
+// probeInactiveModes 探测非活跃模式
+func (s *Switcher) probeInactiveModes() {
+	s.mu.RLock()
+	currentMode := s.currentMode
+	s.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(s.ctx, s.switchCfg.ProbeTimeout*3)
+	defer cancel()
+
+	for mode, t := range s.transports {
+		if mode == currentMode {
+			continue
+		}
+
+		if !t.IsRunning() {
+			continue
+		}
+
+		result := s.prober.ProbeMode(ctx, mode)
+
+		s.decision.RecordProbeResult(mode, result.RTT, result.Available)
+
 		s.mu.Lock()
-		s.currentState = StateStopped
+		if stats, ok := s.modeStats[mode]; ok {
+			if result.Available {
+				stats.State = StateRunning
+			} else {
+				stats.State = StateDegraded
+			}
+		}
 		s.mu.Unlock()
 
-		if s.cancel != nil {
-			s.cancel()
-		}
+		s.log(2, "探测 %s: RTT=%v, 可用=%v", mode, result.RTT, result.Available)
+	}
+}
 
-		// 关闭监听器
-		if s.udpConn != nil {
-			s.udpConn.Close()
-		}
-		if s.tcpLn != nil {
-			s.tcpLn.Close()
-		}
-		if s.wsLn != nil {
-			s.wsLn.Close()
-		}
-		if s.fakeTCPLn != nil {
-			s.fakeTCPLn.Close()
-		}
+// SendTo 发送数据
+func (s *Switcher) SendTo(data []byte, addr *net.UDPAddr) error {
+	s.mu.RLock()
+	mode := s.currentMode
+	t := s.transports[mode]
+	s.mu.RUnlock()
 
-		// 等待所有协程退出
-		s.wg.Wait()
+	if t == nil {
+		return fmt.Errorf("传输层不可用: %s", mode)
+	}
 
-		s.mu.Lock()
-		s.portOwnership = PortOwnerNone
-		s.mu.Unlock()
-	})
+	err := t.Send(data, addr)
+
+	// 异步更新质量
+	select {
+	case s.qualityUpdates <- &qualityUpdate{
+		mode:    mode,
+		success: err == nil,
+		bytes:   int64(len(data)),
+	}:
+	default:
+	}
+
+	if s.metrics != nil && err == nil {
+		s.metrics.AddBytesSent(int64(len(data)))
+	}
+
+	return err
 }
 
 // CurrentMode 获取当前模式
@@ -702,90 +606,165 @@ func (s *Switcher) CurrentMode() string {
 	return string(s.currentMode)
 }
 
+// HasEBPF 是否启用 eBPF
+func (s *Switcher) HasEBPF() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ebpfAttached
+}
+
+// HasFakeTCP 是否启用 FakeTCP
+func (s *Switcher) HasFakeTCP() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	stats, ok := s.modeStats[ModeFakeTCP]
+	return ok && stats.State == StateRunning
+}
+
+// HasHysteria2 是否启用 Hysteria2
+func (s *Switcher) HasHysteria2() bool {
+	return s.congestion != nil
+}
+
+// HasWebSocket 是否启用 WebSocket
+func (s *Switcher) HasWebSocket() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	stats, ok := s.modeStats[ModeWebSocket]
+	return ok && stats.State == StateRunning
+}
+
+// HasARQ 是否启用 ARQ
+func (s *Switcher) HasARQ() bool {
+	return s.cfg.ARQ.Enabled && s.udpServer != nil && s.udpServer.GetARQManager() != nil
+}
+
+// GetEBPFLoader 获取 eBPF 加载器（新增）
+func (s *Switcher) GetEBPFLoader() *ebpfpkg.Loader {
+	return s.ebpfLoader
+}
+
+// SwitchMode 手动切换模式
+func (s *Switcher) SwitchMode(mode TransportMode) error {
+	s.mu.RLock()
+	currentMode := s.currentMode
+	stats, ok := s.modeStats[mode]
+	s.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("未知模式: %s", mode)
+	}
+
+	if stats.State != StateRunning {
+		return fmt.Errorf("模式不可用: %s", mode)
+	}
+
+	s.doSwitch(currentMode, mode, ReasonManual)
+	return nil
+}
+
 // GetStats 获取统计信息
-func (s *Switcher) GetStats() SwitcherStats {
+func (s *Switcher) GetStats() *SwitcherStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var uptime, modeTime time.Duration
-	if !s.startTime.IsZero() {
-		uptime = time.Since(s.startTime)
-	}
-	if !s.modeStart.IsZero() {
-		modeTime = time.Since(s.modeStart)
-	}
-
-	stats := SwitcherStats{
+	stats := &SwitcherStats{
 		CurrentMode:     s.currentMode,
-		CurrentState:    s.currentState,
-		CurrentQuality:  s.getCurrentQuality(),
 		TotalSwitches:   atomic.LoadUint64(&s.totalSwitches),
 		SuccessSwitches: atomic.LoadUint64(&s.successSwitches),
 		FailedSwitches:  atomic.LoadUint64(&s.failedSwitches),
-		LastSwitch:      s.lastSwitch,
+		Uptime:          time.Since(s.startTime),
+		CurrentModeTime: time.Since(s.modeStartTime),
 		ModeStats:       make(map[TransportMode]*ModeStats),
-		Uptime:          uptime,
-		CurrentModeTime: modeTime,
-		ARQEnabled:      s.arqEnabled,
-		ARQActiveConns:  atomic.LoadInt64(&s.arqActiveConns),
-		PortOwnership:   s.portOwnership,
+		ARQEnabled:      s.cfg.ARQ.Enabled,
 	}
 
-	// 复制模式统计
-	for mode, ms := range s.modeStats {
-		stats.ModeStats[mode] = &ModeStats{
-			Mode:           ms.Mode,
-			State:          ms.State,
-			Quality:        ms.Quality,
-			TotalTime:      ms.TotalTime,
-			SwitchInCount:  ms.SwitchInCount,
-			SwitchOutCount: ms.SwitchOutCount,
-			FailureCount:   ms.FailureCount,
-			LastActive:     ms.LastActive,
+	if monitor := s.decision.GetQualityMonitor(s.currentMode); monitor != nil {
+		stats.CurrentQuality = monitor.GetQuality()
+		stats.CurrentState = stats.CurrentQuality.State
+	} else {
+		stats.CurrentState = StateRunning
+	}
+
+	for mode, modeStats := range s.modeStats {
+		statsCopy := *modeStats
+		if monitor := s.decision.GetQualityMonitor(mode); monitor != nil {
+			statsCopy.Quality = monitor.GetQuality()
 		}
+		stats.ModeStats[mode] = &statsCopy
+	}
+
+	if s.udpServer != nil && s.udpServer.GetARQManager() != nil {
+		stats.ARQActiveConns = s.udpServer.GetARQManager().GetActiveConns()
+	}
+
+	// 添加 eBPF 统计（新增）
+	if s.ebpfLoader != nil {
+		if ebpfStats, err := s.ebpfLoader.GetStats(); err == nil {
+			stats.EBPFStats = map[string]uint64{
+				"blacklist_hits":  ebpfStats.BlacklistHits,
+				"ratelimit_hits":  ebpfStats.RatelimitHits,
+				"packets_dropped": ebpfStats.PacketsDropped,
+				"packets_passed":  ebpfStats.PacketsPassed,
+			}
+		}
+	}
+
+	history := s.decision.GetSwitchHistory(1)
+	if len(history) > 0 {
+		stats.LastSwitch = history[0].Timestamp
+		stats.LastSwitchReason = history[0].Reason
 	}
 
 	return stats
 }
 
-// HasEBPF 检查 eBPF 是否可用
-func (s *Switcher) HasEBPF() bool {
-	return s.hasEBPF
+// Stop 停止切换器
+func (s *Switcher) Stop() {
+	s.log(1, "停止智能链路切换器...")
+	s.cancel()
+
+	s.prober.Stop()
+
+	if s.udpServer != nil {
+		s.udpServer.Stop()
+	}
+	if s.tcpServer != nil {
+		s.tcpServer.Stop()
+	}
+	if s.fakeTCP != nil {
+		s.fakeTCP.Stop()
+	}
+	if s.webSocket != nil {
+		s.webSocket.Stop()
+	}
+	if s.ebpf != nil {
+		s.ebpf.Stop()
+	}
+
+	// 关闭 eBPF 加载器（新增）
+	if s.ebpfLoader != nil {
+		s.ebpfLoader.Close()
+		s.ebpfLoader = nil
+	}
+
+	close(s.qualityUpdates)
+	s.wg.Wait()
+	s.log(1, "智能链路切换器已停止")
 }
 
-// HasFakeTCP 检查 FakeTCP 是否可用
-func (s *Switcher) HasFakeTCP() bool {
-	return s.hasFakeTCP
+func (s *Switcher) log(level int, format string, args ...interface{}) {
+	if level > s.logLevel {
+		return
+	}
+	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
+	fmt.Printf("%s %s [Switcher] %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
 
-// HasHysteria2 检查 Hysteria2 是否可用
-func (s *Switcher) HasHysteria2() bool {
-	return s.hasHysteria2
-}
 
-// HasARQ 检查 ARQ 是否可用
-func (s *Switcher) HasARQ() bool {
-	return s.hasARQ
-}
 
-// HasWebSocket 检查 WebSocket 是否可用
-func (s *Switcher) HasWebSocket() bool {
-	return s.hasWebSocket
-}
 
-// GetSwitchHistory 获取切换历史
-func (s *Switcher) GetSwitchHistory() []SwitchEvent {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	history := make([]SwitchEvent, len(s.switchHistory))
-	copy(history, s.switchHistory)
-	return history
-}
 
-// isEBPFAvailable 检查 eBPF 是否可用
-func isEBPFAvailable() bool {
-	// 简化检查：实际应检查内核版本、CAP_BPF 等
-	// Linux 4.15+ 且需要 root 或 CAP_BPF
-	return false // 默认禁用，需要显式启用
-}
+
+
