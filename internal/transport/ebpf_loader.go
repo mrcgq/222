@@ -773,7 +773,3 @@ func getInterfaceByName(name string) (*netInterface, error) {
 	}, nil
 }
 
-
-
-
-
