@@ -1,6 +1,9 @@
+
+
 // =============================================================================
 // 文件: internal/handler/unified_handler.go
 // 描述: 统一处理器 - 用户态核心处理中心
+// 修复：集成黑名单管理器，解密失败时调用 IncrementFailCount()
 // =============================================================================
 package handler
 
@@ -9,12 +12,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/mrcgq/211/internal/config"
 	"github.com/mrcgq/211/internal/crypto"
+	ebpfpkg "github.com/mrcgq/211/internal/ebpf"
 	"github.com/mrcgq/211/internal/metrics"
 	"github.com/mrcgq/211/internal/protocol"
 	"github.com/mrcgq/211/internal/transport"
@@ -49,48 +54,22 @@ const (
 // 类型定义
 // =============================================================================
 
-// Sender 标准发送函数类型（用于 UDP）
 type Sender func(data []byte, addr *net.UDPAddr) error
 
-// ResponseWriter 响应写入器接口（用于同步回传）
-type ResponseWriter interface {
-	Write(data []byte) error
-}
-
-// ResponseWriterFunc 函数适配器
-type ResponseWriterFunc func(data []byte) error
-
-func (f ResponseWriterFunc) Write(data []byte) error {
-	return f(data)
-}
-
-// PacketContext 数据包处理上下文
-type PacketContext struct {
-	From           *net.UDPAddr
-	ResponseWriter ResponseWriter // 如果非 nil，使用同步回传
-	Responses      [][]byte       // 收集需要回传的响应
-	mu             sync.Mutex
-}
-
-// AddResponse 添加响应数据
-func (pc *PacketContext) AddResponse(data []byte) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-	pc.Responses = append(pc.Responses, data)
-}
-
-// UnifiedHandler 统一处理器
 type UnifiedHandler struct {
 	crypto  *crypto.Crypto
 	cfg     *config.Config
 	metrics *metrics.PhantomMetrics
+
+	// 黑名单管理器（新增）
+	blacklistMgr *ebpfpkg.BlacklistManager
 
 	logLevel int
 
 	connections sync.Map
 	sessions    sync.Map
 
-	sender Sender // UDP 异步发送器
+	sender Sender
 
 	stats handlerStats
 
@@ -98,7 +77,6 @@ type UnifiedHandler struct {
 	cancel context.CancelFunc
 }
 
-// ProxyConnection 代理连接
 type ProxyConnection struct {
 	ID         uint32
 	Target     net.Conn
@@ -111,13 +89,8 @@ type ProxyConnection struct {
 	BytesRecv  uint64
 	closed     int32
 	mu         sync.Mutex
-
-	// 用于 WebSocket 的同步响应通道
-	responseChan   chan []byte
-	responseWriter ResponseWriter
 }
 
-// ClientSession 客户端会话
 type ClientSession struct {
 	Addr       *net.UDPAddr
 	LastActive time.Time
@@ -125,7 +98,6 @@ type ClientSession struct {
 	mu         sync.Mutex
 }
 
-// handlerStats 处理器统计
 type handlerStats struct {
 	totalConns     uint64
 	activeConns    int64
@@ -134,13 +106,13 @@ type handlerStats struct {
 	replayBlocked  uint64
 	decryptErrors  uint64
 	heartbeatsRecv uint64
+	xdpBlocked     uint64 // XDP 封禁次数（新增）
 }
 
 // =============================================================================
 // 构造函数
 // =============================================================================
 
-// NewUnifiedHandler 创建统一处理器
 func NewUnifiedHandler(c *crypto.Crypto, cfg *config.Config) *UnifiedHandler {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -172,17 +144,25 @@ func parseLogLevel(level string) int {
 // 公共接口
 // =============================================================================
 
-// SetMetrics 设置指标收集器
 func (h *UnifiedHandler) SetMetrics(m *metrics.PhantomMetrics) {
 	h.metrics = m
 }
 
-// SetSender 设置 UDP 发送器
 func (h *UnifiedHandler) SetSender(fn Sender) {
 	h.sender = fn
 }
 
-// Close 关闭处理器
+// SetBlacklistManager 设置黑名单管理器（新增）
+func (h *UnifiedHandler) SetBlacklistManager(mgr *ebpfpkg.BlacklistManager) {
+	h.blacklistMgr = mgr
+	h.log(LogLevelInfo, "XDP 黑名单管理器已启用")
+}
+
+// GetBlacklistManager 获取黑名单管理器（新增）
+func (h *UnifiedHandler) GetBlacklistManager() *ebpfpkg.BlacklistManager {
+	return h.blacklistMgr
+}
+
 func (h *UnifiedHandler) Close() error {
 	h.cancel()
 
@@ -196,9 +176,8 @@ func (h *UnifiedHandler) Close() error {
 	return nil
 }
 
-// GetStats 获取统计信息
 func (h *UnifiedHandler) GetStats() map[string]interface{} {
-	return map[string]interface{}{
+	stats := map[string]interface{}{
 		"total_conns":     atomic.LoadUint64(&h.stats.totalConns),
 		"active_conns":    atomic.LoadInt64(&h.stats.activeConns),
 		"total_bytes":     atomic.LoadUint64(&h.stats.totalBytes),
@@ -206,131 +185,162 @@ func (h *UnifiedHandler) GetStats() map[string]interface{} {
 		"replay_blocked":  atomic.LoadUint64(&h.stats.replayBlocked),
 		"decrypt_errors":  atomic.LoadUint64(&h.stats.decryptErrors),
 		"heartbeats_recv": atomic.LoadUint64(&h.stats.heartbeatsRecv),
+		"xdp_blocked":     atomic.LoadUint64(&h.stats.xdpBlocked),
 	}
+
+	// 如果黑名单管理器可用，添加黑名单统计
+	if h.blacklistMgr != nil {
+		blStats := h.blacklistMgr.GetStats()
+		stats["blacklist_ipv4_count"] = blStats.BlockedIPv4Count
+		stats["blacklist_ipv6_count"] = blStats.BlockedIPv6Count
+		stats["blacklist_blocked_packets"] = blStats.TotalBlockedPackets
+		stats["blacklist_blocked_bytes"] = blStats.TotalBlockedBytes
+	}
+
+	return stats
 }
 
-// GetActiveConns 获取活跃连接数
 func (h *UnifiedHandler) GetActiveConns() int64 {
 	return atomic.LoadInt64(&h.stats.activeConns)
 }
 
-// GetAuthFailures 获取认证失败次数
 func (h *UnifiedHandler) GetAuthFailures() uint64 {
 	return atomic.LoadUint64(&h.stats.authFailures)
 }
 
-// GetReplayBlocked 获取重放攻击拦截次数
 func (h *UnifiedHandler) GetReplayBlocked() uint64 {
 	return atomic.LoadUint64(&h.stats.replayBlocked)
 }
 
+func (h *UnifiedHandler) GetXDPBlocked() uint64 {
+	return atomic.LoadUint64(&h.stats.xdpBlocked)
+}
+
 // =============================================================================
-// UDP 数据包处理（异步模式）
+// UDP 数据包处理
 // =============================================================================
 
-// HandlePacket 处理 UDP 数据包（异步模式，使用全局 sender）
 func (h *UnifiedHandler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
-	pctx := &PacketContext{
-		From:           from,
-		ResponseWriter: nil, // 异步模式
-	}
-	h.handlePacketWithContext(data, pctx)
-	return nil // UDP 模式下响应通过 sender 异步发送
-}
-
-// HandlePacketSync 处理数据包（同步模式，用于 WebSocket）
-// 返回需要回传的响应数据
-func (h *UnifiedHandler) HandlePacketSync(data []byte, from *net.UDPAddr, writer ResponseWriter) [][]byte {
-	pctx := &PacketContext{
-		From:           from,
-		ResponseWriter: writer,
-		Responses:      make([][]byte, 0, 2),
-	}
-	h.handlePacketWithContext(data, pctx)
-	return pctx.Responses
-}
-
-// handlePacketWithContext 带上下文的数据包处理
-func (h *UnifiedHandler) handlePacketWithContext(data []byte, pctx *PacketContext) {
 	// 1. 解密数据
 	plaintext, err := h.crypto.Decrypt(data)
 	if err != nil {
-		atomic.AddUint64(&h.stats.decryptErrors, 1)
-
-		errStr := err.Error()
-		if contains(errStr, "UserID") {
-			atomic.AddUint64(&h.stats.authFailures, 1)
-		} else if contains(errStr, "重放") || contains(errStr, "replay") {
-			atomic.AddUint64(&h.stats.replayBlocked, 1)
-		}
-
-		h.log(LogLevelDebug, "解密失败: %v", err)
-		return
+		// 修复：解密失败时触发黑名单机制
+		h.handleDecryptionFailure(from, err)
+		return nil
 	}
 
 	// 2. 解析协议请求
 	req, err := protocol.ParseRequest(plaintext)
 	if err != nil {
 		h.log(LogLevelDebug, "解析请求失败: %v", err)
-		return
+		return nil
 	}
 
 	// 3. 更新会话信息
-	h.updateSession(pctx.From, req.ReqID)
+	h.updateSession(from, req.ReqID)
 
 	// 4. 根据请求类型分发处理
 	switch req.Type {
 	case protocol.TypeConnect:
-		h.handleConnect(req, pctx)
+		h.handleUDPConnect(req, from)
 
 	case protocol.TypeData:
-		h.handleData(req, pctx)
+		h.handleUDPData(req, from)
 
 	case protocol.TypeClose:
-		h.handleClose(req)
+		h.handleUDPClose(req)
 
 	case protocol.TypeHeartbeat:
 		atomic.AddUint64(&h.stats.heartbeatsRecv, 1)
-		h.handleHeartbeat(req, pctx)
+		h.handleUDPHeartbeat(req, from)
 
 	default:
 		h.log(LogLevelDebug, "未知请求类型: 0x%02X", req.Type)
 	}
+
+	return nil
 }
 
-// handleConnect 处理连接请求
-func (h *UnifiedHandler) handleConnect(req *protocol.Request, pctx *PacketContext) {
+// handleDecryptionFailure 处理解密失败
+// 修复：触发 XDP 黑名单机制，将恶意 IP 写入内核 Map
+func (h *UnifiedHandler) handleDecryptionFailure(from *net.UDPAddr, err error) {
+	// 记录解密失败统计
+	atomic.AddUint64(&h.stats.decryptErrors, 1)
+
+	errStr := err.Error()
+
+	// 判断错误类型
+	var reason uint8 = ebpfpkg.BlockFlagAuthFail
+
+	if strings.Contains(errStr, "重放") || strings.Contains(errStr, "replay") {
+		reason = ebpfpkg.BlockFlagReplay
+		atomic.AddUint64(&h.stats.replayBlocked, 1)
+	} else if strings.Contains(errStr, "UserID") {
+		reason = ebpfpkg.BlockFlagAuthFail
+		atomic.AddUint64(&h.stats.authFailures, 1)
+	} else if strings.Contains(errStr, "时间戳") || strings.Contains(errStr, "timestamp") {
+		reason = ebpfpkg.BlockFlagAuthFail
+		atomic.AddUint64(&h.stats.authFailures, 1)
+	} else if strings.Contains(errStr, "太短") || strings.Contains(errStr, "short") {
+		reason = ebpfpkg.BlockFlagMalformed
+	}
+
+	// 如果黑名单管理器可用，增加失败计数
+	if h.blacklistMgr != nil {
+		failCount, blocked := h.blacklistMgr.IncrementFailCount(from.IP, reason)
+
+		if blocked {
+			atomic.AddUint64(&h.stats.xdpBlocked, 1)
+			h.log(LogLevelError, "🚫 触发内核护盾! 恶意 IP %s 已被 XDP 封禁 (失败: %d次, 原因: %d)",
+				from.IP, failCount, reason)
+		} else if failCount%5 == 0 && failCount > 0 {
+			// 每 5 次报一次警，防日志刷屏
+			h.log(LogLevelDebug, "⚠️ 发现探测: IP %s 认证失败 %d 次", from.IP, failCount)
+		}
+	} else {
+		h.log(LogLevelDebug, "解密失败: %v (黑名单未启用)", err)
+	}
+}
+
+func (h *UnifiedHandler) handleUDPHeartbeat(req *protocol.Request, from *net.UDPAddr) {
+	h.log(LogLevelDebug, "收到心跳: ID:%d from %s", req.ReqID, from.String())
+
+	resp := protocol.BuildHeartbeatResponse(req.ReqID)
+	encrypted, err := h.crypto.Encrypt(resp)
+	if err != nil {
+		h.log(LogLevelError, "加密心跳响应失败: %v", err)
+		return
+	}
+
+	if h.sender != nil {
+		h.sender(encrypted, from)
+	}
+}
+
+func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAddr) {
 	network := req.NetworkString()
 	target := req.TargetAddr()
 
-	h.log(LogLevelInfo, "Connect: %s %s (ID:%d) from %s",
-		network, target, req.ReqID, pctx.From.String())
+	h.log(LogLevelInfo, "UDP Connect: %s %s (ID:%d) from %s",
+		network, target, req.ReqID, from.String())
 
-	// 连接目标
 	targetConn, err := net.DialTimeout(network, target, connectTimeout)
 	if err != nil {
 		h.log(LogLevelDebug, "连接目标失败: %s - %v", target, err)
-		h.sendResponse(req.ReqID, StatusError, nil, pctx)
+		h.sendUDPResponse(req.ReqID, StatusError, nil, from)
 		return
 	}
 
 	h.configureTCPConnection(targetConn)
 
-	// 创建代理连接
 	conn := &ProxyConnection{
-		ID:             req.ReqID,
-		Target:         targetConn,
-		ClientAddr:     pctx.From,
-		Network:        network,
-		TargetAddr:     target,
-		CreatedAt:      time.Now(),
-		LastActive:     time.Now(),
-		responseWriter: pctx.ResponseWriter,
-	}
-
-	// 如果是同步模式（WebSocket），创建响应通道
-	if pctx.ResponseWriter != nil {
-		conn.responseChan = make(chan []byte, 64)
+		ID:         req.ReqID,
+		Target:     targetConn,
+		ClientAddr: from,
+		Network:    network,
+		TargetAddr: target,
+		CreatedAt:  time.Now(),
+		LastActive: time.Now(),
 	}
 
 	h.connections.Store(req.ReqID, conn)
@@ -341,22 +351,18 @@ func (h *UnifiedHandler) handleConnect(req *protocol.Request, pctx *PacketContex
 		h.metrics.IncConnections()
 	}
 
-	// 发送初始数据（如果有）
 	if len(req.Data) > 0 {
 		if err := h.writeToTarget(conn, req.Data); err != nil {
 			h.log(LogLevelDebug, "发送初始数据失败: %v", err)
 		}
 	}
 
-	// 发送连接成功响应
-	h.sendResponse(req.ReqID, StatusOK, nil, pctx)
+	h.sendUDPResponse(req.ReqID, StatusOK, nil, from)
 
-	// 启动读取循环
-	go h.readLoop(conn, pctx.ResponseWriter)
+	go h.udpReadLoop(conn)
 }
 
-// handleData 处理数据请求
-func (h *UnifiedHandler) handleData(req *protocol.Request, pctx *PacketContext) {
+func (h *UnifiedHandler) handleUDPData(req *protocol.Request, from *net.UDPAddr) {
 	conn := h.getConnection(req.ReqID)
 	if conn == nil {
 		h.log(LogLevelDebug, "连接不存在: ID:%d", req.ReqID)
@@ -365,11 +371,7 @@ func (h *UnifiedHandler) handleData(req *protocol.Request, pctx *PacketContext) 
 
 	conn.mu.Lock()
 	conn.LastActive = time.Now()
-	conn.ClientAddr = pctx.From
-	// 更新响应写入器（WebSocket 连接可能重连）
-	if pctx.ResponseWriter != nil {
-		conn.responseWriter = pctx.ResponseWriter
-	}
+	conn.ClientAddr = from
 	conn.mu.Unlock()
 
 	if len(req.Data) > 0 {
@@ -380,21 +382,12 @@ func (h *UnifiedHandler) handleData(req *protocol.Request, pctx *PacketContext) 
 	}
 }
 
-// handleClose 处理关闭请求
-func (h *UnifiedHandler) handleClose(req *protocol.Request) {
-	h.log(LogLevelInfo, "Close: ID:%d", req.ReqID)
+func (h *UnifiedHandler) handleUDPClose(req *protocol.Request) {
+	h.log(LogLevelInfo, "UDP Close: ID:%d", req.ReqID)
 	h.closeConnection(req.ReqID)
 }
 
-// handleHeartbeat 处理心跳请求
-func (h *UnifiedHandler) handleHeartbeat(req *protocol.Request, pctx *PacketContext) {
-	h.log(LogLevelDebug, "收到心跳: ID:%d from %s", req.ReqID, pctx.From.String())
-	resp := protocol.BuildHeartbeatResponse(req.ReqID)
-	h.sendEncryptedResponse(resp, pctx)
-}
-
-// readLoop 从目标服务器读取数据并回传给客户端
-func (h *UnifiedHandler) readLoop(conn *ProxyConnection, syncWriter ResponseWriter) {
+func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 	defer h.closeConnection(conn.ID)
 
 	buf := make([]byte, readBufferSize)
@@ -417,7 +410,6 @@ func (h *UnifiedHandler) readLoop(conn *ProxyConnection, syncWriter ResponseWrit
 		conn.mu.Lock()
 		conn.LastActive = time.Now()
 		clientAddr := conn.ClientAddr
-		currentWriter := conn.responseWriter
 		conn.mu.Unlock()
 
 		atomic.AddUint64(&conn.BytesRecv, uint64(n))
@@ -427,63 +419,28 @@ func (h *UnifiedHandler) readLoop(conn *ProxyConnection, syncWriter ResponseWrit
 			h.metrics.AddBytesReceived(int64(n))
 		}
 
-		// 构建响应
-		resp := protocol.BuildResponse(conn.ID, protocol.TypeData, buf[:n])
-		encrypted, err := h.crypto.Encrypt(resp)
-		if err != nil {
-			h.log(LogLevelError, "加密响应失败: %v", err)
-			continue
-		}
-
-		// 根据模式发送响应
-		if currentWriter != nil {
-			// 同步模式（WebSocket）
-			if err := currentWriter.Write(encrypted); err != nil {
-				h.log(LogLevelDebug, "同步发送失败: ID:%d - %v", conn.ID, err)
-				return
-			}
-		} else if h.sender != nil {
-			// 异步模式（UDP）
-			if err := h.sender(encrypted, clientAddr); err != nil {
-				h.log(LogLevelDebug, "异步发送失败: ID:%d - %v", conn.ID, err)
-			}
-		}
-
-		if h.metrics != nil {
-			h.metrics.AddBytesSent(int64(len(encrypted)))
-		}
+		h.sendUDPResponse(conn.ID, protocol.TypeData, buf[:n], clientAddr)
 	}
 }
 
-// sendResponse 发送响应
-func (h *UnifiedHandler) sendResponse(reqID uint32, status byte, data []byte, pctx *PacketContext) {
-	resp := protocol.BuildResponse(reqID, status, data)
-	h.sendEncryptedResponse(resp, pctx)
-}
+func (h *UnifiedHandler) sendUDPResponse(reqID uint32, status byte, data []byte, to *net.UDPAddr) {
+	if h.sender == nil {
+		h.log(LogLevelError, "Sender 未设置，无法发送响应")
+		return
+	}
 
-// sendEncryptedResponse 加密并发送响应
-func (h *UnifiedHandler) sendEncryptedResponse(resp []byte, pctx *PacketContext) {
+	resp := protocol.BuildResponse(reqID, status, data)
+
 	encrypted, err := h.crypto.Encrypt(resp)
 	if err != nil {
 		h.log(LogLevelError, "加密响应失败: %v", err)
 		return
 	}
 
-	// 同步模式：收集响应
-	if pctx.ResponseWriter != nil {
-		pctx.AddResponse(encrypted)
-		return
-	}
-
-	// 异步模式：通过 sender 发送
-	if h.sender != nil {
-		if err := h.sender(encrypted, pctx.From); err != nil {
-			h.log(LogLevelDebug, "发送响应失败: %v", err)
-		} else if h.metrics != nil {
-			h.metrics.AddBytesSent(int64(len(encrypted)))
-		}
-	} else {
-		h.log(LogLevelError, "Sender 未设置，无法发送响应")
+	if err := h.sender(encrypted, to); err != nil {
+		h.log(LogLevelDebug, "发送响应失败: %v", err)
+	} else if h.metrics != nil {
+		h.metrics.AddBytesSent(int64(len(encrypted)))
 	}
 }
 
@@ -491,7 +448,6 @@ func (h *UnifiedHandler) sendEncryptedResponse(resp []byte, pctx *PacketContext)
 // TCP 连接处理
 // =============================================================================
 
-// HandleConnection 处理 TCP 连接
 func (h *UnifiedHandler) HandleConnection(ctx context.Context, clientConn net.Conn) {
 	atomic.AddInt64(&h.stats.activeConns, 1)
 	defer atomic.AddInt64(&h.stats.activeConns, -1)
@@ -779,11 +735,6 @@ func (h *UnifiedHandler) closeConnection(reqID uint32) {
 		_ = conn.Target.Close()
 	}
 
-	// 关闭响应通道
-	if conn.responseChan != nil {
-		close(conn.responseChan)
-	}
-
 	atomic.AddInt64(&h.stats.activeConns, -1)
 
 	if h.metrics != nil {
@@ -903,23 +854,6 @@ func (h *UnifiedHandler) cleanup() {
 }
 
 // =============================================================================
-// 辅助函数
-// =============================================================================
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsImpl(s, substr))
-}
-
-func containsImpl(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-// =============================================================================
 // 日志
 // =============================================================================
 
@@ -944,264 +878,8 @@ func (h *UnifiedHandler) log(level int, format string, args ...interface{}) {
 		fmt.Sprintf(format, args...))
 }
 
-// =============================================================================
-// Switcher 适配器方法
-// 这些方法用于 switcher 调用，内部委托给现有的处理逻辑
-// =============================================================================
 
-// HandleUDPPacket 处理 UDP 数据包（供 Switcher 调用）
-func (h *UnifiedHandler) HandleUDPPacket(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
-	// 设置发送器（如果尚未设置）
-	if h.sender == nil {
-		h.SetSender(func(respData []byte, respAddr *net.UDPAddr) error {
-			_, err := conn.WriteToUDP(respData, respAddr)
-			return err
-		})
-	}
 
-	// 委托给现有的 HandlePacket 方法
-	h.HandlePacket(data, addr)
-}
 
-// HandleTCPConn 处理 TCP 连接（供 Switcher 调用）
-func (h *UnifiedHandler) HandleTCPConn(conn net.Conn) {
-	// 委托给现有的 HandleConnection 方法
-	h.HandleConnection(h.ctx, conn)
-}
 
-// HandleWebSocket 处理 WebSocket 连接（供 Switcher 调用）
-func (h *UnifiedHandler) HandleWebSocket(conn net.Conn) {
-	atomic.AddInt64(&h.stats.activeConns, 1)
-	defer atomic.AddInt64(&h.stats.activeConns, -1)
 
-	if h.metrics != nil {
-		h.metrics.IncConnections()
-		defer h.metrics.DecConnections()
-	}
-
-	clientAddr := conn.RemoteAddr().String()
-	h.log(LogLevelDebug, "WebSocket 新连接: %s", clientAddr)
-	defer h.log(LogLevelDebug, "WebSocket 连接关闭: %s", clientAddr)
-	defer conn.Close()
-
-	// WebSocket 握手
-	buf := make([]byte, 4096)
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	n, err := conn.Read(buf)
-	if err != nil {
-		h.log(LogLevelDebug, "WebSocket 读取握手失败: %v", err)
-		return
-	}
-
-	// 简化的 WebSocket 握手响应
-	// 实际应该解析 Sec-WebSocket-Key 并计算正确的 Accept 值
-	if n > 0 && containsBytes(buf[:n], []byte("Upgrade: websocket")) {
-		upgradeResponse := "HTTP/1.1 101 Switching Protocols\r\n" +
-			"Upgrade: websocket\r\n" +
-			"Connection: Upgrade\r\n" +
-			"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
-		conn.Write([]byte(upgradeResponse))
-	}
-
-	// 创建同步响应写入器
-	writer := ResponseWriterFunc(func(data []byte) error {
-		frame := buildWebSocketBinaryFrame(data)
-		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-		_, err := conn.Write(frame)
-		return err
-	})
-
-	// 创建虚拟 UDP 地址用于会话管理
-	virtualAddr := &net.UDPAddr{
-		IP:   net.ParseIP("127.0.0.1"),
-		Port: 0,
-	}
-	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
-		virtualAddr.IP = tcpAddr.IP
-		virtualAddr.Port = tcpAddr.Port
-	}
-
-	// WebSocket 消息处理循环
-	frameBuf := make([]byte, 65536)
-	for {
-		select {
-		case <-h.ctx.Done():
-			return
-		default:
-		}
-
-		conn.SetReadDeadline(time.Now().Add(readTimeout))
-		n, err := conn.Read(frameBuf)
-		if err != nil {
-			if err != io.EOF {
-				h.log(LogLevelDebug, "WebSocket 读取失败: %s - %v", clientAddr, err)
-			}
-			return
-		}
-
-		if n < 2 {
-			continue
-		}
-
-		// 解析 WebSocket 帧
-		payload, opcode, err := parseWebSocketFrame(frameBuf[:n])
-		if err != nil {
-			h.log(LogLevelDebug, "WebSocket 帧解析失败: %v", err)
-			continue
-		}
-
-		// 处理关闭帧
-		if opcode == 0x08 {
-			h.log(LogLevelDebug, "WebSocket 收到关闭帧")
-			return
-		}
-
-		// 处理 Ping 帧
-		if opcode == 0x09 {
-			pongFrame := buildWebSocketPongFrame(payload)
-			conn.Write(pongFrame)
-			continue
-		}
-
-		// 只处理二进制帧和文本帧
-		if opcode != 0x01 && opcode != 0x02 {
-			continue
-		}
-
-		if len(payload) == 0 {
-			continue
-		}
-
-		// 使用同步处理方法
-		responses := h.HandlePacketSync(payload, virtualAddr, writer)
-
-		// 发送收集的响应
-		for _, resp := range responses {
-			frame := buildWebSocketBinaryFrame(resp)
-			conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-			if _, err := conn.Write(frame); err != nil {
-				h.log(LogLevelDebug, "WebSocket 发送响应失败: %v", err)
-				return
-			}
-		}
-	}
-}
-
-// =============================================================================
-// WebSocket 辅助函数
-// =============================================================================
-
-// containsBytes 检查字节切片是否包含子切片
-func containsBytes(data, subslice []byte) bool {
-	return len(data) >= len(subslice) && indexBytes(data, subslice) >= 0
-}
-
-// indexBytes 查找子切片位置
-func indexBytes(data, subslice []byte) int {
-	for i := 0; i <= len(data)-len(subslice); i++ {
-		match := true
-		for j := 0; j < len(subslice); j++ {
-			if data[i+j] != subslice[j] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return i
-		}
-	}
-	return -1
-}
-
-// parseWebSocketFrame 解析 WebSocket 帧
-func parseWebSocketFrame(data []byte) (payload []byte, opcode byte, err error) {
-	if len(data) < 2 {
-		return nil, 0, fmt.Errorf("frame too short")
-	}
-
-	opcode = data[0] & 0x0F
-	masked := (data[1] & 0x80) != 0
-	payloadLen := int(data[1] & 0x7F)
-
-	offset := 2
-
-	if payloadLen == 126 {
-		if len(data) < 4 {
-			return nil, 0, fmt.Errorf("frame too short for extended length")
-		}
-		payloadLen = int(data[2])<<8 | int(data[3])
-		offset = 4
-	} else if payloadLen == 127 {
-		if len(data) < 10 {
-			return nil, 0, fmt.Errorf("frame too short for extended length")
-		}
-		payloadLen = int(data[2])<<56 | int(data[3])<<48 | int(data[4])<<40 | int(data[5])<<32 |
-			int(data[6])<<24 | int(data[7])<<16 | int(data[8])<<8 | int(data[9])
-		offset = 10
-	}
-
-	var maskKey []byte
-	if masked {
-		if len(data) < offset+4 {
-			return nil, 0, fmt.Errorf("frame too short for mask key")
-		}
-		maskKey = data[offset : offset+4]
-		offset += 4
-	}
-
-	if len(data) < offset+payloadLen {
-		return nil, 0, fmt.Errorf("frame too short for payload")
-	}
-
-	payload = make([]byte, payloadLen)
-	copy(payload, data[offset:offset+payloadLen])
-
-	// 解除掩码
-	if masked {
-		for i := 0; i < len(payload); i++ {
-			payload[i] ^= maskKey[i%4]
-		}
-	}
-
-	return payload, opcode, nil
-}
-
-// buildWebSocketBinaryFrame 构建二进制 WebSocket 帧
-func buildWebSocketBinaryFrame(payload []byte) []byte {
-	length := len(payload)
-	var frame []byte
-
-	if length <= 125 {
-		frame = make([]byte, 2+length)
-		frame[0] = 0x82 // FIN=1, opcode=2 (binary)
-		frame[1] = byte(length)
-		copy(frame[2:], payload)
-	} else if length <= 65535 {
-		frame = make([]byte, 4+length)
-		frame[0] = 0x82
-		frame[1] = 126
-		frame[2] = byte(length >> 8)
-		frame[3] = byte(length)
-		copy(frame[4:], payload)
-	} else {
-		frame = make([]byte, 10+length)
-		frame[0] = 0x82
-		frame[1] = 127
-		for i := 0; i < 8; i++ {
-			frame[2+i] = byte(length >> (56 - i*8))
-		}
-		copy(frame[10:], payload)
-	}
-
-	return frame
-}
-
-// buildWebSocketPongFrame 构建 Pong 帧
-func buildWebSocketPongFrame(payload []byte) []byte {
-	length := len(payload)
-	frame := make([]byte, 2+length)
-	frame[0] = 0x8A // FIN=1, opcode=10 (pong)
-	frame[1] = byte(length)
-	copy(frame[2:], payload)
-	return frame
-}
