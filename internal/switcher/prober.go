@@ -150,58 +150,48 @@ func (p *Prober) probeMode(ctx context.Context, mode TransportMode, transport Tr
 		LastProbe: time.Now(),
 	}
 
-	p.mu.RLock()
-	addrs := p.probeAddrs
-	p.mu.RUnlock()
-
-	if len(addrs) == 0 {
-		result.Error = fmt.Errorf("无探测地址")
-		return result
-	}
-
 	// 对每个地址进行探测
 	var rtts []time.Duration
 	var successCount int
 
 	for i := 0; i < p.config.ProbeCount; i++ {
-		for _, addr := range addrs {
-			// 检查上下文是否已取消
-			select {
-			case <-ctx.Done():
-				result.Error = ctx.Err()
-				return result
-			default:
-			}
-
-			// 使用带超时的探测
-			probeDone := make(chan struct{})
-			var rtt time.Duration
-			var err error
-
-			go func() {
-				rtt, err = transport.Probe(addr)
-				close(probeDone)
-			}()
-
-			select {
-			case <-probeDone:
-				// 探测完成
-			case <-time.After(p.config.ProbeTimeout):
-				err = fmt.Errorf("probe timeout")
-			case <-ctx.Done():
-				result.Error = ctx.Err()
-				return result
-			}
-
-			result.ProbeCount++
-
-			if err != nil {
-				continue
-			}
-
-			successCount++
-			rtts = append(rtts, rtt)
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
+			result.Error = ctx.Err()
+			return result
+		default:
 		}
+
+		// 使用带超时的探测
+		probeDone := make(chan struct{})
+		var rtt time.Duration
+		var err error
+
+		go func() {
+			// 调用不带参数的 Probe 方法
+			rtt, err = transport.Probe()
+			close(probeDone)
+		}()
+
+		select {
+		case <-probeDone:
+			// 探测完成
+		case <-time.After(p.config.ProbeTimeout):
+			err = fmt.Errorf("probe timeout")
+		case <-ctx.Done():
+			result.Error = ctx.Err()
+			return result
+		}
+
+		result.ProbeCount++
+
+		if err != nil {
+			continue
+		}
+
+		successCount++
+		rtts = append(rtts, rtt)
 	}
 
 	result.SuccessCount = successCount
