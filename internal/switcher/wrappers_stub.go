@@ -44,7 +44,18 @@ func (w *UDPTransportWrapper) IsRunning() bool {
 
 // GetStats 获取统计信息
 func (w *UDPTransportWrapper) GetStats() TransportStats {
-	return TransportStats{}
+	if w.server == nil {
+		return TransportStats{}
+	}
+	stats := w.server.GetStats()
+	return TransportStats{
+		BytesSent:     int64(stats["bytes_sent"]),
+		BytesReceived: int64(stats["bytes_recv"]),
+		PacketsSent:   int64(stats["packets_sent"]),
+		PacketsRecv:   int64(stats["packets_recv"]),
+		Errors:        int64(stats["packets_dropped"]),
+		LastActivity:  time.Now(),
+	}
 }
 
 // Probe 探测连接质量
@@ -66,22 +77,21 @@ func NewTCPTransportWrapper(server *transport.TCPServer) *TCPTransportWrapper {
 	return &TCPTransportWrapper{server: server}
 }
 
-// Send 发送数据
+// Send 发送数据 (TCP 不支持 UDP 风格的 SendTo)
 func (w *TCPTransportWrapper) Send(data []byte, addr *net.UDPAddr) error {
-	if w.server == nil {
-		return fmt.Errorf("TCP server is nil")
-	}
-	return w.server.SendTo(data, addr)
+	return fmt.Errorf("TCP does not support SendTo, use connection-based sending")
 }
 
 // IsRunning 是否运行中
 func (w *TCPTransportWrapper) IsRunning() bool {
-	return w.server != nil && w.server.IsRunning()
+	return w.server != nil
 }
 
 // GetStats 获取统计信息
 func (w *TCPTransportWrapper) GetStats() TransportStats {
-	return TransportStats{}
+	return TransportStats{
+		LastActivity: time.Now(),
+	}
 }
 
 // Probe 探测连接质量
@@ -118,7 +128,18 @@ func (w *FakeTCPTransportWrapper) IsRunning() bool {
 
 // GetStats 获取统计信息
 func (w *FakeTCPTransportWrapper) GetStats() TransportStats {
-	return TransportStats{}
+	if w.server == nil {
+		return TransportStats{}
+	}
+	stats := w.server.GetStats()
+	return TransportStats{
+		BytesSent:     int64(stats.BytesSent),
+		BytesReceived: int64(stats.BytesReceived),
+		PacketsSent:   int64(stats.PacketsSent),
+		PacketsRecv:   int64(stats.PacketsReceived),
+		Errors:        int64(stats.ChecksumErrors + stats.InvalidPackets + stats.DroppedPackets),
+		LastActivity:  time.Now(),
+	}
 }
 
 // Probe 探测连接质量
@@ -150,12 +171,18 @@ func (w *WSTransportWrapper) Send(data []byte, addr *net.UDPAddr) error {
 
 // IsRunning 是否运行中
 func (w *WSTransportWrapper) IsRunning() bool {
-	return w.server != nil && w.server.IsRunning()
+	return w.server != nil
 }
 
 // GetStats 获取统计信息
 func (w *WSTransportWrapper) GetStats() TransportStats {
-	return TransportStats{}
+	if w.server == nil {
+		return TransportStats{}
+	}
+	return TransportStats{
+		ActiveConns:  int(w.server.GetActiveConns()),
+		LastActivity: time.Now(),
+	}
 }
 
 // Probe 探测连接质量
