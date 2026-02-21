@@ -1,3 +1,4 @@
+
 // internal/protocol/client_types.go
 // 客户端专用协议构建与解析函数
 // 严格匹配服务端 ParseRequest 和 BuildResponse 的字节布局
@@ -232,3 +233,4 @@ func DecodeAddress(addrType byte, data []byte) (host string, bytesRead int, err 
 		return "", 0, errors.New("unknown address type")
 	}
 }
+
