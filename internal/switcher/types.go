@@ -130,16 +130,42 @@ func (q LinkQuality) String() string {
 
 // LinkQualityMetrics 链路质量指标（详细数据）
 type LinkQualityMetrics struct {
-	Available            bool
-	State                TransportState
-	Score                float64
-	RTT                  time.Duration
-	LossRate             float64
-	Throughput           float64
+	// 基础状态
+	Available bool
+	State     TransportState
+	Score     float64
+
+	// RTT 相关
+	RTT       time.Duration // 当前/平均 RTT
+	AvgRTT    time.Duration // 平均 RTT
+	MinRTT    time.Duration // 最小 RTT
+	MaxRTT    time.Duration // 最大 RTT
+	RTTJitter time.Duration // RTT 抖动
+
+	// 丢包相关
+	LossRate     float64 // 丢包率
+	RecentLosses int     // 最近丢包数
+	TotalLosses  uint64  // 总丢包数
+	TotalPackets uint64  // 总包数
+
+	// 吞吐量相关
+	Throughput     float64 // 当前吞吐量 (bytes/s)
+	AvgThroughput  float64 // 平均吞吐量
+	PeakThroughput float64 // 峰值吞吐量
+
+	// 连接相关
+	ActiveConns int    // 活跃连接数
+	TotalConns  uint64 // 总连接数
+	FailedConns uint64 // 失败连接数
+
+	// 连续计数
 	ConsecutiveFailures  int
 	ConsecutiveSuccesses int
-	LastSuccess          time.Time
-	LastFailure          time.Time
+
+	// 时间戳
+	LastCheck   time.Time // 最后检查时间
+	LastSuccess time.Time // 最后成功时间
+	LastFailure time.Time // 最后失败时间
 }
 
 // =============================================================================
@@ -291,8 +317,8 @@ func DefaultSwitcherConfig() *SwitcherConfig {
 		Enabled:             true,
 		CheckInterval:       5 * time.Second,
 		RTTThreshold:        200 * time.Millisecond,
-		LossThreshold:       0.1, // 10%
-		ThroughputThreshold: 1024 * 100, // 100 KB/s
+		LossThreshold:       0.1,          // 10%
+		ThroughputThreshold: 1024 * 100,   // 100 KB/s
 		FailThreshold:       3,
 		RecoverThreshold:    5,
 		MinSwitchInterval:   30 * time.Second,
@@ -326,5 +352,3 @@ type SwitchDecision struct {
 // =============================================================================
 // 注意: ProbeResult 已在 prober.go 中定义，此处不再重复
 // =============================================================================
-
-
