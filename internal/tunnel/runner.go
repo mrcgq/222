@@ -1,3 +1,5 @@
+
+
 // =============================================================================
 // 文件: internal/tunnel/runner.go
 // 描述: Cloudflare Tunnel 进程管理 - 通用部分
@@ -65,6 +67,7 @@ type CloudflaredRunner struct {
 	stderr io.ReadCloser
 
 	onURLReady    func(url string)
+	onURLChanged  func(oldURL, newURL string) // 新增：URL 变更回调
 	onError       func(err error)
 	onStateChange func(running bool)
 
@@ -94,6 +97,7 @@ type RunnerConfig struct {
 	LogLevel    int
 
 	OnURLReady    func(url string)
+	OnURLChanged  func(oldURL, newURL string) // 新增：URL 变更回调
 	OnError       func(err error)
 	OnStateChange func(running bool)
 }
@@ -138,6 +142,7 @@ func NewCloudflaredRunner(cfg *RunnerConfig) (*CloudflaredRunner, error) {
 		doneChan:    make(chan struct{}),
 
 		onURLReady:    cfg.OnURLReady,
+		onURLChanged:  cfg.OnURLChanged,
 		onError:       cfg.OnError,
 		onStateChange: cfg.OnStateChange,
 	}
@@ -353,8 +358,29 @@ func (r *CloudflaredRunner) monitorOutput(ctx context.Context) {
 	if r.mode == ModeTempTunnel {
 		select {
 		case url := <-urlFound:
+			// 修复：检测 URL 变更并发出警告
+			oldURL := ""
+			if v := r.tunnelURL.Load(); v != nil {
+				oldURL = v.(string)
+			}
+
 			r.tunnelURL.Store(url)
 			r.domain.Store(extractDomain(url))
+
+			// 检查是否发生了 URL 变更（隧道重启场景）
+			if oldURL != "" && oldURL != url {
+				r.log(0, "🚨 警告: 临时隧道 URL 发生变更!")
+				r.log(0, "   原 URL: %s", oldURL)
+				r.log(0, "   新 URL: %s", url)
+				r.log(0, "   使用临时隧道的客户端将断开连接，请更新客户端配置！")
+
+				// 触发 URL 变更回调
+				r.notifyURLChanged(oldURL, url)
+
+				// 同时通知错误处理器（让上层感知这个重要事件）
+				r.notifyError(fmt.Errorf("临时隧道 URL 已变更: %s -> %s，客户端需要重新配置", oldURL, url))
+			}
+
 			r.log(1, "隧道 URL 已就绪: %s", url)
 			r.notifyURLReady(url)
 
@@ -418,6 +444,15 @@ func (r *CloudflaredRunner) handleRestart(ctx context.Context) {
 
 	r.log(1, "准备重启 cloudflared (%d/%d)，延迟 %v",
 		r.restartCount, MaxRestartAttempts, RestartDelay)
+
+	// 重启前记录旧 URL（用于后续变更检测）
+	oldURL := ""
+	if v := r.tunnelURL.Load(); v != nil {
+		oldURL = v.(string)
+	}
+	if oldURL != "" {
+		r.log(1, "重启前 URL: %s（重启后可能变更）", oldURL)
+	}
 
 	select {
 	case <-time.After(RestartDelay):
@@ -546,6 +581,13 @@ func (r *CloudflaredRunner) notifyURLReady(url string) {
 	}
 }
 
+// notifyURLChanged 通知 URL 变更（新增）
+func (r *CloudflaredRunner) notifyURLChanged(oldURL, newURL string) {
+	if r.onURLChanged != nil {
+		go r.onURLChanged(oldURL, newURL)
+	}
+}
+
 func (r *CloudflaredRunner) notifyError(err error) {
 	if r.onError != nil {
 		go r.onError(err)
@@ -620,3 +662,6 @@ func (r *CloudflaredRunner) GetStatus() RunnerStatus {
 		RestartCount: r.restartCount,
 	}
 }
+
+
+
