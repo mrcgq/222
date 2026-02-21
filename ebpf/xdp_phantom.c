@@ -440,14 +440,7 @@ static __always_inline int is_ipv6_enabled(void) {
     return 1;
 }
 
-// 获取速率限制配置
-static __always_inline __u32 get_ratelimit_pps(void) {
-    __u32 key = 0;
-    struct global_config *gcfg = bpf_map_lookup_elem(&config, &key);
-    if (gcfg && gcfg->ratelimit_pps > 0)
-        return gcfg->ratelimit_pps;
-    return RATELIMIT_MAX_PPS;
-}
+
 
 // =============================================================================
 // IPv4 UDP 处理（带黑名单和速率限制）
