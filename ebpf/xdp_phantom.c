@@ -1,4 +1,3 @@
-
 // =============================================================================
 // 文件: ebpf/xdp_phantom.c
 // 描述: XDP 加速程序 - 首包过滤与防重放盾牌 (IPv4/IPv6 双栈支持)
@@ -29,39 +28,11 @@
 #define BLOCK_FLAG_MALFORMED    5   // 畸形包
 
 // =============================================================================
-// 黑名单数据结构
+// 黑名单数据结构 - 已在 phantom_common.h 中定义
 // =============================================================================
-
-// IPv4 黑名单条目
-struct blacklist_entry_v4 {
-    __u8  block_flag;       // 封禁原因
-    __u8  severity;         // 严重程度 (1-10)
-    __u16 fail_count;       // 失败计数
-    __u32 first_seen;       // 首次发现时间 (秒)
-    __u32 last_seen;        // 最后发现时间 (秒)
-    __u64 blocked_packets;  // 已拦截包数
-    __u64 blocked_bytes;    // 已拦截字节数
-};
-
-// IPv6 黑名单条目 (使用 128 位地址)
-struct blacklist_entry_v6 {
-    __u8  block_flag;
-    __u8  severity;
-    __u16 fail_count;
-    __u32 first_seen;
-    __u32 last_seen;
-    __u64 blocked_packets;
-    __u64 blocked_bytes;
-};
-
-// 速率限制条目
-struct ratelimit_entry {
-    __u64 window_start_ns;  // 窗口开始时间
-    __u32 packet_count;     // 窗口内包数
-    __u32 byte_count;       // 窗口内字节数
-    __u8  warned;           // 是否已警告
-    __u8  pad[3];
-};
+// struct blacklist_entry_v4  - 定义在 phantom_common.h
+// struct blacklist_entry_v6  - 定义在 phantom_common.h
+// struct ratelimit_entry     - 定义在 phantom_common.h
 
 // =============================================================================
 // eBPF Maps - 黑名单与速率限制
@@ -933,12 +904,3 @@ int xdp_phantom_filter(struct xdp_md *ctx) {
 
 char _license[] SEC("license") = "GPL";
 __u32 _version SEC("version") = 2;
-
-
-
-
-
-
-
-
-
