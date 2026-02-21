@@ -327,5 +327,4 @@ type SwitchDecision struct {
 // 注意: ProbeResult 已在 prober.go 中定义，此处不再重复
 // =============================================================================
 
-// LinkQuality 是 LinkQualityMetrics 的别名，保持向后兼容
-type LinkQuality = LinkQualityMetrics
+
