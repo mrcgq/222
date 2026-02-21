@@ -773,3 +773,45 @@ func getInterfaceByName(name string) (*netInterface, error) {
 	}, nil
 }
 
+
+// =============================================================================
+// 平滑重启支持方法
+// =============================================================================
+
+// PrepareGracefulRestart 准备平滑重启（导出方法）
+func (l *EBPFLoader) PrepareGracefulRestart() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// 确保 maps 已固定，以便新进程可以恢复
+	if !l.pinned && l.config.EnablePinning {
+		if err := l.pinMaps(); err != nil {
+			return fmt.Errorf("pin maps 失败: %w", err)
+		}
+		l.pinned = true
+	}
+
+	// 更新元数据，标记准备重启
+	if err := l.savePinMetadata(); err != nil {
+		return fmt.Errorf("保存元数据失败: %w", err)
+	}
+
+	return nil
+}
+
+// RecoverFromRestart 从重启中恢复（导出方法）
+func (l *EBPFLoader) RecoverFromRestart() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// 尝试从固定的 maps 恢复状态
+	if err := l.tryReusePinnedMaps(); err != nil {
+		return fmt.Errorf("恢复 pinned maps 失败: %w", err)
+	}
+
+	l.reusingMaps = true
+	l.loaded = true
+	l.loadTime = time.Now()
+
+	return nil
+}
