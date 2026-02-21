@@ -49,11 +49,11 @@ func (w *UDPTransportWrapper) GetStats() TransportStats {
 	}
 	stats := w.server.GetStats()
 	return TransportStats{
-		BytesSent:     stats.BytesSent,
-		BytesReceived: stats.BytesReceived,
-		PacketsSent:   stats.PacketsSent,
-		PacketsRecv:   stats.PacketsReceived,
-		Errors:        stats.Errors,
+		BytesSent:     int64(stats["bytes_sent"]),
+		BytesReceived: int64(stats["bytes_recv"]),
+		PacketsSent:   int64(stats["packets_sent"]),
+		PacketsRecv:   int64(stats["packets_recv"]),
+		Errors:        int64(stats["packets_dropped"]),
 		LastActivity:  time.Now(),
 	}
 }
@@ -78,33 +78,24 @@ func NewTCPTransportWrapper(server *transport.TCPServer) *TCPTransportWrapper {
 	return &TCPTransportWrapper{server: server}
 }
 
-// Send 发送数据
+// Send 发送数据 (TCP 不支持 UDP 风格的 SendTo，返回错误或忽略)
 func (w *TCPTransportWrapper) Send(data []byte, addr *net.UDPAddr) error {
-	if w.server == nil {
-		return fmt.Errorf("TCP server is nil")
-	}
-	return w.server.SendTo(data, addr)
+	// TCP 是面向连接的，不支持直接 SendTo
+	// 这里返回不支持的错误，或者可以维护一个连接映射
+	return fmt.Errorf("TCP does not support SendTo, use connection-based sending")
 }
 
 // IsRunning 是否运行中
 func (w *TCPTransportWrapper) IsRunning() bool {
-	return w.server != nil && w.server.IsRunning()
+	// TCPServer 没有 IsRunning 方法，检查 listener 是否存在
+	return w.server != nil
 }
 
 // GetStats 获取统计信息
 func (w *TCPTransportWrapper) GetStats() TransportStats {
-	if w.server == nil {
-		return TransportStats{}
-	}
-	stats := w.server.GetStats()
+	// TCPServer 没有 GetStats 方法，返回空统计
 	return TransportStats{
-		BytesSent:     stats.BytesSent,
-		BytesReceived: stats.BytesReceived,
-		PacketsSent:   stats.PacketsSent,
-		PacketsRecv:   stats.PacketsReceived,
-		Errors:        stats.Errors,
-		ActiveConns:   stats.ActiveConnections,
-		LastActivity:  time.Now(),
+		LastActivity: time.Now(),
 	}
 }
 
@@ -188,7 +179,8 @@ func (w *WSTransportWrapper) Send(data []byte, addr *net.UDPAddr) error {
 
 // IsRunning 是否运行中
 func (w *WSTransportWrapper) IsRunning() bool {
-	return w.server != nil && w.server.IsRunning()
+	// WebSocketServer 没有 IsRunning 方法，检查 server 是否存在
+	return w.server != nil
 }
 
 // GetStats 获取统计信息
@@ -196,15 +188,9 @@ func (w *WSTransportWrapper) GetStats() TransportStats {
 	if w.server == nil {
 		return TransportStats{}
 	}
-	stats := w.server.GetStats()
 	return TransportStats{
-		BytesSent:     stats.BytesSent,
-		BytesReceived: stats.BytesReceived,
-		PacketsSent:   stats.PacketsSent,
-		PacketsRecv:   stats.PacketsReceived,
-		Errors:        stats.Errors,
-		ActiveConns:   stats.ActiveConnections,
-		LastActivity:  time.Now(),
+		ActiveConns:  int(w.server.GetActiveConns()),
+		LastActivity: time.Now(),
 	}
 }
 
