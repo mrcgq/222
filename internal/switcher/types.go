@@ -73,15 +73,20 @@ func (s TransportState) String() string {
 type SwitchReason string
 
 const (
-	ReasonNone        SwitchReason = ""
-	ReasonManual      SwitchReason = "manual"
-	ReasonHighLatency SwitchReason = "high_latency"
-	ReasonHighLoss    SwitchReason = "high_loss"
-	ReasonFailed      SwitchReason = "failed"
-	ReasonRecovered   SwitchReason = "recovered"
-	ReasonProbe       SwitchReason = "probe"
-	ReasonCooldown    SwitchReason = "cooldown"
-	ReasonBetter      SwitchReason = "better_option"
+	ReasonNone             SwitchReason = ""
+	ReasonManual           SwitchReason = "manual"
+	ReasonHighLatency      SwitchReason = "high_latency"
+	ReasonHighLoss         SwitchReason = "high_loss"
+	ReasonFailed           SwitchReason = "failed"
+	ReasonRecovered        SwitchReason = "recovered"
+	ReasonProbe            SwitchReason = "probe"
+	ReasonCooldown         SwitchReason = "cooldown"
+	ReasonBetter           SwitchReason = "better_option"
+	ReasonConnectionFailed SwitchReason = "connection_failed"
+	ReasonHighRTT          SwitchReason = "high_rtt"
+	ReasonLowThroughput    SwitchReason = "low_throughput"
+	ReasonDegraded         SwitchReason = "degraded"
+	ReasonRecovery         SwitchReason = "recovery"
 )
 
 // String 返回原因字符串
@@ -121,6 +126,20 @@ func (q LinkQuality) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// LinkQualityMetrics 链路质量指标（详细数据）
+type LinkQualityMetrics struct {
+	Available            bool
+	State                TransportState
+	Score                float64
+	RTT                  time.Duration
+	LossRate             float64
+	Throughput           float64
+	ConsecutiveFailures  int
+	ConsecutiveSuccesses int
+	LastSuccess          time.Time
+	LastFailure          time.Time
 }
 
 // =============================================================================
@@ -242,8 +261,11 @@ type SwitcherConfig struct {
 	FailThreshold     int
 	RecoverThreshold  int
 	MinSwitchInterval time.Duration
-	MaxSwitchRate     int
+	MaxSwitchRate     float64
 	CooldownPeriod    time.Duration
+
+	// 吞吐量阈值
+	ThroughputThreshold float64
 
 	// 回退配置
 	EnableFallback bool
@@ -266,24 +288,25 @@ type SwitcherConfig struct {
 // DefaultSwitcherConfig 返回默认切换器配置
 func DefaultSwitcherConfig() *SwitcherConfig {
 	return &SwitcherConfig{
-		Enabled:           true,
-		CheckInterval:     5 * time.Second,
-		RTTThreshold:      200 * time.Millisecond,
-		LossThreshold:     0.1, // 10%
-		FailThreshold:     3,
-		RecoverThreshold:  5,
-		MinSwitchInterval: 30 * time.Second,
-		MaxSwitchRate:     5,
-		CooldownPeriod:    60 * time.Second,
-		EnableFallback:    true,
-		FallbackMode:      ModeTCP,
-		EnableProbe:       true,
-		ProbeInterval:     10 * time.Second,
-		ProbePacketSize:   64,
-		ProbeCount:        3,
-		ProbeTimeout:      5 * time.Second,
-		Priority:          []TransportMode{ModeUDP, ModeTCP, ModeFakeTCP, ModeWebSocket},
-		LogLevel:          "info",
+		Enabled:             true,
+		CheckInterval:       5 * time.Second,
+		RTTThreshold:        200 * time.Millisecond,
+		LossThreshold:       0.1, // 10%
+		ThroughputThreshold: 1024 * 100, // 100 KB/s
+		FailThreshold:       3,
+		RecoverThreshold:    5,
+		MinSwitchInterval:   30 * time.Second,
+		MaxSwitchRate:       5,
+		CooldownPeriod:      60 * time.Second,
+		EnableFallback:      true,
+		FallbackMode:        ModeTCP,
+		EnableProbe:         true,
+		ProbeInterval:       10 * time.Second,
+		ProbePacketSize:     64,
+		ProbeCount:          3,
+		ProbeTimeout:        5 * time.Second,
+		Priority:            []TransportMode{ModeUDP, ModeTCP, ModeFakeTCP, ModeWebSocket},
+		LogLevel:            "info",
 	}
 }
 
@@ -297,6 +320,7 @@ type SwitchDecision struct {
 	TargetMode   TransportMode
 	Reason       SwitchReason
 	Confidence   float64
+	Alternatives []TransportMode
 }
 
 // =============================================================================
