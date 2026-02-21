@@ -1,3 +1,4 @@
+
 //go:build linux || darwin || freebsd
 
 package tunnel
@@ -36,3 +37,6 @@ func killProcess(process *os.Process) {
 	// 作为后备，也直接 Kill 进程
 	_ = process.Kill()
 }
+
+
+
