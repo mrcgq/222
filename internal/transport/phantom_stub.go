@@ -2,7 +2,7 @@
 
 // =============================================================================
 // 文件: internal/transport/phantom_stub.go
-// 描述: 非 Linux 平台的 eBPF 存根
+// 描述: 非 Linux 平台的 eBPF 存根 - 仅包含 bpf2go 相关类型
 // =============================================================================
 
 package transport
@@ -60,7 +60,7 @@ func LoadPhantomFromPath(path string) (*ebpf.CollectionSpec, error) {
 }
 
 // =============================================================================
-// 数据结构存根
+// 数据结构存根 (bpf2go 生成的类型)
 // =============================================================================
 
 // PhantomIpAddr IP 地址存根
@@ -120,10 +120,10 @@ type PhantomPortConfig struct {
 
 // PhantomStatsCounter 统计计数器存根
 type PhantomStatsCounter struct {
-	PacketsRX           uint64
-	PacketsTX           uint64
-	BytesRX             uint64
-	BytesTX             uint64
+	PacketsRx           uint64
+	PacketsTx           uint64
+	BytesRx             uint64
+	BytesTx             uint64
 	PacketsDropped      uint64
 	PacketsPassed       uint64
 	PacketsRedirected   uint64
@@ -132,8 +132,8 @@ type PhantomStatsCounter struct {
 	Errors              uint64
 	ChecksumErrors      uint64
 	InvalidPackets      uint64
-	Ipv6PacketsRX       uint64
-	Ipv6PacketsTX       uint64
+	Ipv6PacketsRx       uint64
+	Ipv6PacketsTx       uint64
 	Ipv6SessionsCreated uint64
 	BlacklistHits       uint64
 	RatelimitHits       uint64
@@ -183,30 +183,4 @@ type PhantomRatelimitEntry struct {
 	ByteCount     uint32
 	Warned        uint8
 	Pad           [3]uint8
-}
-
-// =============================================================================
-// 类型别名存根
-// =============================================================================
-
-// EBPFStats 统计别名
-type EBPFStats = PhantomStatsCounter
-
-// EBPFSessionKey 会话键别名
-type EBPFSessionKey = PhantomSessionKey
-
-// EBPFSessionValue 会话值别名
-type EBPFSessionValue = PhantomSessionValue
-
-// EBPFPacketEvent 包事件存根
-type EBPFPacketEvent struct {
-	Timestamp uint64
-	SrcIP     uint32
-	DstIP     uint32
-	SrcPort   uint16
-	DstPort   uint16
-	Protocol  uint8
-	Action    uint8
-	Flags     uint8
-	Pad       uint8
 }
