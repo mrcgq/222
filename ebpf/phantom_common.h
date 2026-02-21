@@ -1,6 +1,8 @@
+
 // =============================================================================
 // 文件: ebpf/phantom_common.h
 // 描述: eBPF 公共头文件 - 类型定义和辅助函数 (IPv4/IPv6 双栈支持)
+// 修复: 添加黑名单/速率限制统计字段，显式结构体对齐
 // =============================================================================
 
 #ifndef __PHANTOM_COMMON_H__
@@ -61,11 +63,28 @@
 #define IPV6_EXT_MAX_DEPTH  8
 
 // =============================================================================
+// 黑名单相关常量
+// =============================================================================
+
+#define BLACKLIST_MAX_ENTRIES   100000
+#define RATELIMIT_MAX_ENTRIES   50000
+#define RATELIMIT_WINDOW_NS     1000000000ULL  // 1 秒
+#define RATELIMIT_MAX_PPS       1000
+#define RATELIMIT_MAX_BPS       10485760       // 10MB/s
+
+// 黑名单标志
+#define BLOCK_FLAG_NONE         0
+#define BLOCK_FLAG_MANUAL       1
+#define BLOCK_FLAG_REPLAY       2
+#define BLOCK_FLAG_AUTH_FAIL    3
+#define BLOCK_FLAG_RATELIMIT    4
+#define BLOCK_FLAG_MALFORMED    5
+
+// =============================================================================
 // IPv6 地址结构
 // =============================================================================
 
 // 统一的 IP 地址存储 (支持 IPv4 和 IPv6)
-// 注意: 此结构体用于网络数据和 map 键，保持 packed
 struct ip_addr {
     union {
         __u32 v4;               // IPv4 地址
@@ -79,8 +98,45 @@ struct ip_addr {
 } __attribute__((packed));
 
 // =============================================================================
+// 黑名单条目 - 严格 8 字节对齐 (总计 32 字节)
+// 修复：显式添加 _pad 字段，确保 bpf2go 生成正确的 Go 结构体
+// =============================================================================
+
+// IPv4 黑名单条目
+struct blacklist_entry_v4 {
+    __u8  block_flag;       // 1 - 封禁原因
+    __u8  severity;         // 1 - 严重程度 (1-10)
+    __u16 fail_count;       // 2 - 失败计数
+    __u32 first_seen;       // 4 - 首次发现时间 (秒)
+    __u32 last_seen;        // 4 - 最后发现时间 (秒)
+    __u32 _pad;             // 4 - 显式填充，确保 8 字节对齐
+    __u64 blocked_packets;  // 8 - 已拦截包数
+    __u64 blocked_bytes;    // 8 - 已拦截字节数
+} __attribute__((aligned(8)));
+
+// IPv6 黑名单条目
+struct blacklist_entry_v6 {
+    __u8  block_flag;       // 1
+    __u8  severity;         // 1
+    __u16 fail_count;       // 2
+    __u32 first_seen;       // 4
+    __u32 last_seen;        // 4
+    __u32 _pad;             // 4 - 显式填充
+    __u64 blocked_packets;  // 8
+    __u64 blocked_bytes;    // 8
+} __attribute__((aligned(8)));
+
+// 速率限制条目
+struct ratelimit_entry {
+    __u64 window_start_ns;  // 8 - 窗口开始时间
+    __u32 packet_count;     // 4 - 窗口内包数
+    __u32 byte_count;       // 4 - 窗口内字节数
+    __u8  warned;           // 1 - 是否已警告
+    __u8  _pad[7];          // 7 - 显式填充到 24 字节
+} __attribute__((aligned(8)));
+
+// =============================================================================
 // 会话键 - 支持 IPv4/IPv6 双栈
-// 注意: 用作 BPF map 键，保持 packed 确保精确布局
 // =============================================================================
 
 struct session_key {
@@ -94,11 +150,11 @@ struct session_key {
 } __attribute__((packed));
 
 // =============================================================================
-// 会话值 - 移除 packed，确保原子操作的对齐要求
+// 会话值 - 确保原子操作的对齐要求
 // =============================================================================
 
 struct session_value {
-    // 8 字节对齐的成员放前面，确保原子操作安全
+    // 8 字节对齐的成员放前面
     __u64 created_ns;           // 创建时间
     __u64 last_seen_ns;         // 最后活动时间
     __u64 bytes_in;             // 入向字节数
@@ -148,13 +204,17 @@ struct global_config {
     __u8  enable_conntrack;
     __u8  enable_ipv6;          // 是否启用 IPv6 支持
     __u8  reserved;
+    __u32 ratelimit_pps;        // 速率限制: 每秒包数
+    __u32 ratelimit_bps;        // 速率限制: 每秒字节数
 } __attribute__((packed));
 
 // =============================================================================
-// 统计计数器 - 移除 packed，确保原子操作的对齐要求
+// 统计计数器 - 确保原子操作的对齐要求
+// 修复：添加 blacklist_hits、ratelimit_hits、auto_blocked_ips 字段
 // =============================================================================
 
 struct stats_counter {
+    // 基础统计
     __u64 packets_rx;
     __u64 packets_tx;
     __u64 bytes_rx;
@@ -167,15 +227,28 @@ struct stats_counter {
     __u64 errors;
     __u64 checksum_errors;
     __u64 invalid_packets;
+    
     // IPv6 特定统计
     __u64 ipv6_packets_rx;
     __u64 ipv6_packets_tx;
     __u64 ipv6_sessions_created;
+    
+    // 黑名单和速率限制统计 (新增)
+    __u64 blacklist_hits;       // 黑名单命中次数
+    __u64 ratelimit_hits;       // 速率限制命中次数
+    __u64 auto_blocked_ips;     // 自动封禁的 IP 数量
+    __u64 replay_attacks;       // 重放攻击拦截次数
+    __u64 auth_failures;        // 认证失败次数
 } __attribute__((aligned(8)));
 
 // =============================================================================
 // 事件结构 (用于 perf buffer)
 // =============================================================================
+
+#define EVENT_TYPE_BLOCKED      1
+#define EVENT_TYPE_RATELIMITED  2
+#define EVENT_TYPE_NEW_SESSION  3
+#define EVENT_TYPE_SUSPICIOUS   4
 
 struct packet_event {
     __u64 timestamp;
@@ -189,7 +262,7 @@ struct packet_event {
     __u8  state;
     __u8  flags;
     __u8  family;               // 地址族
-    __u8  reserved;
+    __u8  event_type;           // 事件类型 (新增)
 } __attribute__((packed));
 
 // =============================================================================
@@ -232,7 +305,6 @@ struct ipv6_parse_result {
 // IPv6 地址操作辅助函数
 // =============================================================================
 
-// 比较两个 IPv6 地址是否相等
 static __always_inline int ipv6_addr_equal(const struct ip_addr *a, 
                                            const struct ip_addr *b) {
     return (a->v6[0] == b->v6[0] &&
@@ -241,7 +313,6 @@ static __always_inline int ipv6_addr_equal(const struct ip_addr *a,
             a->v6[3] == b->v6[3]);
 }
 
-// 比较两个 IP 地址 (支持双栈)
 static __always_inline int ip_addr_equal(const struct ip_addr *a,
                                          const struct ip_addr *b,
                                          __u8 family) {
@@ -252,7 +323,6 @@ static __always_inline int ip_addr_equal(const struct ip_addr *a,
     }
 }
 
-// 复制 IPv6 地址
 static __always_inline void ipv6_addr_copy(struct ip_addr *dst,
                                            const struct in6_addr *src) {
     dst->v6[0] = src->in6_u.u6_addr32[0];
@@ -261,7 +331,6 @@ static __always_inline void ipv6_addr_copy(struct ip_addr *dst,
     dst->v6[3] = src->in6_u.u6_addr32[3];
 }
 
-// 从原始内存复制 IPv6 地址
 static __always_inline void ipv6_addr_copy_raw(struct ip_addr *dst,
                                                const __u32 *src) {
     dst->v6[0] = src[0];
@@ -270,16 +339,13 @@ static __always_inline void ipv6_addr_copy_raw(struct ip_addr *dst,
     dst->v6[3] = src[3];
 }
 
-// 复制 IPv4 地址
 static __always_inline void ipv4_addr_copy(struct ip_addr *dst, __u32 src) {
     dst->v4 = src;
-    // 清零 IPv6 部分以保持一致性
     dst->v6[1] = 0;
     dst->v6[2] = 0;
     dst->v6[3] = 0;
 }
 
-// 清零 IP 地址
 static __always_inline void ip_addr_clear(struct ip_addr *addr) {
     addr->v6[0] = 0;
     addr->v6[1] = 0;
@@ -287,14 +353,12 @@ static __always_inline void ip_addr_clear(struct ip_addr *addr) {
     addr->v6[3] = 0;
 }
 
-// 检查是否为 IPv4 映射的 IPv6 地址 (::ffff:x.x.x.x)
 static __always_inline int is_ipv4_mapped_ipv6(const struct ip_addr *addr) {
     return (addr->v6[0] == 0 &&
             addr->v6[1] == 0 &&
             addr->v6[2] == bpf_htonl(0x0000FFFF));
 }
 
-// 从 IPv4 映射地址提取 IPv4
 static __always_inline __u32 extract_ipv4_from_mapped(const struct ip_addr *addr) {
     return addr->v6[3];
 }
@@ -334,7 +398,6 @@ static __always_inline void csum_replace4(__u16 *sum, __u32 old, __u32 new) {
     *sum = ~csum_fold(csum);
 }
 
-// IPv4 校验和
 static __always_inline __u16 ip_checksum(void *data, int len) {
     __u32 sum = 0;
     __u16 *ptr = data;
@@ -349,14 +412,12 @@ static __always_inline __u16 ip_checksum(void *data, int len) {
     return csum_fold(sum);
 }
 
-// IPv6 伪头校验和 (用于 UDP/TCP)
 static __always_inline __u32 ipv6_pseudo_csum(const struct ip_addr *src,
                                               const struct ip_addr *dst,
                                               __u16 len,
                                               __u8 proto) {
     __u32 sum = 0;
     
-    // 源地址
     sum = csum_add(sum, src->v6[0] >> 16);
     sum = csum_add(sum, src->v6[0] & 0xFFFF);
     sum = csum_add(sum, src->v6[1] >> 16);
@@ -366,7 +427,6 @@ static __always_inline __u32 ipv6_pseudo_csum(const struct ip_addr *src,
     sum = csum_add(sum, src->v6[3] >> 16);
     sum = csum_add(sum, src->v6[3] & 0xFFFF);
     
-    // 目的地址
     sum = csum_add(sum, dst->v6[0] >> 16);
     sum = csum_add(sum, dst->v6[0] & 0xFFFF);
     sum = csum_add(sum, dst->v6[1] >> 16);
@@ -376,7 +436,6 @@ static __always_inline __u32 ipv6_pseudo_csum(const struct ip_addr *src,
     sum = csum_add(sum, dst->v6[3] >> 16);
     sum = csum_add(sum, dst->v6[3] & 0xFFFF);
     
-    // 长度和协议
     sum = csum_add(sum, bpf_htons(len));
     sum = csum_add(sum, bpf_htons(proto));
     
@@ -387,7 +446,6 @@ static __always_inline __u32 ipv6_pseudo_csum(const struct ip_addr *src,
 // 数据包解析辅助函数
 // =============================================================================
 
-// 解析以太网头
 static __always_inline struct ethhdr *parse_ethhdr(void *data, void *data_end) {
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
@@ -395,7 +453,6 @@ static __always_inline struct ethhdr *parse_ethhdr(void *data, void *data_end) {
     return eth;
 }
 
-// 解析 IPv4 头
 static __always_inline struct iphdr *parse_iphdr(void *data, void *data_end) {
     struct iphdr *ip = data;
     if ((void *)(ip + 1) > data_end)
@@ -407,19 +464,15 @@ static __always_inline struct iphdr *parse_iphdr(void *data, void *data_end) {
     return ip;
 }
 
-// 解析 IPv6 头
 static __always_inline struct ipv6hdr *parse_ipv6hdr(void *data, void *data_end) {
     struct ipv6hdr *ip6 = data;
     if ((void *)(ip6 + 1) > data_end)
         return NULL;
-    // 检查版本号
     if ((ip6->version) != 6)
         return NULL;
     return ip6;
 }
 
-// IPv6 扩展头解析
-// 返回: 0 = 成功, -1 = 失败
 static __always_inline int parse_ipv6_ext_headers(
     void *data,
     void *data_end,
@@ -433,15 +486,12 @@ static __always_inline int parse_ipv6_ext_headers(
     result->fragment = 0;
     result->valid = 0;
     
-    // 限制扩展头解析深度以避免验证器循环检查问题
     #pragma unroll
     for (int i = 0; i < IPV6_EXT_MAX_DEPTH; i++) {
-        // 检查是否到达最终协议
         switch (next_hdr) {
         case IPPROTO_UDP:
         case IPPROTO_TCP:
         case IPPROTO_ICMPV6:
-            // 找到传输层协议
             result->next_hdr = next_hdr;
             result->payload_offset = offset;
             result->payload_len = bpf_ntohs(ip6->payload_len) - 
@@ -450,7 +500,6 @@ static __always_inline int parse_ipv6_ext_headers(
             return 0;
             
         case IPPROTO_NONE:
-            // 无后续头部
             result->next_hdr = next_hdr;
             result->payload_offset = offset;
             result->payload_len = 0;
@@ -460,13 +509,12 @@ static __always_inline int parse_ipv6_ext_headers(
         case IPPROTO_HOPOPTS:
         case IPPROTO_ROUTING:
         case IPPROTO_DSTOPTS: {
-            // 可变长度扩展头
             if (ptr + 2 > data_end)
                 return -1;
             
             __u8 *hdr = ptr;
             __u8 ext_next = hdr[0];
-            __u8 ext_len = hdr[1];  // 以 8 字节为单位，不包括第一个 8 字节
+            __u8 ext_len = hdr[1];
             __u16 total_len = (ext_len + 1) * 8;
             
             if (ptr + total_len > data_end)
@@ -479,7 +527,6 @@ static __always_inline int parse_ipv6_ext_headers(
         }
         
         case IPPROTO_FRAGMENT: {
-            // 分片头 (固定 8 字节)
             if (ptr + 8 > data_end)
                 return -1;
             
@@ -493,7 +540,6 @@ static __always_inline int parse_ipv6_ext_headers(
         }
         
         default:
-            // 未知扩展头，假设已到达传输层
             result->next_hdr = next_hdr;
             result->payload_offset = offset;
             result->payload_len = bpf_ntohs(ip6->payload_len) - 
@@ -503,11 +549,9 @@ static __always_inline int parse_ipv6_ext_headers(
         }
     }
     
-    // 超过最大深度
     return -1;
 }
 
-// 解析 UDP 头
 static __always_inline struct udphdr *parse_udphdr(void *data, void *data_end) {
     struct udphdr *udp = data;
     if ((void *)(udp + 1) > data_end)
@@ -515,7 +559,6 @@ static __always_inline struct udphdr *parse_udphdr(void *data, void *data_end) {
     return udp;
 }
 
-// 解析 TCP 头
 static __always_inline struct tcphdr *parse_tcphdr(void *data, void *data_end) {
     struct tcphdr *tcp = data;
     if ((void *)(tcp + 1) > data_end)
@@ -531,7 +574,6 @@ static __always_inline struct tcphdr *parse_tcphdr(void *data, void *data_end) {
 // 会话键操作函数
 // =============================================================================
 
-// 创建 IPv4 会话键
 static __always_inline void make_session_key_v4(
     struct session_key *key,
     __u32 src_ip, __u32 dst_ip,
@@ -547,7 +589,6 @@ static __always_inline void make_session_key_v4(
     key->protocol = protocol;
 }
 
-// 创建 IPv6 会话键
 static __always_inline void make_session_key_v6(
     struct session_key *key,
     const struct in6_addr *src_ip,
@@ -564,7 +605,6 @@ static __always_inline void make_session_key_v6(
     key->protocol = protocol;
 }
 
-// 从 ip_addr 创建 IPv6 会话键
 static __always_inline void make_session_key_v6_raw(
     struct session_key *key,
     const struct ip_addr *src_ip,
@@ -581,7 +621,6 @@ static __always_inline void make_session_key_v6_raw(
     key->protocol = protocol;
 }
 
-// 通用会话键创建 (兼容旧代码)
 static __always_inline void make_session_key(
     struct session_key *key,
     __u32 src_ip, __u32 dst_ip,
@@ -590,7 +629,6 @@ static __always_inline void make_session_key(
     make_session_key_v4(key, src_ip, dst_ip, src_port, dst_port, IPPROTO_UDP);
 }
 
-// 创建反向会话键
 static __always_inline void make_reverse_key(
     struct session_key *rev,
     const struct session_key *key
@@ -623,3 +661,10 @@ static __always_inline void make_reverse_key(
     bpf_printk("phantom ERROR: " fmt, ##__VA_ARGS__)
 
 #endif // __PHANTOM_COMMON_H__
+
+
+
+
+
+
+
