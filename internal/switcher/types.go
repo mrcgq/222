@@ -1,6 +1,7 @@
 // =============================================================================
 // 文件: internal/switcher/types.go
 // 描述: 智能链路切换 - 类型定义
+// 注意: ProbeResult 已在 prober.go 中定义，此处不再重复
 // =============================================================================
 
 package switcher
@@ -72,6 +73,7 @@ func (s TransportState) String() string {
 type SwitchReason string
 
 const (
+	ReasonNone        SwitchReason = ""
 	ReasonManual      SwitchReason = "manual"
 	ReasonHighLatency SwitchReason = "high_latency"
 	ReasonHighLoss    SwitchReason = "high_loss"
@@ -85,6 +87,40 @@ const (
 // String 返回原因字符串
 func (r SwitchReason) String() string {
 	return string(r)
+}
+
+// =============================================================================
+// 链路质量
+// =============================================================================
+
+// LinkQuality 链路质量等级
+type LinkQuality int
+
+const (
+	QualityUnknown   LinkQuality = iota
+	QualityExcellent             // 优秀
+	QualityGood                  // 良好
+	QualityFair                  // 一般
+	QualityPoor                  // 较差
+	QualityBad                   // 很差
+)
+
+// String 返回质量等级字符串
+func (q LinkQuality) String() string {
+	switch q {
+	case QualityExcellent:
+		return "excellent"
+	case QualityGood:
+		return "good"
+	case QualityFair:
+		return "fair"
+	case QualityPoor:
+		return "poor"
+	case QualityBad:
+		return "bad"
+	default:
+		return "unknown"
+	}
 }
 
 // =============================================================================
@@ -227,6 +263,30 @@ type SwitcherConfig struct {
 	LogLevel string
 }
 
+// DefaultSwitcherConfig 返回默认切换器配置
+func DefaultSwitcherConfig() *SwitcherConfig {
+	return &SwitcherConfig{
+		Enabled:           true,
+		CheckInterval:     5 * time.Second,
+		RTTThreshold:      200 * time.Millisecond,
+		LossThreshold:     0.1, // 10%
+		FailThreshold:     3,
+		RecoverThreshold:  5,
+		MinSwitchInterval: 30 * time.Second,
+		MaxSwitchRate:     5,
+		CooldownPeriod:    60 * time.Second,
+		EnableFallback:    true,
+		FallbackMode:      ModeTCP,
+		EnableProbe:       true,
+		ProbeInterval:     10 * time.Second,
+		ProbePacketSize:   64,
+		ProbeCount:        3,
+		ProbeTimeout:      5 * time.Second,
+		Priority:          []TransportMode{ModeUDP, ModeTCP, ModeFakeTCP, ModeWebSocket},
+		LogLevel:          "info",
+	}
+}
+
 // =============================================================================
 // 决策结果
 // =============================================================================
@@ -239,12 +299,6 @@ type SwitchDecision struct {
 	Confidence   float64
 }
 
-// ProbeResult 探测结果
-type ProbeResult struct {
-	Mode      TransportMode
-	RTT       time.Duration
-	Loss      float64
-	Available bool
-	Error     error
-	Timestamp time.Time
-}
+// =============================================================================
+// 注意: ProbeResult 已在 prober.go 中定义，此处不再重复
+// =============================================================================
