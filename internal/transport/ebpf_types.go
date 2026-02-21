@@ -4,7 +4,7 @@
 // 文件: internal/transport/ebpf_types.go
 // 描述: eBPF 加速 - 辅助类型和函数 (仅 Linux)
 // 注意: 核心数据结构由 bpf2go 自动生成，本文件仅保留辅助函数和常量
-// 重要: 使用 unsafe 内存操作确保与 bpf2go 生成的任意字段名兼容
+// 重要: 类型别名定义在 ebpf_stats.go 中，本文件不再重复定义
 // 关键: 所有多字节字段使用原生内存读写，保持与 eBPF 内核一致的字节序
 // =============================================================================
 package transport
@@ -105,30 +105,9 @@ func DefaultEBPFConfig() *EBPFConfig {
 }
 
 // =============================================================================
-// 类型别名 - 映射到 bpf2go 生成的类型
+// 注意: 类型别名 EBPFStats, EBPFSessionKey, EBPFSessionValue, EBPFPacketEvent
+// 已在 ebpf_stats.go 中定义，此处不再重复
 // =============================================================================
-
-// EBPFStats 统计别名
-type EBPFStats = PhantomStatsCounter
-
-// EBPFSessionKey 会话键别名
-type EBPFSessionKey = PhantomSessionKey
-
-// EBPFSessionValue 会话值别名
-type EBPFSessionValue = PhantomSessionValue
-
-// EBPFPacketEvent 包事件
-type EBPFPacketEvent struct {
-	Timestamp uint64
-	SrcIP     uint32
-	DstIP     uint32
-	SrcPort   uint16
-	DstPort   uint16
-	Protocol  uint8
-	Action    uint8
-	Flags     uint8
-	Pad       uint8
-}
 
 // =============================================================================
 // Go 侧会话包装类型
@@ -483,30 +462,48 @@ func GetSessionValuePeer(val *PhantomSessionValue) (peerIP net.IP, peerPort uint
 }
 
 // =============================================================================
-// 统计计数器读取 - 动态适配 bpf2go 生成的实际大小
+// 统计计数器读取 - 使用 unsafe 直接读取内存，兼容任意字段名
 // =============================================================================
 
 // GetStatsCounterValues 从统计计数器中提取所有值
-// 使用动态大小适配，避免硬编码大小导致的编译错误
+// 使用 unsafe 直接读取内存，避免依赖 bpf2go 生成的具体字段名
 func GetStatsCounterValues(stats *PhantomStatsCounter) map[string]uint64 {
-	// 使用反射获取实际大小，或者直接访问字段
-	return map[string]uint64{
-		"packets_rx":            stats.PacketsRx,
-		"packets_tx":            stats.PacketsTx,
-		"bytes_rx":              stats.BytesRx,
-		"bytes_tx":              stats.BytesTx,
-		"packets_dropped":       stats.PacketsDropped,
-		"packets_passed":        stats.PacketsPassed,
-		"packets_redirected":    stats.PacketsRedirected,
-		"sessions_created":      stats.SessionsCreated,
-		"sessions_expired":      stats.SessionsExpired,
-		"errors":                stats.Errors,
-		"checksum_errors":       stats.ChecksumErrors,
-		"invalid_packets":       stats.InvalidPackets,
-		"ipv6_packets_rx":       stats.Ipv6PacketsRx,
-		"ipv6_packets_tx":       stats.Ipv6PacketsTx,
-		"ipv6_sessions_created": stats.Ipv6SessionsCreated,
+	// 获取结构体的内存视图
+	// PhantomStatsCounter 包含多个 uint64 字段，按顺序排列
+	size := unsafe.Sizeof(*stats)
+	numFields := int(size / 8) // 每个 uint64 占 8 字节
+
+	statsPtr := unsafe.Pointer(stats)
+	result := make(map[string]uint64)
+
+	// 字段名列表 (按 C 结构体定义顺序)
+	fieldNames := []string{
+		"packets_rx",
+		"packets_tx",
+		"bytes_rx",
+		"bytes_tx",
+		"packets_dropped",
+		"packets_passed",
+		"packets_redirected",
+		"sessions_created",
+		"sessions_expired",
+		"errors",
+		"checksum_errors",
+		"invalid_packets",
+		"ipv6_packets_rx",
+		"ipv6_packets_tx",
+		"ipv6_sessions_created",
+		"blacklist_hits",
+		"ratelimit_hits",
 	}
+
+	for i := 0; i < numFields && i < len(fieldNames); i++ {
+		offset := uintptr(i * 8)
+		value := *(*uint64)(unsafe.Pointer(uintptr(statsPtr) + offset))
+		result[fieldNames[i]] = value
+	}
+
+	return result
 }
 
 // =============================================================================
