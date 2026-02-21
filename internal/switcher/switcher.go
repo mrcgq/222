@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/switcher/switcher.go
 // 描述: 智能链路切换 - 核心切换器
@@ -663,6 +661,21 @@ func (s *Switcher) SwitchMode(mode TransportMode) error {
 	return nil
 }
 
+// convertToQualityInfo 将 LinkQualityMetrics 转换为 QualityInfo
+func convertToQualityInfo(m *LinkQualityMetrics) QualityInfo {
+	if m == nil {
+		return QualityInfo{}
+	}
+	return QualityInfo{
+		RTT:       m.RTT,
+		Loss:      m.LossRate,
+		Jitter:    m.RTTJitter,
+		Bandwidth: int64(m.Throughput),
+		State:     m.State,
+		Score:     m.Score,
+	}
+}
+
 // GetStats 获取统计信息
 func (s *Switcher) GetStats() *SwitcherStats {
 	s.mu.RLock()
@@ -680,7 +693,7 @@ func (s *Switcher) GetStats() *SwitcherStats {
 	}
 
 	if monitor := s.decision.GetQualityMonitor(s.currentMode); monitor != nil {
-		stats.CurrentQuality = monitor.GetQuality()
+		stats.CurrentQuality = convertToQualityInfo(monitor.GetQuality())
 		stats.CurrentState = stats.CurrentQuality.State
 	} else {
 		stats.CurrentState = StateRunning
@@ -689,13 +702,13 @@ func (s *Switcher) GetStats() *SwitcherStats {
 	for mode, modeStats := range s.modeStats {
 		statsCopy := *modeStats
 		if monitor := s.decision.GetQualityMonitor(mode); monitor != nil {
-			statsCopy.Quality = monitor.GetQuality()
+			statsCopy.Quality = convertToQualityInfo(monitor.GetQuality())
 		}
 		stats.ModeStats[mode] = &statsCopy
 	}
 
 	if s.udpServer != nil && s.udpServer.GetARQManager() != nil {
-		stats.ARQActiveConns = s.udpServer.GetARQManager().GetActiveConns()
+		stats.ARQActiveConns = int(s.udpServer.GetARQManager().GetActiveConns())
 	}
 
 	// 添加 eBPF 统计（新增）
@@ -760,16 +773,3 @@ func (s *Switcher) log(level int, format string, args ...interface{}) {
 	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
 	fmt.Printf("%s %s [Switcher] %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
