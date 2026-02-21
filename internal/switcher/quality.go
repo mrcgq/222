@@ -1,5 +1,3 @@
-
-
 // =============================================================================
 // 文件: internal/switcher/quality.go
 // 描述: 智能链路切换 - 链路质量检测
@@ -14,9 +12,9 @@ import (
 
 const (
 	// 采样窗口
-	rttSampleWindow     = 20
-	lossSampleWindow    = 100
-	throughputWindow    = 10 * time.Second
+	rttSampleWindow  = 20
+	lossSampleWindow = 100
+	throughputWindow = 10 * time.Second
 
 	// 评分权重
 	rttWeight        = 0.35
@@ -33,12 +31,12 @@ type QualityMonitor struct {
 	mode TransportMode
 
 	// RTT 采样
-	rttSamples   []time.Duration
-	rttIndex     int
-	rttCount     int
-	rttSum       time.Duration
-	minRTT       time.Duration
-	maxRTT       time.Duration
+	rttSamples []time.Duration
+	rttIndex   int
+	rttCount   int
+	rttSum     time.Duration
+	minRTT     time.Duration
+	maxRTT     time.Duration
 
 	// 丢包采样 (滑动窗口)
 	lossBitmap   []bool
@@ -52,9 +50,9 @@ type QualityMonitor struct {
 	lastBytesTime     time.Time
 
 	// 连接统计
-	activeConns    int
-	totalConns     uint64
-	failedConns    uint64
+	activeConns int
+	totalConns  uint64
+	failedConns uint64
 
 	// 连续成功/失败
 	consecutiveSuccesses int
@@ -219,12 +217,12 @@ func (m *QualityMonitor) RecordDisconnection() {
 	m.lastUpdate = time.Now()
 }
 
-// GetQuality 获取链路质量
-func (m *QualityMonitor) GetQuality() *LinkQuality {
+// GetQuality 获取链路质量（返回 *LinkQualityMetrics）
+func (m *QualityMonitor) GetQuality() *LinkQualityMetrics {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	q := &LinkQuality{
+	q := &LinkQualityMetrics{
 		LastCheck:            m.lastUpdate,
 		LastSuccess:          m.lastSuccess,
 		LastFailure:          m.lastFailure,
@@ -289,7 +287,7 @@ func (m *QualityMonitor) GetQuality() *LinkQuality {
 	}
 
 	// 计算可用性
-	q.Available = m.consecutiveFailures < 5 && 
+	q.Available = m.consecutiveFailures < 5 &&
 		(m.lastSuccess.IsZero() || time.Since(m.lastSuccess) < 30*time.Second)
 
 	if q.Available {
@@ -307,7 +305,7 @@ func (m *QualityMonitor) GetQuality() *LinkQuality {
 }
 
 // calculateScore 计算综合评分 (0-100)
-func (m *QualityMonitor) calculateScore(q *LinkQuality) float64 {
+func (m *QualityMonitor) calculateScore(q *LinkQualityMetrics) float64 {
 	var score float64 = 100
 
 	// RTT 评分 (越低越好)
@@ -361,7 +359,7 @@ func (m *QualityMonitor) GetScoreTrend() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if len(m.scoreHistory) < 5 {
+	if len(m.scoreHistory) < 10 {
 		return 0
 	}
 
@@ -419,7 +417,3 @@ func (m *QualityMonitor) Reset() {
 
 	m.lastUpdate = time.Now()
 }
-
-
-
-
