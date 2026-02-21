@@ -1,3 +1,4 @@
+
 // =============================================================================
 // 文件: internal/crypto/crypto.go
 // =============================================================================
@@ -23,9 +24,9 @@ const (
 	PSKSize       = 32
 	UserIDSize    = 4
 	TimestampSize = 2
-	NonceSize     = chacha20poly1305.NonceSize
-	TagSize       = chacha20poly1305.Overhead
-	HeaderSize    = UserIDSize + TimestampSize
+	NonceSize     = chacha20poly1305.NonceSize // 12
+	TagSize       = chacha20poly1305.Overhead  // 16
+	HeaderSize    = UserIDSize + TimestampSize // 6
 )
 
 // Crypto 加密器
@@ -122,9 +123,12 @@ func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
 
 // Decrypt 解密数据
 func (c *Crypto) Decrypt(data []byte) ([]byte, error) {
-	minSize := HeaderSize + NonceSize + TagSize
+	// 修复：正确的最小长度校验
+	// UserID(4) + Timestamp(2) + Nonce(12) + Tag(16) = 34 字节
+	// 原代码漏算了 16 字节的 Poly1305 Tag，会导致短包被误放行或数组越界
+	minSize := HeaderSize + NonceSize + TagSize // 4 + 2 + 12 + 16 = 34
 	if len(data) < minSize {
-		return nil, fmt.Errorf("数据太短")
+		return nil, fmt.Errorf("数据太短，非 Phantom 数据包 (len=%d, min=%d)", len(data), minSize)
 	}
 
 	// 验证 UserID
@@ -273,3 +277,7 @@ func GeneratePSK() (string, error) {
 	}
 	return base64.StdEncoding.EncodeToString(psk), nil
 }
+
+
+
+
