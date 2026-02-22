@@ -1,8 +1,6 @@
-
 // =============================================================================
 // 文件: internal/transport/udp.go
-// 描述: 增强版 UDP 服务器 - ARQ 作为增强层集成（修复版 v3）
-//       新增：SendOnly 模式，仅创建发送通道，不监听端口
+// 描述: 增强版 UDP 服务器 - 新增分片发送支持
 // =============================================================================
 package transport
 
@@ -16,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mrcgq/211/internal/congestion"
+	"github.com/mrcgq/211/internal/protocol"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -148,23 +147,28 @@ type UDPServer struct {
 	// 包序号
 	nextPacketNum uint64
 
+	// 分片 ID 计数器
+	fragIDCounter uint32
+
 	// 状态标志
 	running  int32
 	started  int32
-	sendOnly bool // 新增：仅发送模式
+	sendOnly bool
 
 	// 统计信息
-	packetsRecv    uint64
-	packetsSent    uint64
-	bytesRecv      uint64
-	bytesSent      uint64
-	packetsDropped uint64
+	packetsRecv     uint64
+	packetsSent     uint64
+	bytesRecv       uint64
+	bytesSent       uint64
+	packetsDropped  uint64
+	fragmentsSent   uint64 // 新增：发送的分片数
+	fragmentsRecv   uint64 // 新增：接收的分片数
 
 	// 连接建立的 singleflight 防止并发竞争
 	connectGroup singleflight.Group
 
-	// 连接状态缓存（避免频繁锁操作）
-	connCache    sync.Map // map[string]*arqConnState
+	// 连接状态缓存
+	connCache    sync.Map
 	connCacheMu  sync.RWMutex
 	connCacheTTL time.Duration
 
@@ -214,7 +218,6 @@ func NewUDPServer(addr string, h PacketHandler, logLevel string) *UDPServer {
 }
 
 // NewUDPServerSendOnly 创建仅发送模式的 UDP 服务器
-// 不监听端口，仅用于发送数据 (配合 eBPF 使用)
 func NewUDPServerSendOnly(addr string, h PacketHandler, logLevel string) *UDPServer {
 	server := NewUDPServer(addr, h, logLevel)
 	server.sendOnly = true
@@ -234,7 +237,7 @@ func NewUDPServerWithConfig(addr string, h PacketHandler, logLevel string, bufCo
 // 配置方法
 // =============================================================================
 
-// SetBufferConfig 设置缓冲区配置（启动前调用）
+// SetBufferConfig 设置缓冲区配置
 func (s *UDPServer) SetBufferConfig(config *BufferConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -268,18 +271,14 @@ func (s *UDPServer) EnableARQ(config *ARQConnConfig, handler ARQHandler) {
 
 // Start 启动服务器
 func (s *UDPServer) Start(ctx context.Context) error {
-	// SendOnly 模式：仅创建发送连接
 	if s.sendOnly {
 		return s.startSendOnly(ctx)
 	}
-
-	// 正常模式：监听并接收
 	return s.startNormal(ctx)
 }
 
 // startSendOnly 仅发送模式启动
 func (s *UDPServer) startSendOnly(ctx context.Context) error {
-	// 创建一个不绑定特定端口的 UDP socket，仅用于发送
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return fmt.Errorf("创建发送 socket 失败: %w", err)
@@ -287,7 +286,6 @@ func (s *UDPServer) startSendOnly(ctx context.Context) error {
 
 	s.conn = conn
 
-	// 设置写缓冲区
 	_, writeSize := s.bufferConfig.calculateBufferSize()
 	if err := s.conn.SetWriteBuffer(writeSize); err != nil {
 		s.log(1, "写缓冲区设置失败: %v", err)
@@ -312,12 +310,10 @@ func (s *UDPServer) startNormal(ctx context.Context) error {
 		return fmt.Errorf("监听失败: %w", err)
 	}
 
-	// 设置优化的缓冲区
 	if err := s.setupBuffers(); err != nil {
 		s.log(1, "缓冲区设置警告: %v", err)
 	}
 
-	// 初始化 worker 池
 	s.workerChs = make([]chan *packetTask, s.workers)
 	for i := 0; i < s.workers; i++ {
 		s.workerChs[i] = make(chan *packetTask, defaultWorkerQueueSize)
@@ -336,11 +332,11 @@ func (s *UDPServer) startNormal(ctx context.Context) error {
 		go s.congestionLoop(ctx)
 	}
 
-	// 启动连接缓存清理
 	s.wg.Add(1)
 	go s.connCacheCleanupLoop(ctx)
 
-	s.log(1, "UDP 服务器已启动: %s (workers: %d, ARQ: %v)", s.addr, s.workers, s.arqEnabled)
+	s.log(1, "UDP 服务器已启动: %s (workers: %d, ARQ: %v, maxPayload: %d)",
+		s.addr, s.workers, s.arqEnabled, protocol.MaxUDPPayloadSize)
 	return nil
 }
 
@@ -348,9 +344,7 @@ func (s *UDPServer) startNormal(ctx context.Context) error {
 func (s *UDPServer) setupBuffers() error {
 	readSize, writeSize := s.bufferConfig.calculateBufferSize()
 
-	// 尝试设置读缓冲区
 	if err := s.conn.SetReadBuffer(readSize); err != nil {
-		// 如果失败，尝试较小的值
 		for size := readSize / 2; size >= minBufferSize; size /= 2 {
 			if err := s.conn.SetReadBuffer(size); err == nil {
 				s.log(1, "读缓冲区降级设置为: %d bytes", size)
@@ -360,7 +354,6 @@ func (s *UDPServer) setupBuffers() error {
 		}
 	}
 
-	// 尝试设置写缓冲区
 	if err := s.conn.SetWriteBuffer(writeSize); err != nil {
 		for size := writeSize / 2; size >= minBufferSize; size /= 2 {
 			if err := s.conn.SetWriteBuffer(size); err == nil {
@@ -371,10 +364,8 @@ func (s *UDPServer) setupBuffers() error {
 		}
 	}
 
-	s.log(2, "缓冲区配置: read=%dMB, write=%dMB, BDP目标=%.2fMB",
-		readSize/1024/1024,
-		writeSize/1024/1024,
-		float64(s.bufferConfig.TargetBandwidth/8)*float64(s.bufferConfig.ExpectedRTTMs)/1000/1024/1024)
+	s.log(2, "缓冲区配置: read=%dMB, write=%dMB",
+		readSize/1024/1024, writeSize/1024/1024)
 
 	return nil
 }
@@ -445,7 +436,7 @@ func (s *UDPServer) orderedWorker(idx int) {
 		}
 
 		if resp := s.handler.HandlePacket(task.data, task.addr); resp != nil {
-			s.sendWithCongestion(resp, task.addr)
+			s.SendTo(resp, task.addr)
 		}
 	}
 }
@@ -477,9 +468,84 @@ func (s *UDPServer) connCacheCleanupLoop(ctx context.Context) {
 }
 
 // =============================================================================
-// 发送方法
+// 发送方法（核心修改：支持分片）
 // =============================================================================
 
+// SendTo 发送数据到指定地址（自动分片）
+func (s *UDPServer) SendTo(data []byte, addr *net.UDPAddr) error {
+	if s.conn == nil {
+		return fmt.Errorf("连接未初始化")
+	}
+
+	// 如果 ARQ 已启用且连接已建立，通过 ARQ 发送
+	if s.arqEnabled && s.arqManager != nil && !s.sendOnly {
+		if s.isARQConnEstablished(addr) {
+			if conn := s.arqManager.GetConn(addr); conn != nil {
+				return conn.Send(data)
+			}
+		}
+	}
+
+	// 检查是否需要分片
+	if protocol.NeedsFragmentation(len(data)) {
+		return s.sendFragmented(data, addr)
+	}
+
+	// 不需要分片，直接发送
+	s.sendWithCongestion(data, addr)
+	return nil
+}
+
+// sendFragmented 分片发送大数据包
+func (s *UDPServer) sendFragmented(data []byte, addr *net.UDPAddr) error {
+	// 生成分片组 ID
+	fragID := uint16(atomic.AddUint32(&s.fragIDCounter, 1) & 0xFFFF)
+
+	totalLen := len(data)
+	fragCount := protocol.CalculateFragmentCount(totalLen)
+
+	if fragCount > protocol.MaxFragments {
+		return fmt.Errorf("数据太大，需要 %d 个分片，超过最大限制 %d",
+			fragCount, protocol.MaxFragments)
+	}
+
+	s.log(2, "📦 分片发送: dataLen=%d, fragCount=%d, fragID=%d, to=%s",
+		totalLen, fragCount, fragID, addr.String())
+
+	// 从原始数据中提取 reqID（假设格式: Type(1) + ReqID(4) + ...）
+	var reqID uint32
+	if len(data) >= 5 {
+		reqID = uint32(data[1])<<24 | uint32(data[2])<<16 | uint32(data[3])<<8 | uint32(data[4])
+	}
+
+	for i := 0; i < fragCount; i++ {
+		start := i * protocol.MaxFragmentDataSize
+		end := start + protocol.MaxFragmentDataSize
+		if end > totalLen {
+			end = totalLen
+		}
+
+		fragData := data[start:end]
+
+		// 构建分片包
+		fragPacket := protocol.BuildFragmentPacket(
+			reqID,
+			fragID,
+			uint8(i),
+			uint8(fragCount),
+			fragData,
+		)
+
+		// 发送分片
+		s.sendWithCongestion(fragPacket, addr)
+		atomic.AddUint64(&s.fragmentsSent, 1)
+
+		s.log(2, "📤 分片 %d/%d: %d字节 (fragID=%d)",
+			i+1, fragCount, len(fragPacket), fragID)
+	}
+
+	return nil
+}
 
 // sendWithCongestion 带拥塞控制的发送
 func (s *UDPServer) sendWithCongestion(data []byte, addr *net.UDPAddr) {
@@ -508,35 +574,18 @@ func (s *UDPServer) sendWithCongestion(data []byte, addr *net.UDPAddr) {
 	}
 }
 
-// SendTo 发送数据到指定地址
-func (s *UDPServer) SendTo(data []byte, addr *net.UDPAddr) error {
-	if s.conn == nil {
-		return fmt.Errorf("连接未初始化")
-	}
+// =============================================================================
+// ARQ 相关方法
+// =============================================================================
 
-	// 如果 ARQ 已启用且连接已建立，通过 ARQ 发送
-	if s.arqEnabled && s.arqManager != nil && !s.sendOnly {
-		if s.isARQConnEstablished(addr) {
-			if conn := s.arqManager.GetConn(addr); conn != nil {
-				return conn.Send(data)
-			}
-		}
-	}
-
-	s.sendWithCongestion(data, addr)
-	return nil
-}
-
-// SendViaARQ 通过 ARQ 发送（使用 singleflight 防止并发连接）
+// SendViaARQ 通过 ARQ 发送
 func (s *UDPServer) SendViaARQ(ctx context.Context, data []byte, addr *net.UDPAddr) error {
 	if !s.arqEnabled || s.arqManager == nil {
 		return fmt.Errorf("ARQ 未启用")
 	}
 
-	// 使用地址作为 key 进行 singleflight
 	key := addr.String()
 
-	// 使用 singleflight 确保同一地址只有一个连接建立过程
 	connInterface, err, _ := s.connectGroup.Do(key, func() (interface{}, error) {
 		return s.getOrCreateARQConn(ctx, addr)
 	})
@@ -553,7 +602,6 @@ func (s *UDPServer) SendViaARQ(ctx context.Context, data []byte, addr *net.UDPAd
 func (s *UDPServer) getOrCreateARQConn(ctx context.Context, addr *net.UDPAddr) (*ARQConn, error) {
 	key := addr.String()
 
-	// 检查缓存
 	if cached, ok := s.connCache.Load(key); ok {
 		state := cached.(*arqConnState)
 		if state.established && state.conn != nil && state.conn.IsEstablished() {
@@ -562,10 +610,8 @@ func (s *UDPServer) getOrCreateARQConn(ctx context.Context, addr *net.UDPAddr) (
 		}
 	}
 
-	// 检查 ARQManager 中是否已有连接
 	if conn := s.arqManager.GetConn(addr); conn != nil {
 		if conn.IsEstablished() {
-			// 更新缓存
 			s.connCache.Store(key, &arqConnState{
 				conn:        conn,
 				established: true,
@@ -575,20 +621,17 @@ func (s *UDPServer) getOrCreateARQConn(ctx context.Context, addr *net.UDPAddr) (
 		}
 	}
 
-	// 创建新连接
 	conn, err := s.arqManager.CreateConn(s.conn, addr)
 	if err != nil {
 		return nil, fmt.Errorf("创建 ARQ 连接失败: %w", err)
 	}
 
-	// 启动并建立连接
 	conn.Start()
 
 	if err := conn.Connect(ctx); err != nil {
 		return nil, fmt.Errorf("ARQ 连接失败: %w", err)
 	}
 
-	// 更新缓存
 	s.connCache.Store(key, &arqConnState{
 		conn:        conn,
 		established: true,
@@ -598,18 +641,16 @@ func (s *UDPServer) getOrCreateARQConn(ctx context.Context, addr *net.UDPAddr) (
 	return conn, nil
 }
 
-// isARQConnEstablished 检查 ARQ 连接是否已建立（带缓存）
+// isARQConnEstablished 检查 ARQ 连接是否已建立
 func (s *UDPServer) isARQConnEstablished(addr *net.UDPAddr) bool {
 	key := addr.String()
 
 	if cached, ok := s.connCache.Load(key); ok {
 		state := cached.(*arqConnState)
-		// 缓存有效期内直接返回
 		if time.Since(state.lastCheck) < s.connCacheTTL {
 			return state.established
 		}
 
-		// 缓存过期，重新检查
 		if state.conn != nil {
 			established := state.conn.IsEstablished()
 			state.established = established
@@ -618,7 +659,6 @@ func (s *UDPServer) isARQConnEstablished(addr *net.UDPAddr) bool {
 		}
 	}
 
-	// 没有缓存，检查 ARQManager
 	if conn := s.arqManager.GetConn(addr); conn != nil {
 		established := conn.IsEstablished()
 		s.connCache.Store(key, &arqConnState{
@@ -636,7 +676,6 @@ func (s *UDPServer) isARQConnEstablished(addr *net.UDPAddr) bool {
 // 拥塞控制循环
 // =============================================================================
 
-// congestionLoop 拥塞控制日志循环
 func (s *UDPServer) congestionLoop(ctx context.Context) {
 	defer s.wg.Done()
 
@@ -665,7 +704,6 @@ func (s *UDPServer) congestionLoop(ctx context.Context) {
 // 辅助方法
 // =============================================================================
 
-// hashAddr 计算地址哈希
 func (s *UDPServer) hashAddr(addr *net.UDPAddr) int {
 	hash := 0
 	for _, b := range addr.IP {
@@ -678,12 +716,10 @@ func (s *UDPServer) hashAddr(addr *net.UDPAddr) int {
 	return hash
 }
 
-// GetARQManager 获取 ARQ 管理器
 func (s *UDPServer) GetARQManager() *ARQManager {
 	return s.arqManager
 }
 
-// IsRunning 是否运行中 (真实状态检查)
 func (s *UDPServer) IsRunning() bool {
 	if atomic.LoadInt32(&s.running) != 1 {
 		return false
@@ -697,26 +733,22 @@ func (s *UDPServer) IsRunning() bool {
 	return true
 }
 
-// IsSendOnly 是否为仅发送模式
 func (s *UDPServer) IsSendOnly() bool {
 	return s.sendOnly
 }
 
-// OnAck 处理 ACK（供外部调用，如非 ARQ 场景）
 func (s *UDPServer) OnAck(packetNumber uint64, ackedBytes int, rtt time.Duration) {
 	if s.congestion != nil {
 		s.congestion.OnPacketAcked(packetNumber, ackedBytes, rtt)
 	}
 }
 
-// OnPacketLost 处理丢包（供外部调用）
 func (s *UDPServer) OnPacketLost(packetNumber uint64, lostBytes int) {
 	if s.congestion != nil {
 		s.congestion.OnPacketLost(packetNumber, lostBytes)
 	}
 }
 
-// GetCongestionStats 获取拥塞控制统计
 func (s *UDPServer) GetCongestionStats() *congestion.CongestionStats {
 	if s.congestion != nil {
 		return s.congestion.GetStats()
@@ -724,7 +756,6 @@ func (s *UDPServer) GetCongestionStats() *congestion.CongestionStats {
 	return nil
 }
 
-// GetStats 获取统计信息
 func (s *UDPServer) GetStats() map[string]uint64 {
 	stats := map[string]uint64{
 		"packets_recv":    atomic.LoadUint64(&s.packetsRecv),
@@ -732,6 +763,8 @@ func (s *UDPServer) GetStats() map[string]uint64 {
 		"bytes_recv":      atomic.LoadUint64(&s.bytesRecv),
 		"bytes_sent":      atomic.LoadUint64(&s.bytesSent),
 		"packets_dropped": atomic.LoadUint64(&s.packetsDropped),
+		"fragments_sent":  atomic.LoadUint64(&s.fragmentsSent),
+		"fragments_recv":  atomic.LoadUint64(&s.fragmentsRecv),
 	}
 
 	if s.arqEnabled && s.arqManager != nil {
@@ -739,7 +772,6 @@ func (s *UDPServer) GetStats() map[string]uint64 {
 		stats["arq_total_conns"] = s.arqManager.GetTotalConns()
 	}
 
-	// 标记是否为 SendOnly 模式
 	if s.sendOnly {
 		stats["send_only_mode"] = 1
 	} else {
@@ -749,12 +781,10 @@ func (s *UDPServer) GetStats() map[string]uint64 {
 	return stats
 }
 
-// GetConn 获取底层 UDP 连接
 func (s *UDPServer) GetConn() *net.UDPConn {
 	return s.conn
 }
 
-// GetBufferStats 获取缓冲区统计
 func (s *UDPServer) GetBufferStats() map[string]interface{} {
 	readSize, writeSize := s.bufferConfig.calculateBufferSize()
 	bdp := float64(s.bufferConfig.TargetBandwidth/8) * float64(s.bufferConfig.ExpectedRTTMs) / 1000
@@ -767,6 +797,7 @@ func (s *UDPServer) GetBufferStats() map[string]interface{} {
 		"write_buffer_bytes":    writeSize,
 		"buffer_multiplier":     s.bufferConfig.BufferMultiplier,
 		"send_only_mode":        s.sendOnly,
+		"max_udp_payload":       protocol.MaxUDPPayloadSize,
 	}
 }
 
@@ -774,7 +805,6 @@ func (s *UDPServer) GetBufferStats() map[string]interface{} {
 // 停止方法
 // =============================================================================
 
-// Stop 停止服务器
 func (s *UDPServer) Stop() {
 	if !atomic.CompareAndSwapInt32(&s.running, 1, 0) {
 		return
@@ -782,7 +812,6 @@ func (s *UDPServer) Stop() {
 
 	close(s.stopCh)
 
-	// 仅在非 SendOnly 模式下关闭 worker
 	if !s.sendOnly {
 		for _, ch := range s.workerChs {
 			if ch != nil {
@@ -801,7 +830,6 @@ func (s *UDPServer) Stop() {
 	}
 	s.wg.Wait()
 
-	// 清理连接缓存
 	s.connCache = sync.Map{}
 
 	if s.sendOnly {
