@@ -1,4 +1,3 @@
-
 // internal/handler/client_handler.go
 package handler
 
@@ -43,13 +42,12 @@ const (
 	HeartbeatInterval = 15 * time.Second
 	SessionTimeout    = 120 * time.Second
 
-	// DefaultWSPath 默认 WebSocket 路径，与服务端 config.yaml 的 path 对应
-	DefaultWSPath = "/ws"
-
-	// MinEncryptedPacketLen TSKD 加密包最小长度
-	// UserID(4) + Timestamp(2) + Nonce(12) + Poly1305_Tag(16) = 34 字节最小头部
-	// 修复：原值 18 漏算了 ChaCha20-Poly1305 的 16 字节 MAC Tag
+	DefaultWSPath         = "/ws"
 	MinEncryptedPacketLen = 34
+
+	// 分片重组相关
+	FragmentTimeout     = 10 * time.Second // 分片超时时间
+	MaxPendingFragments = 256              // 最大待处理分片组数
 )
 
 type Config struct {
@@ -61,13 +59,9 @@ type Config struct {
 	DownloadMbps   int
 	TransportMode  string
 	TLSFingerprint string
-
-	// WSPath WebSocket 路径，必须与服务端一致
-	// 留空自动使用 "/ws"
-	WSPath string
+	WSPath         string
 }
 
-// getWSPath 获取实际使用的 WebSocket 路径
 func (c *Config) getWSPath() string {
 	if c.WSPath == "" {
 		return DefaultWSPath
@@ -91,6 +85,159 @@ type Session struct {
 	mu         sync.Mutex
 }
 
+// =============================================================================
+// 分片重组器
+// =============================================================================
+
+// fragmentGroup 分片组
+type fragmentGroup struct {
+	fragments  map[uint8][]byte // 按索引存储的分片
+	totalCount uint8            // 总分片数
+	received   int              // 已接收分片数
+	createdAt  time.Time        // 创建时间
+	totalSize  int              // 累计大小
+	reqID      uint32           // 请求 ID
+}
+
+// FragmentAssembler 分片重组器
+type FragmentAssembler struct {
+	pending map[uint16]*fragmentGroup // key: fragID
+	mu      sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+// NewFragmentAssembler 创建分片重组器
+func NewFragmentAssembler() *FragmentAssembler {
+	ctx, cancel := context.WithCancel(context.Background())
+	fa := &FragmentAssembler{
+		pending: make(map[uint16]*fragmentGroup),
+		ctx:     ctx,
+		cancel:  cancel,
+	}
+	go fa.cleanupLoop()
+	return fa
+}
+
+// ProcessPacket 处理收到的包
+// 返回: (完整数据, 是否是分片包)
+// 如果是分片包但未完成重组，返回 (nil, true)
+func (fa *FragmentAssembler) ProcessPacket(data []byte) ([]byte, bool) {
+	// 检查是否是分片包
+	if !protocol.IsFragmentPacket(data) {
+		return data, false
+	}
+
+	// 解析分片包
+	frag, err := protocol.ParseFragmentPacket(data)
+	if err != nil {
+		return nil, true
+	}
+
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
+
+	// 获取或创建分片组
+	group, exists := fa.pending[frag.FragID]
+	if !exists {
+		// 检查是否超过最大待处理数
+		if len(fa.pending) >= MaxPendingFragments {
+			// 删除最旧的
+			var oldestID uint16
+			var oldestTime time.Time
+			for id, g := range fa.pending {
+				if oldestTime.IsZero() || g.createdAt.Before(oldestTime) {
+					oldestID = id
+					oldestTime = g.createdAt
+				}
+			}
+			delete(fa.pending, oldestID)
+		}
+
+		group = &fragmentGroup{
+			fragments:  make(map[uint8][]byte),
+			totalCount: frag.FragTotal,
+			createdAt:  time.Now(),
+			reqID:      frag.ReqID,
+		}
+		fa.pending[frag.FragID] = group
+	}
+
+	// 检查分片是否重复
+	if _, duplicate := group.fragments[frag.FragIndex]; duplicate {
+		return nil, true
+	}
+
+	// 存储分片
+	fragData := make([]byte, len(frag.Data))
+	copy(fragData, frag.Data)
+	group.fragments[frag.FragIndex] = fragData
+	group.received++
+	group.totalSize += len(frag.Data)
+
+	// 检查是否完整
+	if group.received == int(group.totalCount) {
+		// 重组数据
+		result := make([]byte, 0, group.totalSize)
+		for i := uint8(0); i < group.totalCount; i++ {
+			if fragPart, ok := group.fragments[i]; ok {
+				result = append(result, fragPart...)
+			} else {
+				// 缺少分片（不应该发生，因为 received == totalCount）
+				delete(fa.pending, frag.FragID)
+				return nil, true
+			}
+		}
+
+		// 清理
+		delete(fa.pending, frag.FragID)
+
+		return result, true
+	}
+
+	return nil, true
+}
+
+// cleanupLoop 定期清理超时的分片组
+func (fa *FragmentAssembler) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-fa.ctx.Done():
+			return
+		case <-ticker.C:
+			fa.mu.Lock()
+			now := time.Now()
+			for id, group := range fa.pending {
+				if now.Sub(group.createdAt) > FragmentTimeout {
+					delete(fa.pending, id)
+				}
+			}
+			fa.mu.Unlock()
+		}
+	}
+}
+
+// Close 关闭重组器
+func (fa *FragmentAssembler) Close() {
+	fa.cancel()
+}
+
+// GetStats 获取统计信息
+func (fa *FragmentAssembler) GetStats() map[string]int {
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
+	return map[string]int{
+		"pending_groups": len(fa.pending),
+	}
+}
+
+// =============================================================================
+// PhantomClientHandler
+// =============================================================================
+
 type PhantomClientHandler struct {
 	crypto     *crypto.Crypto
 	controller *congestion.Hysteria2Controller
@@ -101,15 +248,20 @@ type PhantomClientHandler struct {
 	sessionsMu sync.RWMutex
 	nextReqID  uint32
 
+	// 分片重组器
+	fragmentAssembler *FragmentAssembler
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
 	stats struct {
-		bytesSent     uint64
-		bytesReceived uint64
-		packetsSent   uint64
-		packetsRecv   uint64
+		bytesSent        uint64
+		bytesReceived    uint64
+		packetsSent      uint64
+		packetsRecv      uint64
+		fragmentsRecv    uint64 // 新增：接收的分片数
+		fragmentsAssembled uint64 // 新增：重组完成的分片组数
 	}
 }
 
@@ -204,8 +356,6 @@ func (a *fakeTCPAdapter) Close() error {
 // ============================================
 
 func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
-	// 修复：清除 PSK 中不可见的空白字符（换行符、空格、制表符）
-	// 这是 "UserID 不匹配" 的最常见原因
 	cfg.PSK = strings.TrimSpace(cfg.PSK)
 
 	timeWindowSec := int(cfg.TimeWindow.Seconds())
@@ -220,7 +370,6 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 	serverEndpoint := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.ServerPort)
 
 	switch {
-	// ========== WSS / WS 模式 ==========
 	case cfg.TransportMode == "wss" || cfg.TransportMode == "ws":
 		scheme := "ws"
 		if cfg.TransportMode == "wss" {
@@ -245,7 +394,6 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 		trans = &wsStreamAdapter{conn: wsConn}
 		fmt.Printf("[Client] WebSocket 隧道已建立: %s\n", url)
 
-	// ========== FakeTCP 模式（仅 Linux）==========
 	case cfg.TransportMode == "faketcp" && runtime.GOOS == "linux":
 		ftConfig := transport.DefaultFakeTCPConfig()
 		ftClient, err := transport.NewFakeTCPClient(serverEndpoint, ftConfig)
@@ -255,7 +403,6 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 		trans = &fakeTCPAdapter{client: ftClient}
 		fmt.Printf("[Client] FakeTCP 隧道已建立: %s\n", serverEndpoint)
 
-	// ========== 默认 UDP 模式 ==========
 	default:
 		udpAddr, err := net.ResolveUDPAddr("udp", serverEndpoint)
 		if err != nil {
@@ -271,13 +418,14 @@ func NewClientHandler(cfg *Config) (*PhantomClientHandler, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &PhantomClientHandler{
-		crypto:     cry,
-		controller: controller,
-		transport:  trans,
-		config:     cfg,
-		sessions:   make(map[uint32]*Session),
-		ctx:        ctx,
-		cancel:     cancel,
+		crypto:            cry,
+		controller:        controller,
+		transport:         trans,
+		config:            cfg,
+		sessions:          make(map[uint32]*Session),
+		fragmentAssembler: NewFragmentAssembler(), // 初始化分片重组器
+		ctx:               ctx,
+		cancel:            cancel,
 	}
 
 	h.wg.Add(2)
@@ -314,7 +462,7 @@ func (h *PhantomClientHandler) sendEncryptedPacket(payload []byte) error {
 }
 
 // ============================================
-// 接收循环
+// 接收循环（修改：支持分片重组）
 // ============================================
 
 func (h *PhantomClientHandler) receiveLoop() {
@@ -332,27 +480,35 @@ func (h *PhantomClientHandler) receiveLoop() {
 			return
 		}
 
-		// 修复：过滤过短的包（不足以构成有效的 TSKD 加密包）
-		// 避免 WebSocket 控制帧等噪音进入解密流程
-		// 最小长度 = UserID(4) + Timestamp(2) + Nonce(12) + Tag(16) = 34
 		if n < MinEncryptedPacketLen {
 			continue
 		}
 
 		decrypted, err := h.crypto.Decrypt(buf[:n])
 		if err != nil {
-			// 解密失败原因：PSK 不一致 / 时间偏差 > TimeWindow / 数据损坏
-			// 静默丢弃，不打印日志避免刷屏
 			continue
+		}
+
+		atomic.AddUint64(&h.stats.bytesReceived, uint64(n))
+		atomic.AddUint64(&h.stats.packetsRecv, 1)
+
+		// 检查是否是分片包并进行重组
+		reassembled, isFragment := h.fragmentAssembler.ProcessPacket(decrypted)
+		if isFragment {
+			atomic.AddUint64(&h.stats.fragmentsRecv, 1)
+			if reassembled == nil {
+				// 分片未完成，等待更多分片
+				continue
+			}
+			// 分片重组完成
+			atomic.AddUint64(&h.stats.fragmentsAssembled, 1)
+			decrypted = reassembled
 		}
 
 		resp, err := protocol.ParseServerResponse(decrypted)
 		if err != nil {
 			continue
 		}
-
-		atomic.AddUint64(&h.stats.bytesReceived, uint64(n))
-		atomic.AddUint64(&h.stats.packetsRecv, 1)
 
 		h.controller.OnPacketAcked(0, 0, time.Millisecond*10)
 
@@ -569,6 +725,12 @@ func (h *PhantomClientHandler) cleanupStaleSessions() {
 
 func (h *PhantomClientHandler) Close() error {
 	h.cancel()
+
+	// 关闭分片重组器
+	if h.fragmentAssembler != nil {
+		h.fragmentAssembler.Close()
+	}
+
 	h.wg.Wait()
 	return h.transport.Close()
 }
@@ -578,12 +740,14 @@ func (h *PhantomClientHandler) Close() error {
 // ============================================
 
 type Stats struct {
-	BytesSent      uint64
-	BytesReceived  uint64
-	PacketsSent    uint64
-	PacketsRecv    uint64
-	SessionsTotal  uint64
-	SessionsActive int64
+	BytesSent          uint64
+	BytesReceived      uint64
+	PacketsSent        uint64
+	PacketsRecv        uint64
+	FragmentsRecv      uint64
+	FragmentsAssembled uint64
+	SessionsTotal      uint64
+	SessionsActive     int64
 }
 
 func (h *PhantomClientHandler) GetStats() Stats {
@@ -592,18 +756,12 @@ func (h *PhantomClientHandler) GetStats() Stats {
 	h.sessionsMu.RUnlock()
 
 	return Stats{
-		BytesSent:      atomic.LoadUint64(&h.stats.bytesSent),
-		BytesReceived:  atomic.LoadUint64(&h.stats.bytesReceived),
-		PacketsSent:    atomic.LoadUint64(&h.stats.packetsSent),
-		PacketsRecv:    atomic.LoadUint64(&h.stats.packetsRecv),
-		SessionsActive: int64(activeCount),
+		BytesSent:          atomic.LoadUint64(&h.stats.bytesSent),
+		BytesReceived:      atomic.LoadUint64(&h.stats.bytesReceived),
+		PacketsSent:        atomic.LoadUint64(&h.stats.packetsSent),
+		PacketsRecv:        atomic.LoadUint64(&h.stats.packetsRecv),
+		FragmentsRecv:      atomic.LoadUint64(&h.stats.fragmentsRecv),
+		FragmentsAssembled: atomic.LoadUint64(&h.stats.fragmentsAssembled),
+		SessionsActive:     int64(activeCount),
 	}
 }
-
-
-
-
-
-
-
-
