@@ -1,9 +1,10 @@
 // =============================================================================
 // 文件: internal/switcher/switcher.go
 // 描述: 智能链路切换 - 核心切换器
-// 修复：统一使用 ebpfpkg.Loader + EBPFLoaderTransportWrapper
-//       删除旧版 EBPFAccelerator 兼容代码
-//       eBPF 模式发包使用 UDP Server 的主连接
+// 修复：
+//   1. 统一使用 ebpfpkg.Loader + EBPFLoaderTransportWrapper
+//   2. eBPF 模式发包使用 UDP Server 的主连接
+//   3. 强制使用 UDP 作为默认模式，解决响应发送问题
 // =============================================================================
 package switcher
 
@@ -119,7 +120,7 @@ func New(cfg *config.Config, cry *crypto.Crypto, h *handler.UnifiedHandler) *Swi
 		}
 	}
 	if len(switchCfg.Priority) == 0 {
-		switchCfg.Priority = []TransportMode{ModeEBPF, ModeFakeTCP, ModeUDP, ModeWebSocket}
+		switchCfg.Priority = []TransportMode{ModeEBPF, ModeUDP, ModeFakeTCP, ModeWebSocket}
 	}
 
 	logLevel := 1
@@ -377,11 +378,30 @@ func (s *Switcher) registerTransport(mode TransportMode, handler TransportHandle
 }
 
 // selectInitialMode 选择初始模式
+// 修复：优先使用 UDP 模式，因为这是所有传输层的基础
+// UDP 可以向任意地址发送响应，而 FakeTCP/WebSocket 需要已建立的会话
 func (s *Switcher) selectInitialMode() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 如果 eBPF 已挂载，优先使用 eBPF 模式
+	// 修复：优先使用 UDP 模式
+	// 原因：
+	// 1. UDP 是最基础的传输方式，可以向任意 UDP 地址发送响应
+	// 2. FakeTCP/WebSocket 等模式需要已建立的会话才能发送
+	// 3. 所有传输层（UDP/TCP/FakeTCP/WebSocket）收到的请求都会调用 Handler
+	// 4. Handler 的 sender 指向 Switcher.SendTo，使用当前模式发送
+	// 5. 如果当前模式是 FakeTCP，而请求来自 UDP，响应就发不出去
+	if stats, ok := s.modeStats[ModeUDP]; ok && stats.State == StateRunning {
+		s.currentMode = ModeUDP
+		s.modeStartTime = time.Now()
+		s.modeStats[ModeUDP].LastActive = time.Now()
+		s.modeStats[ModeUDP].SwitchInCount++
+		s.log(1, "初始模式: %s", ModeUDP)
+		return
+	}
+
+	// 如果 eBPF 已挂载且 UDP 不可用，使用 eBPF 模式
+	// eBPF 模式的 Send 也是通过 UDP Server 发送的，所以也能正常工作
 	if s.ebpfAttached {
 		if stats, ok := s.modeStats[ModeEBPF]; ok && stats.State == StateRunning {
 			s.currentMode = ModeEBPF
@@ -393,8 +413,13 @@ func (s *Switcher) selectInitialMode() {
 		}
 	}
 
-	// 按优先级选择
+	// 按优先级选择（排除 FakeTCP 和 WebSocket 作为默认模式）
+	// 因为它们需要已建立的会话才能发送响应
 	for _, mode := range s.switchCfg.Priority {
+		// 跳过这些需要会话的模式
+		if mode == ModeFakeTCP || mode == ModeWebSocket || mode == ModeTCP {
+			continue
+		}
 		if stats, ok := s.modeStats[mode]; ok && stats.State == StateRunning {
 			s.currentMode = mode
 			s.modeStartTime = time.Now()
@@ -405,9 +430,10 @@ func (s *Switcher) selectInitialMode() {
 		}
 	}
 
-	// 默认 UDP
+	// 默认 UDP（兜底）
 	s.currentMode = ModeUDP
 	s.modeStartTime = time.Now()
+	s.log(1, "初始模式: %s (默认)", ModeUDP)
 }
 
 // monitorLoop 监控循环
@@ -435,6 +461,12 @@ func (s *Switcher) checkAndSwitch() {
 
 	decision := s.decision.Evaluate(currentMode)
 	if !decision.ShouldSwitch {
+		return
+	}
+
+	// 修复：不要切换到需要会话的模式
+	if decision.TargetMode == ModeFakeTCP || decision.TargetMode == ModeWebSocket {
+		s.log(2, "跳过切换到 %s (需要会话)", decision.TargetMode)
 		return
 	}
 
