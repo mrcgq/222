@@ -1,10 +1,7 @@
-
-
-
 // =============================================================================
 // 文件: internal/handler/unified_handler.go
 // 描述: 统一处理器 - 用户态核心处理中心
-// 修复：集成黑名单管理器，解密失败时调用 IncrementFailCount()
+// 修复：添加调试日志，定位响应发送问题
 // =============================================================================
 package handler
 
@@ -62,7 +59,7 @@ type UnifiedHandler struct {
 	cfg     *config.Config
 	metrics *metrics.PhantomMetrics
 
-	// 黑名单管理器（新增）
+	// 黑名单管理器
 	blacklistMgr *ebpfpkg.BlacklistManager
 
 	logLevel int
@@ -107,7 +104,9 @@ type handlerStats struct {
 	replayBlocked  uint64
 	decryptErrors  uint64
 	heartbeatsRecv uint64
-	xdpBlocked     uint64 // XDP 封禁次数（新增）
+	xdpBlocked     uint64
+	responsesSent  uint64 // 新增：响应发送计数
+	responseFails  uint64 // 新增：响应发送失败计数
 }
 
 // =============================================================================
@@ -151,15 +150,14 @@ func (h *UnifiedHandler) SetMetrics(m *metrics.PhantomMetrics) {
 
 func (h *UnifiedHandler) SetSender(fn Sender) {
 	h.sender = fn
+	h.log(LogLevelInfo, "Sender 已设置")
 }
 
-// SetBlacklistManager 设置黑名单管理器（新增）
 func (h *UnifiedHandler) SetBlacklistManager(mgr *ebpfpkg.BlacklistManager) {
 	h.blacklistMgr = mgr
 	h.log(LogLevelInfo, "XDP 黑名单管理器已启用")
 }
 
-// GetBlacklistManager 获取黑名单管理器（新增）
 func (h *UnifiedHandler) GetBlacklistManager() *ebpfpkg.BlacklistManager {
 	return h.blacklistMgr
 }
@@ -187,9 +185,10 @@ func (h *UnifiedHandler) GetStats() map[string]interface{} {
 		"decrypt_errors":  atomic.LoadUint64(&h.stats.decryptErrors),
 		"heartbeats_recv": atomic.LoadUint64(&h.stats.heartbeatsRecv),
 		"xdp_blocked":     atomic.LoadUint64(&h.stats.xdpBlocked),
+		"responses_sent":  atomic.LoadUint64(&h.stats.responsesSent),
+		"response_fails":  atomic.LoadUint64(&h.stats.responseFails),
 	}
 
-	// 如果黑名单管理器可用，添加黑名单统计
 	if h.blacklistMgr != nil {
 		blStats := h.blacklistMgr.GetStats()
 		stats["blacklist_ipv4_count"] = blStats.BlockedIPv4Count
@@ -225,7 +224,6 @@ func (h *UnifiedHandler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
 	// 1. 解密数据
 	plaintext, err := h.crypto.Decrypt(data)
 	if err != nil {
-		// 修复：解密失败时触发黑名单机制
 		h.handleDecryptionFailure(from, err)
 		return nil
 	}
@@ -262,15 +260,11 @@ func (h *UnifiedHandler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
 	return nil
 }
 
-// handleDecryptionFailure 处理解密失败
-// 修复：触发 XDP 黑名单机制，将恶意 IP 写入内核 Map
 func (h *UnifiedHandler) handleDecryptionFailure(from *net.UDPAddr, err error) {
-	// 记录解密失败统计
 	atomic.AddUint64(&h.stats.decryptErrors, 1)
 
 	errStr := err.Error()
 
-	// 判断错误类型
 	var reason uint8 = ebpfpkg.BlockFlagAuthFail
 
 	if strings.Contains(errStr, "重放") || strings.Contains(errStr, "replay") {
@@ -286,7 +280,6 @@ func (h *UnifiedHandler) handleDecryptionFailure(from *net.UDPAddr, err error) {
 		reason = ebpfpkg.BlockFlagMalformed
 	}
 
-	// 如果黑名单管理器可用，增加失败计数
 	if h.blacklistMgr != nil {
 		failCount, blocked := h.blacklistMgr.IncrementFailCount(from.IP, reason)
 
@@ -295,7 +288,6 @@ func (h *UnifiedHandler) handleDecryptionFailure(from *net.UDPAddr, err error) {
 			h.log(LogLevelError, "🚫 触发内核护盾! 恶意 IP %s 已被 XDP 封禁 (失败: %d次, 原因: %d)",
 				from.IP, failCount, reason)
 		} else if failCount%5 == 0 && failCount > 0 {
-			// 每 5 次报一次警，防日志刷屏
 			h.log(LogLevelDebug, "⚠️ 发现探测: IP %s 认证失败 %d 次", from.IP, failCount)
 		}
 	} else {
@@ -314,7 +306,13 @@ func (h *UnifiedHandler) handleUDPHeartbeat(req *protocol.Request, from *net.UDP
 	}
 
 	if h.sender != nil {
-		h.sender(encrypted, from)
+		if err := h.sender(encrypted, from); err != nil {
+			h.log(LogLevelError, "❌ 心跳响应发送失败: %v", err)
+		} else {
+			h.log(LogLevelDebug, "✅ 心跳响应已发送: %d字节 -> %s", len(encrypted), from.String())
+		}
+	} else {
+		h.log(LogLevelError, "❌ Sender 未设置，无法发送心跳响应")
 	}
 }
 
@@ -358,6 +356,8 @@ func (h *UnifiedHandler) handleUDPConnect(req *protocol.Request, from *net.UDPAd
 		}
 	}
 
+	// 发送连接成功响应
+	h.log(LogLevelInfo, "📤 准备发送 Connect ACK: ID:%d -> %s", req.ReqID, from.String())
 	h.sendUDPResponse(req.ReqID, StatusOK, nil, from)
 
 	go h.udpReadLoop(conn)
@@ -392,6 +392,7 @@ func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 	defer h.closeConnection(conn.ID)
 
 	buf := make([]byte, readBufferSize)
+	readCount := 0
 
 	for {
 		if atomic.LoadInt32(&conn.closed) != 0 {
@@ -408,6 +409,7 @@ func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 			return
 		}
 
+		readCount++
 		conn.mu.Lock()
 		conn.LastActive = time.Now()
 		clientAddr := conn.ClientAddr
@@ -420,28 +422,46 @@ func (h *UnifiedHandler) udpReadLoop(conn *ProxyConnection) {
 			h.metrics.AddBytesReceived(int64(n))
 		}
 
+		// 调试日志：记录每次读取和发送
+		h.log(LogLevelInfo, "📥 从目标读取: ID:%d, 第%d次, %d字节, 准备发送到 %s",
+			conn.ID, readCount, n, clientAddr.String())
+
 		h.sendUDPResponse(conn.ID, protocol.TypeData, buf[:n], clientAddr)
 	}
 }
 
 func (h *UnifiedHandler) sendUDPResponse(reqID uint32, status byte, data []byte, to *net.UDPAddr) {
 	if h.sender == nil {
-		h.log(LogLevelError, "Sender 未设置，无法发送响应")
+		h.log(LogLevelError, "❌ Sender 未设置，无法发送响应 (reqID:%d)", reqID)
+		atomic.AddUint64(&h.stats.responseFails, 1)
 		return
 	}
+
+	// 调试日志：记录发送前的信息
+	h.log(LogLevelInfo, "📤 准备发送响应: reqID=%d, status=0x%02X, dataLen=%d, to=%s",
+		reqID, status, len(data), to.String())
 
 	resp := protocol.BuildResponse(reqID, status, data)
 
 	encrypted, err := h.crypto.Encrypt(resp)
 	if err != nil {
-		h.log(LogLevelError, "加密响应失败: %v", err)
+		h.log(LogLevelError, "❌ 加密响应失败: %v", err)
+		atomic.AddUint64(&h.stats.responseFails, 1)
 		return
 	}
 
+	h.log(LogLevelDebug, "🔐 加密完成: plainLen=%d -> encryptedLen=%d", len(resp), len(encrypted))
+
+	// 调用 sender 发送
 	if err := h.sender(encrypted, to); err != nil {
-		h.log(LogLevelDebug, "发送响应失败: %v", err)
-	} else if h.metrics != nil {
-		h.metrics.AddBytesSent(int64(len(encrypted)))
+		h.log(LogLevelError, "❌ Sender 返回错误: reqID=%d, to=%s, err=%v", reqID, to.String(), err)
+		atomic.AddUint64(&h.stats.responseFails, 1)
+	} else {
+		h.log(LogLevelInfo, "✅ 响应已发送: reqID=%d, %d字节 -> %s", reqID, len(encrypted), to.String())
+		atomic.AddUint64(&h.stats.responsesSent, 1)
+		if h.metrics != nil {
+			h.metrics.AddBytesSent(int64(len(encrypted)))
+		}
 	}
 }
 
@@ -878,25 +898,3 @@ func (h *UnifiedHandler) log(level int, format string, args ...interface{}) {
 		time.Now().Format("15:04:05"),
 		fmt.Sprintf(format, args...))
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
