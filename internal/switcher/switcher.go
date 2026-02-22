@@ -577,6 +577,7 @@ func (s *Switcher) probeInactiveModes() {
 	}
 }
 
+
 // SendTo 发送数据
 func (s *Switcher) SendTo(data []byte, addr *net.UDPAddr) error {
 	s.mu.RLock()
@@ -585,10 +586,19 @@ func (s *Switcher) SendTo(data []byte, addr *net.UDPAddr) error {
 	s.mu.RUnlock()
 
 	if t == nil {
+		s.log(0, "❌ 传输层不可用: %s", mode)
 		return fmt.Errorf("传输层不可用: %s", mode)
 	}
 
+	// 调试日志
+	s.log(2, "📡 Switcher.SendTo: mode=%s, dataLen=%d, to=%s", mode, len(data), addr.String())
+
 	err := t.Send(data, addr)
+	if err != nil {
+		s.log(0, "❌ Transport.Send 失败: mode=%s, to=%s, err=%v", mode, addr.String(), err)
+	} else {
+		s.log(2, "✅ Transport.Send 成功: mode=%s, %d字节 -> %s", mode, len(data), addr.String())
+	}
 
 	// 异步更新质量
 	select {
