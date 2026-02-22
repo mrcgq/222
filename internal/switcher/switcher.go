@@ -1,7 +1,9 @@
 // =============================================================================
 // 文件: internal/switcher/switcher.go
 // 描述: 智能链路切换 - 核心切换器
-// 修复：初始化时创建 BlacklistManager 并注入 Handler
+// 修复：统一使用 ebpfpkg.Loader + EBPFLoaderTransportWrapper
+//       删除旧版 EBPFAccelerator 兼容代码
+//       eBPF 模式发包使用 UDP Server 的主连接
 // =============================================================================
 package switcher
 
@@ -35,9 +37,8 @@ type Switcher struct {
 	tcpServer  *transport.TCPServer
 	fakeTCP    *transport.FakeTCPServer
 	webSocket  *transport.WebSocketServer
-	ebpf       *transport.EBPFAccelerator
 
-	// eBPF 加载器（新增）
+	// eBPF 加载器（统一使用新版）
 	ebpfLoader *ebpfpkg.Loader
 
 	congestion *congestion.Hysteria2Controller
@@ -264,12 +265,12 @@ func (s *Switcher) startTransports(ctx context.Context) error {
 
 	// ==========================================================================
 	// 2. eBPF 加速插件 (附加到已有的 UDP 之上，不再监听端口)
-	// 修复：使用新的 eBPF Loader 并创建 BlacklistManager
+	// 关键修复：使用 EBPFLoaderTransportWrapper，通过 UDP Server 发包
 	// ==========================================================================
 	if s.cfg.EBPF.Enabled {
 		s.log(1, "正在加载 eBPF 加速插件...")
 
-		// 创建 eBPF 加载器
+		// 创建 eBPF 加载器配置
 		loaderConfig := &ebpfpkg.LoaderConfig{
 			ProgramPath: s.cfg.EBPF.ProgramPath,
 			Interface:   s.cfg.EBPF.Interface,
@@ -294,39 +295,16 @@ func (s *Switcher) startTransports(ctx context.Context) error {
 				s.ebpfAttached = true
 				s.modeStats[ModeEBPF].State = StateRunning
 
-				// 修复：获取黑名单管理器并注入 Handler
+				// 获取黑名单管理器并注入 Handler
 				if blacklistMgr := s.ebpfLoader.GetBlacklistManager(); blacklistMgr != nil {
 					s.handler.SetBlacklistManager(blacklistMgr)
 					s.log(1, "XDP 黑名单管理器已注入 Handler")
 				}
 
+				// 关键修复：注册 eBPF 传输包装器（使用 UDP Server 的连接发包）
+				s.registerTransport(ModeEBPF, NewEBPFLoaderTransportWrapper(s.ebpfLoader, s.udpServer))
+
 				s.log(1, "eBPF 内核加速已就绪，正在加速 UDP 流量")
-			}
-		}
-
-		// 兼容旧的 EBPFAccelerator（如果需要）
-		if s.ebpfLoader == nil {
-			s.ebpf = transport.NewEBPFAccelerator(
-				s.cfg.EBPF.Interface,
-				s.cfg.EBPF.XDPMode,
-				s.cfg.EBPF.ProgramPath,
-				s.cfg.EBPF.MapSize,
-				s.cfg.EBPF.EnableStats,
-				s.handler,
-				logLevel,
-			)
-
-			if err := s.ebpf.Start(ctx, s.cfg.Listen); err != nil {
-				s.log(1, "eBPF 加速挂载失败: %v (使用标准 UDP 模式)", err)
-				s.ebpf = nil
-			} else if s.ebpf.IsActive() {
-				s.ebpfAttached = true
-				s.registerTransport(ModeEBPF, NewEBPFTransportWrapper(s.ebpf))
-				s.modeStats[ModeEBPF].State = StateRunning
-				s.log(1, "eBPF 内核加速已就绪 (旧模式)")
-			} else {
-				s.log(1, "eBPF 未激活")
-				s.ebpf = nil
 			}
 		}
 	}
@@ -637,9 +615,14 @@ func (s *Switcher) HasARQ() bool {
 	return s.cfg.ARQ.Enabled && s.udpServer != nil && s.udpServer.GetARQManager() != nil
 }
 
-// GetEBPFLoader 获取 eBPF 加载器（新增）
+// GetEBPFLoader 获取 eBPF 加载器
 func (s *Switcher) GetEBPFLoader() *ebpfpkg.Loader {
 	return s.ebpfLoader
+}
+
+// GetUDPServer 获取 UDP 服务器
+func (s *Switcher) GetUDPServer() *transport.UDPServer {
+	return s.udpServer
 }
 
 // SwitchMode 手动切换模式
@@ -711,7 +694,7 @@ func (s *Switcher) GetStats() *SwitcherStats {
 		stats.ARQActiveConns = int(s.udpServer.GetARQManager().GetActiveConns())
 	}
 
-	// 添加 eBPF 统计（新增）
+	// 添加 eBPF 统计
 	if s.ebpfLoader != nil {
 		if ebpfStats, err := s.ebpfLoader.GetStats(); err == nil {
 			stats.EBPFStats = map[string]uint64{
@@ -751,11 +734,8 @@ func (s *Switcher) Stop() {
 	if s.webSocket != nil {
 		s.webSocket.Stop()
 	}
-	if s.ebpf != nil {
-		s.ebpf.Stop()
-	}
 
-	// 关闭 eBPF 加载器（新增）
+	// 关闭 eBPF 加载器
 	if s.ebpfLoader != nil {
 		s.ebpfLoader.Close()
 		s.ebpfLoader = nil
@@ -772,4 +752,75 @@ func (s *Switcher) log(level int, format string, args ...interface{}) {
 	}
 	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
 	fmt.Printf("%s %s [Switcher] %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+}
+
+// =============================================================================
+// eBPF Loader 传输包装器
+// 关键设计：eBPF 只负责内核加速，发包使用 UDP Server 的主连接
+// =============================================================================
+
+// EBPFLoaderTransportWrapper eBPF Loader 传输包装器
+type EBPFLoaderTransportWrapper struct {
+	loader    *ebpfpkg.Loader
+	udpServer *transport.UDPServer
+
+	// 统计
+	packetsTx uint64
+	bytesTx   uint64
+}
+
+// NewEBPFLoaderTransportWrapper 创建包装器
+func NewEBPFLoaderTransportWrapper(loader *ebpfpkg.Loader, udpServer *transport.UDPServer) *EBPFLoaderTransportWrapper {
+	return &EBPFLoaderTransportWrapper{
+		loader:    loader,
+		udpServer: udpServer,
+	}
+}
+
+// Send 发送数据 - 使用 UDP 服务器的主连接（关键修复点）
+// 确保响应包从正确的端口（如 54321）发出，而不是随机端口
+func (w *EBPFLoaderTransportWrapper) Send(data []byte, addr *net.UDPAddr) error {
+	if w.udpServer == nil {
+		return fmt.Errorf("UDP 服务器未初始化")
+	}
+
+	conn := w.udpServer.GetConn()
+	if conn == nil {
+		return fmt.Errorf("UDP 连接未初始化")
+	}
+
+	_, err := conn.WriteToUDP(data, addr)
+	if err == nil {
+		atomic.AddUint64(&w.packetsTx, 1)
+		atomic.AddUint64(&w.bytesTx, uint64(len(data)))
+	}
+
+	return err
+}
+
+// IsRunning 是否运行中
+func (w *EBPFLoaderTransportWrapper) IsRunning() bool {
+	return w.loader != nil && w.loader.IsAttached()
+}
+
+// GetStats 获取统计
+func (w *EBPFLoaderTransportWrapper) GetStats() interface{} {
+	if w.loader == nil {
+		return nil
+	}
+
+	stats, err := w.loader.GetStats()
+	if err != nil {
+		return nil
+	}
+
+	// 合并发包统计
+	return map[string]uint64{
+		"packets_tx":      atomic.LoadUint64(&w.packetsTx),
+		"bytes_tx":        atomic.LoadUint64(&w.bytesTx),
+		"blacklist_hits":  stats.BlacklistHits,
+		"ratelimit_hits":  stats.RatelimitHits,
+		"packets_dropped": stats.PacketsDropped,
+		"packets_passed":  stats.PacketsPassed,
+	}
 }
