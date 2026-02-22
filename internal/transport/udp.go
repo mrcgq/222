@@ -480,6 +480,7 @@ func (s *UDPServer) connCacheCleanupLoop(ctx context.Context) {
 // 发送方法
 // =============================================================================
 
+
 // sendWithCongestion 带拥塞控制的发送
 func (s *UDPServer) sendWithCongestion(data []byte, addr *net.UDPAddr) {
 	packetSize := len(data)
@@ -493,14 +494,15 @@ func (s *UDPServer) sendWithCongestion(data []byte, addr *net.UDPAddr) {
 		s.congestion.OnPacketSent(pktNum, packetSize, false)
 	}
 
-	_, err := s.conn.WriteToUDP(data, addr)
+	n, err := s.conn.WriteToUDP(data, addr)
 	if err != nil {
-		s.log(2, "发送失败: %v", err)
+		s.log(0, "❌ WriteToUDP 失败: %v, to=%s", err, addr.String())
 		if s.congestion != nil {
 			pktNum := atomic.LoadUint64(&s.nextPacketNum) - 1
 			s.congestion.OnPacketLost(pktNum, packetSize)
 		}
 	} else {
+		s.log(2, "✅ WriteToUDP 成功: %d字节 -> %s", n, addr.String())
 		atomic.AddUint64(&s.packetsSent, 1)
 		atomic.AddUint64(&s.bytesSent, uint64(packetSize))
 	}
