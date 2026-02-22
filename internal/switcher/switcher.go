@@ -814,7 +814,7 @@ func (w *EBPFLoaderTransportWrapper) GetStats() TransportStats {
 	if w.loader != nil {
 		if ebpfStats, err := w.loader.GetStats(); err == nil {
 			stats.PacketsRecv = int64(ebpfStats.PacketsPassed)
-			stats.BytesReceived = int64(ebpfStats.BytesRX)
+			stats.BytesReceived = int64(ebpfStats.BytesRx)
 			stats.Errors = int64(ebpfStats.PacketsDropped)
 		}
 	}
