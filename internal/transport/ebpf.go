@@ -2,8 +2,9 @@
 
 // =============================================================================
 // 文件: internal/transport/ebpf.go
-// 描述: eBPF 加速 - 主加速器
-//       修复：eBPF 只负责内核挂载，不再监听端口，避免与 UDP 冲突
+// 描述: eBPF 加速 - 旧版加速器
+// 状态: 已废弃 - 请使用 internal/ebpf.Loader + switcher.EBPFLoaderTransportWrapper
+// 保留原因: 向后兼容
 // =============================================================================
 package transport
 
@@ -20,6 +21,7 @@ import (
 )
 
 // EBPFAccelerator eBPF 加速器
+// Deprecated: 请使用 internal/ebpf.Loader 配合 EBPFLoaderTransportWrapper
 type EBPFAccelerator struct {
 	config   *EBPFConfig
 	handler  PacketHandler
@@ -28,8 +30,10 @@ type EBPFAccelerator struct {
 	// eBPF 加载器
 	loader *EBPFLoader
 
-	// 用户态发送 socket (不监听，仅发送)
-	sendConn *net.UDPConn
+	// 主 UDP 连接（由外部注入，共享端口）
+	// 修复：不再使用随机端口的 sendConn
+	mainConn *net.UDPConn
+	connMu   sync.RWMutex
 
 	// 统计
 	stats            EBPFAcceleratorStats
@@ -98,6 +102,22 @@ func NewEBPFAccelerator(
 	}
 }
 
+// SetMainConnection 注入主 UDP 连接（关键修复）
+// 必须在 Start 之后、SendTo 之前调用
+func (e *EBPFAccelerator) SetMainConnection(conn *net.UDPConn) {
+	e.connMu.Lock()
+	defer e.connMu.Unlock()
+	e.mainConn = conn
+	e.log(2, "主 UDP 连接已注入")
+}
+
+// GetMainConnection 获取主连接
+func (e *EBPFAccelerator) GetMainConnection() *net.UDPConn {
+	e.connMu.RLock()
+	defer e.connMu.RUnlock()
+	return e.mainConn
+}
+
 // Start 启动加速器
 // eBPF 只负责内核挂载，不监听端口（端口由 UDP 模块持有）
 func (e *EBPFAccelerator) Start(ctx context.Context, listenAddr string) error {
@@ -122,10 +142,8 @@ func (e *EBPFAccelerator) Start(ctx context.Context, listenAddr string) error {
 		e.log(1, "配置端口失败: %v", err)
 	}
 
-	// 创建用户态发送 socket (随机端口，仅用于发送响应)
-	if err := e.createSendSocket(); err != nil {
-		e.log(1, "创建发送 socket 失败: %v", err)
-	}
+	// 修复：不再创建随机端口的发送 socket
+	// 连接由外部通过 SetMainConnection 注入
 
 	e.ctx, e.cancel = context.WithCancel(ctx)
 	atomic.StoreInt32(&e.running, 1)
@@ -145,24 +163,12 @@ func (e *EBPFAccelerator) Start(ctx context.Context, listenAddr string) error {
 	e.wg.Add(1)
 	go e.cleanupLoop()
 
-	// 注意：不再启动 userSpaceLoop，因为 UDP 模块已经在监听端口
-
 	e.stats.Active = true
 	e.stats.XDPMode = e.loader.GetXDPMode()
 	e.stats.Interface = e.loader.GetInterface()
 	e.stats.ProgramLoaded = true
 
 	e.log(1, "eBPF 加速引擎已挂载: %s (mode: %s)", e.config.Interface, e.loader.GetXDPMode())
-	return nil
-}
-
-// createSendSocket 创建用户态发送 socket (随机端口，仅发送)
-func (e *EBPFAccelerator) createSendSocket() error {
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		return err
-	}
-	e.sendConn = conn
 	return nil
 }
 
@@ -368,14 +374,14 @@ func (e *EBPFAccelerator) cleanupSessions() {
 	}
 }
 
-// SendTo 发送数据
+// SendTo 发送数据 - 使用注入的主 UDP 连接（关键修复）
 func (e *EBPFAccelerator) SendTo(data []byte, addr *net.UDPAddr) error {
-	e.mu.RLock()
-	conn := e.sendConn
-	e.mu.RUnlock()
+	e.connMu.RLock()
+	conn := e.mainConn
+	e.connMu.RUnlock()
 
 	if conn == nil {
-		return fmt.Errorf("发送 socket 未初始化")
+		return fmt.Errorf("主 UDP 连接未注入，请先调用 SetMainConnection")
 	}
 
 	_, err := conn.WriteToUDP(data, addr)
@@ -411,6 +417,11 @@ func (e *EBPFAccelerator) IsActive() bool {
 	return atomic.LoadInt32(&e.running) == 1 && e.loader != nil && e.loader.IsAttached()
 }
 
+// GetLoader 获取 eBPF 加载器
+func (e *EBPFAccelerator) GetLoader() *EBPFLoader {
+	return e.loader
+}
+
 // Stop 停止加速器
 func (e *EBPFAccelerator) Stop() {
 	atomic.StoreInt32(&e.running, 0)
@@ -423,9 +434,7 @@ func (e *EBPFAccelerator) Stop() {
 		e.loader.Close()
 	}
 
-	if e.sendConn != nil {
-		e.sendConn.Close()
-	}
+	// 注意: mainConn 由外部管理，不在这里关闭
 
 	e.wg.Wait()
 	e.log(1, "eBPF 加速器已停止")
